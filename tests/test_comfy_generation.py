@@ -1,12 +1,13 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from PIL import Image, PngImagePlugin
 
 import app as app_module
-from comfy_generation import build_edit_options, list_lora_catalog, patch_prompt
+from comfy_generation import ComfyClient, build_edit_options, list_lora_catalog, patch_prompt_and_workflow
 from gallery_db import connect_db, init_db, upsert_photo
 
 
@@ -41,16 +42,49 @@ def sample_prompt():
 def sample_workflow():
     return {
         "nodes": [
-            {"id": 1, "type": "PrimitiveStringMultiline", "mode": 0},
+            {
+                "id": 1,
+                "type": "PrimitiveStringMultiline",
+                "mode": 0,
+                "pos": [10, 20],
+                "inputs": [{"name": "value", "widget": {"name": "value"}}],
+                "widgets_values": ["old prompt"],
+            },
             {"id": 2, "type": "TextEncode", "mode": 0},
-            {"id": 3, "type": "Seed (rgthree)", "mode": 0},
-            {"id": 4, "type": "KSampler", "mode": 0},
-            {"id": 5, "type": "LoadImage", "mode": 0},
+            {"id": 3, "type": "Seed (rgthree)", "mode": 0, "widgets_values": [5]},
+            {
+                "id": 4,
+                "type": "KSampler",
+                "mode": 0,
+                "inputs": [
+                    {"name": "seed", "widget": {"name": "seed"}},
+                    {"name": "steps", "widget": {"name": "steps"}},
+                ],
+                "widgets_values": [5, 4],
+            },
+            {
+                "id": 5,
+                "type": "LoadImage",
+                "mode": 0,
+                "inputs": [{"name": "image", "widget": {"name": "image"}}],
+                "widgets_values": ["ref.png", "image"],
+            },
             {"id": 6, "type": "SaveImage", "mode": 0},
-            {"id": 7, "type": "LoraLoaderModelOnly", "mode": 0},
+            {
+                "id": 7,
+                "type": "LoraLoaderModelOnly",
+                "mode": 0,
+                "inputs": [
+                    {"name": "lora_name", "widget": {"name": "lora_name"}},
+                    {"name": "strength_model", "widget": {"name": "strength_model"}},
+                ],
+                "widgets_values": ["kept.safetensors", 0.7],
+            },
             {"id": 8, "type": "LoraLoaderModelOnly", "mode": 0},
         ],
         "links": [[1, 5, 0, 6, 0, "IMAGE"]],
+        "groups": [{"id": 1, "title": "group", "bounding": [0, 0, 100, 100]}],
+        "seed_widgets": {"3": 0},
     }
 
 
@@ -59,10 +93,21 @@ class FixedRng:
         return 99
 
 
+class CapturingComfyClient(ComfyClient):
+    def __init__(self):
+        super().__init__(base_url="http://example.test")
+        self.payload = None
+
+    def post_json(self, _path, payload, timeout=None):
+        self.payload = payload
+        return {"prompt_id": "prompt-1"}
+
+
 class FakeComfyClient:
     output_root = None
     available = True
     queued_prompt = None
+    queued_workflow = None
     uploaded_paths = []
 
     def is_available(self):
@@ -72,13 +117,17 @@ class FakeComfyClient:
         self.uploaded_paths.append(Path(image_path).name)
         return f"uploaded/{Path(image_path).name}"
 
-    def queue_prompt(self, prompt):
+    def run_prompt(self, prompt, workflow, client_id, progress_callback=None):
         type(self).queued_prompt = prompt
-        return {"prompt_id": "prompt-1"}
-
-    def wait_for_history(self, prompt_id):
-        create_png(self.output_root / "generated.png", color=(80, 90, 100))
-        return {"outputs": {"6": {"images": [{"filename": "generated.png", "subfolder": ""}]}}}
+        type(self).queued_workflow = workflow
+        if progress_callback:
+            progress_callback({"state": "queued", "prompt_id": "prompt-1"})
+            progress_callback({"state": "running", "node": "4", "value": 1, "max": 6})
+        generated_path = self.output_root / "generated.png"
+        create_png(generated_path, color=(80, 90, 100))
+        if progress_callback:
+            progress_callback({"preview": generated_path.read_bytes()})
+        return "prompt-1", {"outputs": {"6": {"images": [{"filename": "generated.png", "subfolder": ""}]}}}
 
 
 class ComfyGenerationTests(unittest.TestCase):
@@ -128,7 +177,7 @@ class ComfyGenerationTests(unittest.TestCase):
         self.assertEqual([item["node_id"] for item in options["loras"]], ["7"])
         self.assertEqual([item["node_id"] for item in options["images"]], ["5"])
 
-        patched, info = patch_prompt(
+        patched, patched_workflow, info = patch_prompt_and_workflow(
             detail,
             {
                 "prompt": "new prompt",
@@ -145,6 +194,26 @@ class ComfyGenerationTests(unittest.TestCase):
         self.assertEqual(patched["4"]["inputs"]["steps"], 8)
         self.assertEqual(patched["7"]["inputs"]["strength_model"], 0.0)
         self.assertEqual(patched["5"]["inputs"]["image"], "uploaded/ref.png")
+        self.assertEqual(patched_workflow["groups"], sample_workflow()["groups"])
+        self.assertEqual(patched_workflow["links"], sample_workflow()["links"])
+        self.assertEqual(patched_workflow["nodes"][0]["pos"], [10, 20])
+        self.assertEqual(patched_workflow["nodes"][0]["widgets_values"][0], "new prompt")
+        self.assertEqual(patched_workflow["nodes"][2]["widgets_values"][0], 99)
+        self.assertEqual(patched_workflow["nodes"][3]["widgets_values"][1], 8)
+        self.assertEqual(patched_workflow["nodes"][4]["widgets_values"][0], "uploaded/ref.png")
+        self.assertEqual(patched_workflow["nodes"][6]["mode"], 4)
+        self.assertEqual(patched_workflow["nodes"][6]["widgets_values"], ["kept.safetensors", 0.0])
+
+    def test_queue_prompt_sends_workflow_as_extra_pnginfo(self):
+        client = CapturingComfyClient()
+        workflow = sample_workflow()
+
+        queued = client.queue_prompt(sample_prompt(), client_id="job-1", workflow=workflow)
+
+        self.assertEqual(queued["prompt_id"], "prompt-1")
+        self.assertEqual(client.payload["client_id"], "job-1")
+        self.assertEqual(client.payload["extra_data"]["workflow"], workflow)
+        self.assertEqual(client.payload["extra_data"]["extra_pnginfo"]["workflow"], workflow)
 
     def test_comfy_status_and_generate_endpoint_with_fake_client(self):
         source_prompt = json.dumps(sample_prompt())
@@ -159,8 +228,10 @@ class ComfyGenerationTests(unittest.TestCase):
         FakeComfyClient.output_root = self.images_root / "output"
         FakeComfyClient.available = True
         FakeComfyClient.queued_prompt = None
+        FakeComfyClient.queued_workflow = None
         FakeComfyClient.uploaded_paths = []
         app_module.COMFY_CLIENT_FACTORY = FakeComfyClient
+        previous_scan_albums = app_module.scan_albums
         try:
             client = app_module.app.test_client()
             self.assertEqual(client.post("/api/scan", json={"metadata": True, "sync": True}).status_code, 200)
@@ -188,6 +259,10 @@ class ComfyGenerationTests(unittest.TestCase):
             self.assertEqual(options.status_code, 200)
             self.assertEqual(options.get_json()["options"]["prompt"], "old prompt")
 
+            def fail_scan(*_args, **_kwargs):
+                raise AssertionError("scan_albums must not be called after generation")
+
+            app_module.scan_albums = fail_scan
             generated = client.post(
                 f"/api/photos/{source_id}/comfy/generate",
                 json={
@@ -198,18 +273,36 @@ class ComfyGenerationTests(unittest.TestCase):
                     "references": [{"node_id": "5", "photo_id": ref_id}],
                 },
             )
-            self.assertEqual(generated.status_code, 200)
-            generated_photo = generated.get_json()["photo"]
+            self.assertEqual(generated.status_code, 202)
+            job_id = generated.get_json()["job"]["id"]
+            generated_photo = None
+            job = None
+            for _ in range(30):
+                job_response = client.get(f"/api/comfy/jobs/{job_id}")
+                self.assertEqual(job_response.status_code, 200)
+                job = job_response.get_json()["job"]
+                if job["state"] == "done":
+                    generated_photo = job["photo"]
+                    break
+                time.sleep(0.05)
             self.assertIsNotNone(generated_photo)
+            self.assertTrue(job["preview_available"])
+            preview = client.get(f"/api/comfy/jobs/{job_id}/preview")
+            self.assertEqual(preview.status_code, 200)
+            self.assertEqual(preview.data[:8], b"\x89PNG\r\n\x1a\n")
             self.assertEqual(generated_photo["memberships"][0]["filename"], "generated.png")
             self.assertEqual(FakeComfyClient.queued_prompt["1"]["inputs"]["value"], "generated prompt")
             self.assertEqual(FakeComfyClient.queued_prompt["4"]["inputs"]["steps"], 6)
             self.assertEqual(FakeComfyClient.queued_prompt["5"]["inputs"]["image"], "uploaded/ref.png")
+            self.assertIsNotNone(FakeComfyClient.queued_workflow)
+            self.assertEqual(FakeComfyClient.queued_workflow["nodes"][0]["widgets_values"][0], "generated prompt")
+            self.assertEqual(FakeComfyClient.queued_workflow["groups"], sample_workflow()["groups"])
 
             refreshed = client.get(f"/api/photos/{source_id}").get_json()["photo"]
             self.assertIn("variant", [link["type"] for link in refreshed["links"]])
         finally:
             app_module.COMFY_CLIENT_FACTORY = previous_factory
+            app_module.scan_albums = previous_scan_albums
 
 
 if __name__ == "__main__":

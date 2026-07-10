@@ -9,6 +9,9 @@ const state = {
     comfyAvailable: false,
     comfyOptions: null,
     comfyReferences: {},
+    comfyJobPollTimer: null,
+    comfyPreviewVersion: null,
+    comfyPollFailures: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -95,6 +98,58 @@ function renderPhotoDetail(photo) {
     renderLinks(photo.links);
     renderLinkedStrip(photo.links);
     refreshComfyStatus();
+}
+
+function galleryPhotoFromDetail(photo) {
+    const membership = photo.memberships.find((item) => item.album_name === state.selectedAlbum?.name) || photo.memberships[0];
+    if (!membership) {
+        return null;
+    }
+    return {
+        id: photo.id,
+        checksum: photo.checksum,
+        filename: membership.filename,
+        relative_path: membership.relative_path,
+        album_name: membership.album_name,
+        width: photo.width,
+        height: photo.height,
+        tags: photo.tags || [],
+        favorite: Boolean(photo.memberships.some((item) => item.type === "output") && photo.memberships.some((item) => item.type === "user")),
+        album_count: photo.memberships.length,
+        user_album_count: photo.memberships.filter((item) => item.type === "user").length,
+        original_url: photo.original_url,
+        thumbnail_url: photo.thumbnail_url,
+    };
+}
+
+function addPhotoToCurrentGallery(photo) {
+    const gallery = $("#gallery-list");
+    if (!gallery || !state.selectedAlbum || !photo.memberships.some((item) => item.album_name === state.selectedAlbum.name)) {
+        return;
+    }
+    const galleryPhoto = galleryPhotoFromDetail(photo);
+    if (!galleryPhoto) {
+        return;
+    }
+    state.photos = [galleryPhoto, ...state.photos.filter((item) => item.id !== photo.id)];
+    gallery.querySelector(`[data-photo-id="${photo.id}"]`)?.closest("li")?.remove();
+    gallery.insertAdjacentHTML("afterbegin", renderGalleryItem(galleryPhoto));
+}
+
+function renderGalleryItem(photo) {
+    return `
+        <li>
+            <button class="thumbnail" type="button" data-photo-id="${photo.id}">
+                <img src="${photo.thumbnail_url}" alt="${escapeHtml(photo.filename)}" loading="lazy">
+                ${photo.favorite ? `
+                    <span class="favorite-badge" title="Present dans output et dans un album user">
+                        *${photo.user_album_count > 1 ? `<small>${photo.user_album_count}</small>` : ""}
+                    </span>
+                ` : ""}
+                <span class="filename">${escapeHtml(photo.filename)}</span>
+            </button>
+        </li>
+    `;
 }
 
 function applyDetailsVisibility() {
@@ -214,6 +269,12 @@ function renderComfyOptions(options) {
     $("#comfy-prompt").value = options.prompt || "";
     $("#comfy-seed-mode").value = "keep";
     $("#comfy-steps").value = options.steps || "";
+    $("#comfy-preview").hidden = true;
+    $("#comfy-preview-image").removeAttribute("src");
+    $("#comfy-preview-image").onerror = () => {
+        $("#comfy-preview").hidden = true;
+    };
+    state.comfyPreviewVersion = null;
     renderComfyLoras(options.loras || [], options.lora_catalog || []);
     renderComfyReferences(options.images || []);
 }
@@ -321,23 +382,90 @@ async function submitComfyGeneration(event) {
         })),
     };
     try {
-        setComfyStatus("Generation en cours, attente de l'historique...");
+        setComfyStatus("Lancement du job...");
         const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/comfy/generate`, {
             method: "POST",
             body: JSON.stringify(payload),
         });
-        if (data.photo) {
-            setComfyStatus("Image generee. Ouverture...");
-            closeComfyModal();
-            await openPhoto(data.photo.id);
-        } else {
-            setComfyStatus(`Generation terminee (${data.prompt_id}), image non retrouvee apres rescan.`);
-        }
+        startComfyJobPolling(data.job.id, done);
+        renderComfyJob(data.job);
     } catch (error) {
         setComfyStatus(error.message, true);
-    } finally {
         done();
         refreshComfyStatus();
+    }
+}
+
+function startComfyJobPolling(jobId, done) {
+    stopComfyJobPolling();
+    state.comfyPollFailures = 0;
+    pollComfyJob(jobId, done, 1000);
+}
+
+function stopComfyJobPolling() {
+    window.clearTimeout(state.comfyJobPollTimer);
+    state.comfyJobPollTimer = null;
+}
+
+function pollComfyJob(jobId, done, delay) {
+    state.comfyJobPollTimer = window.setTimeout(async () => {
+        try {
+            const data = await fetchJson(`/api/comfy/jobs/${jobId}`);
+            state.comfyPollFailures = 0;
+            renderComfyJob(data.job);
+            if (!data.job.active) {
+                stopComfyJobPolling();
+                done();
+                refreshComfyStatus();
+                if (data.job.state === "done" && data.job.photo) {
+                    addPhotoToCurrentGallery(data.job.photo);
+                    closeComfyModal();
+                    await openPhoto(data.job.photo.id);
+                }
+                return;
+            }
+            pollComfyJob(jobId, done, 1000);
+        } catch (error) {
+            state.comfyPollFailures += 1;
+            if (state.comfyPollFailures >= 8) {
+                stopComfyJobPolling();
+                setComfyStatus(`Suivi interrompu: ${error.message}`, true);
+                done();
+                refreshComfyStatus();
+                return;
+            }
+            const retryDelay = Math.min(1000 * Math.pow(1.7, state.comfyPollFailures), 10000);
+            setComfyStatus(`Connexion temporairement perdue, nouvelle tentative ${state.comfyPollFailures}/8...`);
+            pollComfyJob(jobId, done, retryDelay);
+        }
+    }, delay);
+}
+
+function renderComfyJob(job) {
+    const pieces = [job.message || job.state || "Generation"];
+    if (job.node) {
+        pieces.push(`node ${job.node}`);
+    }
+    if (job.progress && job.progress_max) {
+        pieces.push(`${job.progress}/${job.progress_max}`);
+    }
+    if (job.prompt_id) {
+        pieces.push(job.prompt_id);
+    }
+    setComfyStatus(pieces.join(" | "), job.state === "error");
+    if (job.preview_available) {
+        const version = job.preview_updated_at || Date.now();
+        if (state.comfyPreviewVersion !== version) {
+            state.comfyPreviewVersion = version;
+            $("#comfy-preview-image").src = `/api/comfy/jobs/${job.id}/preview?t=${encodeURIComponent(version)}`;
+        }
+        $("#comfy-preview").hidden = false;
+    }
+    if (job.state === "done" && !job.photo) {
+        setComfyStatus("Generation terminee, image non retrouvee dans l'album output.", true);
+    }
+    if (job.state === "error") {
+        setComfyStatus(job.error || job.message || "Generation en erreur", true);
     }
 }
 

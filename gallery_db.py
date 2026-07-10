@@ -675,6 +675,77 @@ def find_latest_output_photo_after(conn, since_timestamp):
     return row["id"] if row else None
 
 
+def import_output_photo(conn, image_path, thumbnail_root):
+    image_path = Path(image_path)
+    album = find_output_album_for_path(conn, image_path)
+    if not album:
+        raise ValueError("No output album contains this generated image")
+    relative_path = image_path.relative_to(Path(album["path"])).as_posix()
+    stat = image_path.stat()
+    checksum = checksum_file(image_path)
+    width, height = image_size(image_path)
+    photo_id = upsert_photo(conn, checksum, width, height, stat.st_size)
+    conn.execute(
+        """
+        INSERT INTO album_photos(album_id, photo_id, relative_path, filename, mtime, file_size, is_missing)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(album_id, photo_id, relative_path) DO UPDATE SET
+            filename=excluded.filename,
+            mtime=excluded.mtime,
+            file_size=excluded.file_size,
+            is_missing=0,
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        (album["id"], photo_id, relative_path, image_path.name, stat.st_mtime, stat.st_size),
+    )
+    ensure_thumbnail(image_path, thumbnail_root, checksum)
+    rescan_metadata(conn, photo_id, image_path)
+    return photo_id
+
+
+def find_output_album_for_path(conn, image_path):
+    image_path = Path(image_path).resolve()
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM albums
+        WHERE type='output'
+        ORDER BY CASE name WHEN 'output' THEN 0 ELSE 1 END, name COLLATE NOCASE
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            image_path.relative_to(Path(row["path"]).resolve())
+            return row
+        except ValueError:
+            continue
+    return None
+
+
+def output_paths_from_history(conn, filenames):
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM albums
+        WHERE type='output'
+        ORDER BY CASE name WHEN 'output' THEN 0 ELSE 1 END, name COLLATE NOCASE
+        """
+    ).fetchall()
+    paths = []
+    for filename in filenames:
+        normalized = _normalize_relative_image_name(filename)
+        for row in rows:
+            candidate = Path(row["path"]) / normalized
+            if candidate.exists():
+                paths.append(candidate)
+                break
+            basename_candidate = Path(row["path"]) / Path(normalized).name
+            if basename_candidate.exists():
+                paths.append(basename_candidate)
+                break
+    return paths
+
+
 def upsert_tag(conn, name):
     cleaned = name.strip()
     if not cleaned:

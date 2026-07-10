@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 from comfy_generation import (
     ComfyClient,
@@ -14,7 +14,7 @@ from comfy_generation import (
     build_edit_options,
     extract_history_filenames,
     list_lora_catalog,
-    patch_prompt,
+    patch_prompt_and_workflow,
 )
 from gallery_db import (
     ALLOWED_ALBUM_TYPES,
@@ -23,13 +23,13 @@ from gallery_db import (
     create_photo_link,
     discover_albums,
     find_photo_file,
-    find_latest_output_photo_after,
-    find_output_photo_by_name,
     get_photo_detail,
+    import_output_photo,
     init_db,
     list_albums,
     list_gallery_photos,
     list_tags,
+    output_paths_from_history,
     rescan_metadata,
     scan_albums,
     search_photos,
@@ -47,6 +47,8 @@ PER_PAGE = 100
 app = Flask(__name__)
 COMFY_CLIENT_FACTORY = ComfyClient
 SCAN_LOCK = threading.Lock()
+COMFY_JOB_LOCK = threading.Lock()
+COMFY_JOBS = {}
 SCAN_STATUS = {
     "active": False,
     "job_id": None,
@@ -72,6 +74,148 @@ def ensure_ready():
 
 def get_comfy_client():
     return COMFY_CLIENT_FACTORY()
+
+
+def create_comfy_job(photo_id, payload):
+    job_id = str(uuid4())
+    job = {
+        "id": job_id,
+        "photo_id": photo_id,
+        "active": True,
+        "state": "preparing",
+        "message": "Preparation",
+        "prompt_id": None,
+        "node": None,
+        "progress": None,
+        "progress_max": None,
+        "seed": None,
+        "output_filenames": [],
+        "photo": None,
+        "error": None,
+        "preview": None,
+        "preview_updated_at": None,
+        "started_at": time.time(),
+        "updated_at": time.time(),
+        "finished_at": None,
+    }
+    with COMFY_JOB_LOCK:
+        COMFY_JOBS[job_id] = job
+    thread = threading.Thread(target=run_comfy_job, args=(job_id, photo_id, payload), daemon=True)
+    thread.start()
+    return comfy_job_snapshot(job_id)
+
+
+def update_comfy_job(job_id, **updates):
+    with COMFY_JOB_LOCK:
+        job = COMFY_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+
+def comfy_job_snapshot(job_id):
+    with COMFY_JOB_LOCK:
+        job = COMFY_JOBS.get(job_id)
+        if not job:
+            return None
+        snapshot = {key: value for key, value in job.items() if key != "preview"}
+        snapshot["preview_available"] = bool(job.get("preview"))
+        return deepcopy(snapshot)
+
+
+def comfy_job_preview(job_id):
+    with COMFY_JOB_LOCK:
+        job = COMFY_JOBS.get(job_id)
+        if not job:
+            return None, None
+        preview = job.get("preview")
+        updated_at = job.get("preview_updated_at")
+    return preview, updated_at
+
+
+def run_comfy_job(job_id, photo_id, payload):
+    client = get_comfy_client()
+    try:
+        uploaded_images = {}
+        update_comfy_job(job_id, state="preparing", message="Upload des references")
+        with connect_db(DB_PATH) as conn:
+            detail = get_photo_detail(conn, photo_id)
+            if not detail:
+                raise ValueError("Photo not found")
+            for reference in payload.get("references") or []:
+                node_id = str(reference.get("node_id"))
+                target_photo_id = reference.get("photo_id")
+                if not node_id or not target_photo_id:
+                    continue
+                image_path = find_photo_file(conn, int(target_photo_id))
+                if not image_path:
+                    raise ValueError(f"Reference photo {target_photo_id} not found")
+                uploaded_images[node_id] = client.upload_image(image_path)
+            prompt, workflow, patch_info = patch_prompt_and_workflow(detail, payload, uploaded_images=uploaded_images)
+
+        update_comfy_job(job_id, state="queued", message="Envoi a ComfyUI", seed=patch_info.get("seed"))
+
+        def on_progress(progress):
+            if progress.get("preview"):
+                update_comfy_job(job_id, preview=progress["preview"], preview_updated_at=time.time())
+                return
+            updates = {}
+            if progress.get("state"):
+                updates["state"] = progress["state"]
+            if "prompt_id" in progress:
+                updates["prompt_id"] = progress.get("prompt_id")
+            if "node" in progress:
+                updates["node"] = progress.get("node")
+            if "value" in progress or "max" in progress:
+                updates["progress"] = progress.get("value")
+                updates["progress_max"] = progress.get("max")
+            if updates:
+                message = "Generation en cours" if updates.get("state") == "running" else None
+                if message:
+                    updates["message"] = message
+                update_comfy_job(job_id, **updates)
+
+        prompt_id, history = client.run_prompt(prompt, workflow, job_id, progress_callback=on_progress)
+        output_filenames = extract_history_filenames(history)
+        update_comfy_job(
+            job_id,
+            state="importing",
+            message="Import de l'image generee",
+            prompt_id=prompt_id,
+            output_filenames=output_filenames,
+        )
+
+        generated_photo = None
+        with connect_db(DB_PATH) as conn:
+            output_paths = output_paths_from_history(conn, output_filenames)
+            if not output_paths:
+                raise ComfyGenerationError("Generated output file was not found in the output album")
+            generated_photo_id = None
+            for output_path in output_paths:
+                generated_photo_id = import_output_photo(conn, output_path, THUMBNAIL_ROOT)
+            if generated_photo_id and generated_photo_id != photo_id:
+                create_photo_link(conn, photo_id, generated_photo_id, "variant")
+                generated_photo = get_photo_detail(conn, generated_photo_id)
+        update_comfy_job(
+            job_id,
+            active=False,
+            state="done",
+            message="Image generee",
+            prompt_id=prompt_id,
+            photo=generated_photo,
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        update_comfy_job(
+            job_id,
+            active=False,
+            state="error",
+            message=str(exc),
+            error=str(exc),
+            finished_at=time.time(),
+        )
 
 
 def selected_album_name(albums, requested):
@@ -269,59 +413,35 @@ def api_comfy_edit_options(photo_id):
 def api_comfy_generate(photo_id):
     ensure_ready()
     payload = request.get_json(silent=True) or {}
-    started_at = time.time()
     client = get_comfy_client()
     if not client.is_available():
         return jsonify({"ok": False, "error": "ComfyUI is not available"}), 503
+    with connect_db(DB_PATH) as conn:
+        if not get_photo_detail(conn, photo_id):
+            return jsonify({"ok": False, "error": "Photo not found"}), 404
+    job = create_comfy_job(photo_id, payload)
+    return jsonify({"ok": True, "job": job}), 202
 
-    try:
-        uploaded_images = {}
-        with connect_db(DB_PATH) as conn:
-            detail = get_photo_detail(conn, photo_id)
-            if not detail:
-                return jsonify({"ok": False, "error": "Photo not found"}), 404
-            for reference in payload.get("references") or []:
-                node_id = str(reference.get("node_id"))
-                target_photo_id = reference.get("photo_id")
-                if not node_id or not target_photo_id:
-                    continue
-                image_path = find_photo_file(conn, int(target_photo_id))
-                if not image_path:
-                    return jsonify({"ok": False, "error": f"Reference photo {target_photo_id} not found"}), 400
-                uploaded_images[node_id] = client.upload_image(image_path)
-            prompt, patch_info = patch_prompt(detail, payload, uploaded_images=uploaded_images)
 
-        queued = client.queue_prompt(prompt)
-        prompt_id = queued.get("prompt_id")
-        if not prompt_id:
-            raise ComfyGenerationError("ComfyUI did not return a prompt_id")
-        history = client.wait_for_history(prompt_id)
-        output_filenames = extract_history_filenames(history)
+@app.get("/api/comfy/jobs/<job_id>")
+def api_comfy_job(job_id):
+    job = comfy_job_snapshot(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Job not found"}), 404
+    return jsonify({"ok": True, "job": job})
 
-        scan_albums(DB_PATH, IMAGES_ROOT, THUMBNAIL_ROOT, scan_metadata=True)
-        with connect_db(DB_PATH) as conn:
-            generated_photo_id = find_output_photo_by_name(conn, output_filenames)
-            if generated_photo_id is None:
-                generated_photo_id = find_latest_output_photo_after(conn, started_at - 1)
-            generated_photo = None
-            if generated_photo_id and generated_photo_id != photo_id:
-                create_photo_link(conn, photo_id, generated_photo_id, "variant")
-                generated_photo = get_photo_detail(conn, generated_photo_id)
-        return jsonify(
-            {
-                "ok": True,
-                "prompt_id": prompt_id,
-                "seed": patch_info.get("seed"),
-                "output_filenames": output_filenames,
-                "photo": generated_photo,
-            }
-        )
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except ComfyUnavailable as exc:
-        return jsonify({"ok": False, "error": f"ComfyUI is not available: {exc}"}), 503
-    except ComfyGenerationError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 502
+
+@app.get("/api/comfy/jobs/<job_id>/preview")
+def api_comfy_job_preview(job_id):
+    preview, updated_at = comfy_job_preview(job_id)
+    if preview is None:
+        return Response(status=404)
+    content_type = "image/png" if preview.startswith(b"\x89PNG") else "image/jpeg"
+    response = Response(preview, mimetype=content_type)
+    response.headers["Cache-Control"] = "no-store"
+    if updated_at:
+        response.headers["X-Preview-Updated-At"] = str(updated_at)
+    return response
 
 
 @app.post("/api/photos/<int:photo_id>/metadata/rescan")

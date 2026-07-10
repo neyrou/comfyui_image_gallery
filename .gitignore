@@ -3,3 +3,4 @@ static/images/**
 instance/**
 __pycache__/**
 tests/__pycache__/**
+static/private_exemples/**

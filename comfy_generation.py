@@ -5,7 +5,10 @@ import random
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 from urllib import error, request
+
+import websocket
 
 from metadata_extractor import _is_blacklisted_lora
 
@@ -86,8 +89,91 @@ class ComfyClient:
         subfolder = data.get("subfolder")
         return f"{subfolder}/{name}" if subfolder else name
 
-    def queue_prompt(self, prompt):
-        return self.post_json("/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4())}, timeout=max(self.timeout, 10))
+    def queue_prompt(self, prompt, client_id=None, workflow=None):
+        payload = {"prompt": prompt, "client_id": client_id or str(uuid.uuid4())}
+        if workflow is not None:
+            payload["extra_data"] = {
+                "workflow": workflow,
+                "extra_pnginfo": {"workflow": workflow},
+            }
+        return self.post_json("/prompt", payload, timeout=max(self.timeout, 10))
+
+    def run_prompt(self, prompt, workflow, client_id, progress_callback=None):
+        ws = None
+        try:
+            ws = websocket.create_connection(self.websocket_url(client_id), timeout=max(self.timeout, 10))
+        except Exception:
+            ws = None
+
+        queued = self.queue_prompt(prompt, client_id=client_id, workflow=workflow)
+        prompt_id = queued.get("prompt_id")
+        if not prompt_id:
+            raise ComfyGenerationError("ComfyUI did not return a prompt_id")
+        self._progress(progress_callback, state="queued", prompt_id=prompt_id)
+
+        if ws is None:
+            history = self.wait_for_history(prompt_id)
+            self._progress(progress_callback, state="done", prompt_id=prompt_id)
+            return prompt_id, history
+
+        try:
+            history = self.listen_for_completion(ws, prompt_id, progress_callback=progress_callback)
+            return prompt_id, history
+        except websocket.WebSocketException:
+            history = self.wait_for_history(prompt_id)
+            self._progress(progress_callback, state="done", prompt_id=prompt_id)
+            return prompt_id, history
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def websocket_url(self, client_id):
+        parsed = urlparse(self.base_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return f"{scheme}://{parsed.netloc}/ws?clientId={client_id}"
+
+    def listen_for_completion(self, ws, prompt_id, progress_callback=None, timeout=3600):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                message = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            if isinstance(message, bytes):
+                preview = extract_preview_bytes(message)
+                if preview:
+                    self._progress(progress_callback, preview=preview)
+                continue
+            try:
+                data = json.loads(message)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            event_type = data.get("type")
+            payload = data.get("data") or {}
+            if event_type == "executing":
+                node = payload.get("node")
+                self._progress(progress_callback, state="running", prompt_id=prompt_id, node=node)
+                if payload.get("prompt_id") == prompt_id and node is None:
+                    history = self.wait_for_history(prompt_id, timeout=30)
+                    self._progress(progress_callback, state="done", prompt_id=prompt_id, node=None)
+                    return history
+            elif event_type == "progress":
+                self._progress(
+                    progress_callback,
+                    state="running",
+                    prompt_id=prompt_id,
+                    value=payload.get("value"),
+                    max=payload.get("max"),
+                )
+            elif event_type in {"executed", "status"}:
+                self._progress(progress_callback, state="running", prompt_id=prompt_id)
+        raise ComfyGenerationError("Generation timed out")
+
+    def _progress(self, progress_callback, **payload):
+        if progress_callback:
+            progress_callback(payload)
 
     def wait_for_history(self, prompt_id, timeout=180, interval=1):
         deadline = time.time() + timeout
@@ -157,6 +243,11 @@ def build_edit_options(detail, lora_catalog):
 
 
 def patch_prompt(detail, payload, uploaded_images=None, rng=None):
+    patched, _workflow, info = patch_prompt_and_workflow(detail, payload, uploaded_images=uploaded_images, rng=rng)
+    return patched, info
+
+
+def patch_prompt_and_workflow(detail, payload, uploaded_images=None, rng=None):
     metadata = detail.get("metadata") or {}
     prompt = loads_json(metadata.get("raw_prompt_json"))
     workflow = loads_json(metadata.get("raw_workflow_json"))
@@ -164,23 +255,27 @@ def patch_prompt(detail, payload, uploaded_images=None, rng=None):
         raise ValueError("Cette image ne contient pas de prompt ComfyUI exploitable")
 
     patched = copy.deepcopy(prompt)
+    patched_workflow = copy.deepcopy(workflow) if isinstance(workflow, dict) else None
     nodes = normalize_prompt_nodes(patched)
-    workflow_nodes = normalize_workflow_nodes(workflow)
+    workflow_nodes = normalize_workflow_nodes(patched_workflow)
     bypassed_ids = bypassed_node_ids(workflow_nodes)
     active_nodes = {node_id: node for node_id, node in nodes.items() if node_id not in bypassed_ids}
 
     prompt_text = str(payload.get("prompt") or "").strip()
     if prompt_text:
         apply_prompt_text(active_nodes, prompt_text)
+        apply_workflow_prompt_text(patched_workflow, active_nodes, prompt_text)
 
     steps = payload.get("steps")
     if steps not in (None, ""):
         apply_steps(active_nodes, int(steps))
+        apply_workflow_steps(patched_workflow, active_nodes, int(steps))
 
     seed = current_seed(active_nodes)
     if payload.get("seed_mode") == "random" or seed is None:
         seed = (rng or random.SystemRandom()).randint(0, MAX_SEED)
     apply_seed(active_nodes, seed)
+    apply_workflow_seed(patched_workflow, active_nodes, seed)
 
     for lora in payload.get("loras") or []:
         node_id = str(lora.get("node_id"))
@@ -202,6 +297,7 @@ def patch_prompt(detail, payload, uploaded_images=None, rng=None):
                 widgets[0] = name
             if len(widgets) > 1:
                 widgets[1] = strength
+        apply_workflow_lora(patched_workflow, node_id, name, strength, enabled=bool(lora.get("enabled", True)))
 
     uploaded_images = uploaded_images or {}
     for node_id, image_name in uploaded_images.items():
@@ -211,8 +307,9 @@ def patch_prompt(detail, payload, uploaded_images=None, rng=None):
             widgets = node.get("widgets_values")
             if isinstance(widgets, list) and widgets:
                 widgets[0] = image_name
+            apply_workflow_image(patched_workflow, str(node_id), image_name)
 
-    return patched, {"seed": seed}
+    return patched, patched_workflow, {"seed": seed}
 
 
 def normalize_prompt_nodes(prompt):
@@ -343,6 +440,122 @@ def apply_steps(nodes, steps):
         raise ValueError("Aucun champ steps numerique n'a ete trouve")
 
 
+def workflow_node_map(workflow):
+    return normalize_workflow_nodes(workflow)
+
+
+def apply_workflow_prompt_text(workflow, active_nodes, prompt_text):
+    if not isinstance(workflow, dict):
+        return
+    workflow_nodes = workflow_node_map(workflow)
+    for node_id in prompt_text_node_ids(active_nodes):
+        node = active_nodes.get(str(node_id), {})
+        inputs = node.get("inputs", {})
+        widget_name = next(
+            (key for key in ("value", "prompt", "text", "positive") if key in inputs and not isinstance(inputs.get(key), list)),
+            "value",
+        )
+        set_workflow_widget(workflow_nodes.get(str(node_id)), widget_name, prompt_text)
+
+
+def apply_workflow_steps(workflow, active_nodes, steps):
+    if not isinstance(workflow, dict):
+        return
+    workflow_nodes = workflow_node_map(workflow)
+    for node_id, node in active_nodes.items():
+        if "steps" in node.get("inputs", {}):
+            set_workflow_widget(workflow_nodes.get(str(node_id)), "steps", steps)
+
+
+def apply_workflow_seed(workflow, active_nodes, seed):
+    if not isinstance(workflow, dict):
+        return
+    workflow_nodes = workflow_node_map(workflow)
+    for node_id, node in active_nodes.items():
+        inputs = node.get("inputs", {})
+        if "seed_noise" in inputs:
+            set_workflow_widget(workflow_nodes.get(str(node_id)), "seed_noise", seed)
+        if "seed" in inputs:
+            set_workflow_widget(workflow_nodes.get(str(node_id)), "seed", seed)
+        if node.get("class_type", "").lower().startswith("seed"):
+            workflow_node = workflow_nodes.get(str(node_id))
+            if workflow_node and isinstance(workflow_node.get("widgets_values"), list):
+                ensure_widget_index(workflow_node, 0)
+                workflow_node["widgets_values"][0] = seed
+    seed_widgets = workflow.get("seed_widgets")
+    if isinstance(seed_widgets, dict):
+        for node_id, widget_index in seed_widgets.items():
+            workflow_node = workflow_nodes.get(str(node_id))
+            if workflow_node and isinstance(widget_index, int):
+                ensure_widget_index(workflow_node, widget_index)
+                workflow_node["widgets_values"][widget_index] = seed
+
+
+def apply_workflow_lora(workflow, node_id, name, strength, enabled=True):
+    if not isinstance(workflow, dict):
+        return
+    workflow_node = workflow_node_map(workflow).get(str(node_id))
+    if not workflow_node:
+        return
+    workflow_node["mode"] = 0 if enabled else 4
+    set_workflow_widget(workflow_node, "lora_name", name)
+    set_workflow_widget(workflow_node, "strength_model", strength)
+
+
+def apply_workflow_image(workflow, node_id, image_name):
+    if not isinstance(workflow, dict):
+        return
+    workflow_node = workflow_node_map(workflow).get(str(node_id))
+    if not workflow_node:
+        return
+    set_workflow_widget(workflow_node, "image", image_name)
+    properties = workflow_node.setdefault("properties", {})
+    if isinstance(properties, dict) and "image" in properties:
+        properties["image"] = image_name
+
+
+def set_workflow_widget(workflow_node, widget_name, value):
+    if not workflow_node:
+        return False
+    index = workflow_widget_index(workflow_node, widget_name)
+    if index is None:
+        fallback = fallback_widget_index(workflow_node, widget_name)
+        if fallback is None:
+            return False
+        index = fallback
+    ensure_widget_index(workflow_node, index)
+    workflow_node["widgets_values"][index] = value
+    return True
+
+
+def workflow_widget_index(workflow_node, widget_name):
+    widget_index = 0
+    for item in workflow_node.get("inputs") or []:
+        if not isinstance(item, dict) or "widget" not in item:
+            continue
+        if item.get("name") == widget_name or item.get("widget", {}).get("name") == widget_name:
+            return widget_index
+        widget_index += 1
+    return None
+
+
+def fallback_widget_index(workflow_node, widget_name):
+    node_type = workflow_node.get("type")
+    if node_type == "LoadImage" and widget_name == "image":
+        return 0
+    if node_type == "LoraLoaderModelOnly":
+        return {"lora_name": 0, "strength_model": 1}.get(widget_name)
+    if str(node_type).lower().startswith("seed") and widget_name == "seed":
+        return 0
+    return None
+
+
+def ensure_widget_index(workflow_node, index):
+    widgets = workflow_node.setdefault("widgets_values", [])
+    while len(widgets) <= index:
+        widgets.append(None)
+
+
 def lora_options(nodes, workflow_nodes, bypassed_ids):
     options = []
     for node_id, node in nodes.items():
@@ -447,6 +660,16 @@ def extract_history_filenames(history):
                     subfolder = item.get("subfolder")
                     filenames.append(f"{subfolder}/{filename}" if subfolder else filename)
     return filenames
+
+
+def extract_preview_bytes(message):
+    for marker in (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"):
+        index = message.find(marker)
+        if index >= 0:
+            return message[index:]
+    if len(message) > 8:
+        return message[8:]
+    return None
 
 
 def int_or_text_key(value):
