@@ -1,44 +1,169 @@
 <!DOCTYPE html>
-<html>
+<html lang="fr">
 <head>
-    <title>ComfyUI Output Images</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ComfyUI Image Gallery</title>
     <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css') }}">
-    <link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/fancybox/3.5.7/jquery.fancybox.min.css">
 </head>
-<body class="dark-mode">
-    <header>
-        <div class="logo-container">
+<body>
+    <header class="topbar">
+        <div class="brand">
             <img class="logo" src="{{ url_for('static', filename='logo.png') }}" alt="ComfyUI Logo">
+            <div>
+                <h1>ComfyUI Gallery</h1>
+                {% if selected_album %}
+                    <p>{{ selected_album.display_name }} · {{ selected_album.type }} · {{ selected_album.photo_count or 0 }} images</p>
+                {% else %}
+                    <p>Aucun album disponible</p>
+                {% endif %}
+            </div>
+        </div>
+        <div class="toolbar">
+            <label class="field">
+                <span>Album</span>
+                <select id="album-select">
+                    {% for album in albums %}
+                        <option value="{{ album.name }}" {% if selected_album and album.name == selected_album.name %}selected{% endif %}>
+                            {{ album.display_name }} ({{ album.type }})
+                        </option>
+                    {% endfor %}
+                </select>
+            </label>
+            <button id="scan-button" type="button">Rescan albums</button>
+            <button id="admin-button" type="button">Gérer</button>
         </div>
     </header>
-    <ul class="image-list">
-        {% for thumbnail in current_thumbnails %}
-            <li>
-                <a data-fancybox="gallery" href="{{ url_for('static', filename='images/output/' + thumbnail) }}">
-                    <div class="thumbnail">
-                        <img src="{{ url_for('static', filename='thumbnails/' + thumbnail) }}" alt="{{ thumbnail }}">
-                    </div>
-                </a>
-            </li>
-        {% endfor %}
-    </ul>
-    <div class="pagination">
-        {% if page > 1 %}
-            <a href="?page=1">&laquo; First</a>
-            <a href="?page={{ page - 1 }}">Previous</a>
-        {% endif %}
-        {% for p in range(1, total_pages + 1) %}
-            <a href="?page={{ p }}" {% if p == page %}class="current-page"{% endif %}>{{ p }}</a>
-        {% endfor %}
-        {% if page < total_pages %}
-            <a href="?page={{ page + 1 }}">Next</a>
-            <a href="?page={{ total_pages }}">Last &raquo;</a>
-        {% endif %}
+
+    {% if selected_album and selected_album.scan_error %}
+        <div class="notice">Album illisible: {{ selected_album.scan_error }}</div>
+    {% endif %}
+
+    <div class="scan-status" id="scan-status" hidden>
+        <strong id="scan-status-title">Scan</strong>
+        <span id="scan-status-message">En attente...</span>
+        <small id="scan-status-detail"></small>
     </div>
-    <footer class="footer">
-    All images are copyrighted &#169; 2023
-    </footer>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/fancybox/3.5.7/jquery.fancybox.min.js"></script>
+
+    <main>
+        {% if photos %}
+            <ul class="image-list" id="gallery-list">
+                {% for photo in photos %}
+                    <li>
+                        <button class="thumbnail" type="button" data-photo-id="{{ photo.id }}">
+                            <img src="{{ photo.thumbnail_url }}" alt="{{ photo.filename }}" loading="lazy">
+                            {% if photo.favorite %}
+                                <span class="favorite-badge" title="Présent dans output et dans un album user">
+                                    ★{% if photo.user_album_count > 1 %}<small>{{ photo.user_album_count }}</small>{% endif %}
+                                </span>
+                            {% endif %}
+                            <span class="filename">{{ photo.filename }}</span>
+                        </button>
+                    </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <section class="empty-state">
+                <h2>Aucune image scannée</h2>
+                <p>Lance un rescan si les dossiers viennent d’être ajoutés ou si les albums sont des liens symboliques.</p>
+            </section>
+        {% endif %}
+
+        <nav class="pagination" aria-label="Pagination">
+            {% if selected_album and page > 1 %}
+                <a href="?album={{ selected_album.name }}&page=1">Première</a>
+                <a href="?album={{ selected_album.name }}&page={{ page - 1 }}">Précédente</a>
+            {% endif %}
+            {% if selected_album %}
+                {% for p in range(1, total_pages + 1) %}
+                    <a href="?album={{ selected_album.name }}&page={{ p }}" {% if p == page %}class="current-page"{% endif %}>{{ p }}</a>
+                {% endfor %}
+            {% endif %}
+            {% if selected_album and page < total_pages %}
+                <a href="?album={{ selected_album.name }}&page={{ page + 1 }}">Suivante</a>
+                <a href="?album={{ selected_album.name }}&page={{ total_pages }}">Dernière</a>
+            {% endif %}
+        </nav>
+    </main>
+
+    <div class="modal" id="photo-modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close-modal></div>
+        <section class="photo-viewer" role="dialog" aria-modal="true" aria-label="Photo">
+            <div class="viewer-stage">
+                <img id="viewer-image" alt="">
+                <div class="viewer-actions">
+                    <button type="button" id="prev-button" title="Précédente">‹</button>
+                    <button type="button" id="play-button" title="Diaporama">▶</button>
+                    <button type="button" id="next-button" title="Suivante">›</button>
+                    <button type="button" id="close-button" data-close-modal title="Fermer">×</button>
+                </div>
+                <div class="linked-strip" id="linked-strip"></div>
+            </div>
+            <aside class="details-panel">
+                <div class="panel-header">
+                    <h2 id="detail-title">Détails</h2>
+                    <button type="button" id="rescan-metadata-button">Rescan JSON</button>
+                </div>
+                <dl class="meta-list">
+                    <dt>Albums</dt>
+                    <dd id="detail-albums">-</dd>
+                    <dt>Seed</dt>
+                    <dd id="detail-seed">-</dd>
+                    <dt>Images sources</dt>
+                    <dd id="detail-used-images">-</dd>
+                    <dt>LoRA</dt>
+                    <dd id="detail-loras">-</dd>
+                </dl>
+                <section>
+                    <h3>Prompt</h3>
+                    <pre id="detail-prompt"></pre>
+                </section>
+                <section>
+                    <h3>Tags photo</h3>
+                    <div class="tag-row" id="detail-tags"></div>
+                    <div class="inline-form">
+                        <input id="photo-tags-input" type="text" placeholder="portrait, favori, a trier">
+                        <button id="save-photo-tags-button" type="button">Enregistrer</button>
+                    </div>
+                </section>
+                <section>
+                    <h3>Liens</h3>
+                    <div class="link-list" id="detail-links"></div>
+                    <div class="inline-form">
+                        <input id="link-search-input" type="search" placeholder="Chercher une photo">
+                        <select id="link-type-select">
+                            {% for link_type in allowed_link_types %}
+                                <option value="{{ link_type }}">{{ link_type }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="search-results" id="link-search-results"></div>
+                </section>
+            </aside>
+        </section>
+    </div>
+
+    <div class="modal" id="admin-modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close-admin></div>
+        <section class="admin-panel" role="dialog" aria-modal="true" aria-label="Gestion">
+            <div class="panel-header">
+                <h2>Gestion des albums</h2>
+                <button type="button" data-close-admin>×</button>
+            </div>
+            <div class="album-admin-list" id="album-admin-list"></div>
+        </section>
+    </div>
+
+    <footer class="footer">All images are copyrighted © 2023</footer>
+
+    <script>
+        window.galleryState = {
+            albums: {{ albums|tojson }},
+            photos: {{ photos|tojson }},
+            selectedAlbum: {{ selected_album|tojson }},
+            allowedAlbumTypes: {{ allowed_album_types|tojson }}
+        };
+    </script>
+    <script src="{{ url_for('static', filename='gallery.js') }}"></script>
 </body>
 </html>
