@@ -4,6 +4,8 @@ const state = {
     currentIndex: -1,
     playTimer: null,
     scanPollTimer: null,
+    scanStatusClosed: false,
+    detailsVisible: window.localStorage.getItem("gallery.detailsVisible") === "true",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -58,6 +60,7 @@ async function openPhoto(photoId) {
     state.currentPhoto = data.photo;
     state.currentIndex = state.photos.findIndex((photo) => photo.id === photoId);
     renderPhotoDetail(data.photo);
+    applyDetailsVisibility();
     $("#photo-modal").classList.add("open");
     $("#photo-modal").setAttribute("aria-hidden", "false");
 }
@@ -88,6 +91,23 @@ function renderPhotoDetail(photo) {
     $("#photo-tags-input").value = photo.tags.map((tag) => tag.name).join(", ");
     renderLinks(photo.links);
     renderLinkedStrip(photo.links);
+}
+
+function applyDetailsVisibility() {
+    const viewer = document.querySelector(".photo-viewer");
+    const button = $("#details-toggle-button");
+    if (!viewer || !button) {
+        return;
+    }
+    viewer.classList.toggle("details-open", state.detailsVisible);
+    button.setAttribute("aria-pressed", state.detailsVisible ? "true" : "false");
+    button.title = state.detailsVisible ? "Masquer les détails" : "Afficher les détails";
+}
+
+function toggleDetailsPanel() {
+    state.detailsVisible = !state.detailsVisible;
+    window.localStorage.setItem("gallery.detailsVisible", state.detailsVisible ? "true" : "false");
+    applyDetailsVisibility();
 }
 
 function renderLinks(links) {
@@ -260,8 +280,9 @@ async function saveAlbum(event) {
 async function scanAlbums() {
     const done = setBusy($("#scan-button"), "Scan...");
     try {
+        state.scanStatusClosed = false;
         const data = await fetchJson("/api/scan", { method: "POST", body: JSON.stringify({ metadata: false }) });
-        renderScanStatus(data.job);
+        renderScanStatus(data.job, { force: true });
         startScanPolling(done);
     } catch (error) {
         alert(error.message);
@@ -274,7 +295,7 @@ function startScanPolling(done) {
     state.scanPollTimer = window.setInterval(async () => {
         try {
             const data = await fetchJson("/api/scan/status");
-            renderScanStatus(data.job);
+            renderScanStatus(data.job, { force: true });
             if (!data.job.active) {
                 window.clearInterval(state.scanPollTimer);
                 done();
@@ -290,15 +311,22 @@ function startScanPolling(done) {
     }, 1000);
 }
 
-function renderScanStatus(job) {
+function renderScanStatus(job, options = {}) {
     const box = $("#scan-status");
     if (!box || !job) {
+        return;
+    }
+    if (!options.force && !job.active) {
+        return;
+    }
+    if (state.scanStatusClosed && !job.active) {
         return;
     }
     box.hidden = false;
     box.dataset.state = job.state || "running";
     $("#scan-status-title").textContent = job.state === "done" ? "Scan termine" : job.state === "error" ? "Scan en erreur" : "Scan en cours";
     $("#scan-status-message").textContent = job.message || "Scan...";
+    $("#scan-status-close").hidden = Boolean(job.active);
     const details = [];
     if (job.album) {
         details.push(`album: ${job.album}`);
@@ -318,11 +346,9 @@ function renderScanStatus(job) {
 async function resumeScanStatusIfNeeded() {
     try {
         const data = await fetchJson("/api/scan/status");
-        if (data.job.active || data.job.state === "done" || data.job.state === "error") {
-            renderScanStatus(data.job);
-        }
         if (data.job.active) {
             const done = setBusy($("#scan-button"), "Scan...");
+            renderScanStatus(data.job, { force: true });
             startScanPolling(done);
         }
     } catch (_error) {
@@ -335,6 +361,10 @@ function bindEvents() {
         window.location.href = `?album=${encodeURIComponent(event.target.value)}&page=1`;
     });
     $("#scan-button")?.addEventListener("click", scanAlbums);
+    $("#scan-status-close")?.addEventListener("click", () => {
+        state.scanStatusClosed = true;
+        $("#scan-status").hidden = true;
+    });
     $("#admin-button")?.addEventListener("click", openAdmin);
     $("#rescan-metadata-button")?.addEventListener("click", rescanCurrentMetadata);
     $("#save-photo-tags-button")?.addEventListener("click", savePhotoTags);
@@ -342,6 +372,7 @@ function bindEvents() {
     $("#prev-button")?.addEventListener("click", () => navigate(-1));
     $("#next-button")?.addEventListener("click", () => navigate(1));
     $("#play-button")?.addEventListener("click", toggleSlideshow);
+    $("#details-toggle-button")?.addEventListener("click", toggleDetailsPanel);
     $$("[data-close-modal]").forEach((button) => button.addEventListener("click", closePhotoModal));
     $$("[data-close-admin]").forEach((button) => button.addEventListener("click", closeAdmin));
 

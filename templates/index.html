@@ -40,9 +40,12 @@
     {% endif %}
 
     <div class="scan-status" id="scan-status" hidden>
-        <strong id="scan-status-title">Scan</strong>
-        <span id="scan-status-message">En attente...</span>
-        <small id="scan-status-detail"></small>
+        <div>
+            <strong id="scan-status-title">Scan</strong>
+            <span id="scan-status-message">En attente...</span>
+            <small id="scan-status-detail"></small>
+        </div>
+        <button type="button" id="scan-status-close" title="Fermer" hidden>×</button>
     </div>
 
     <main>
@@ -95,6 +98,7 @@
                     <button type="button" id="prev-button" title="Précédente">‹</button>
                     <button type="button" id="play-button" title="Diaporama">▶</button>
                     <button type="button" id="next-button" title="Suivante">›</button>
+                    <button type="button" id="details-toggle-button" title="Détails">...</button>
                     <button type="button" id="close-button" data-close-modal title="Fermer">×</button>
                 </div>
                 <div class="linked-strip" id="linked-strip"></div>

@@ -118,7 +118,9 @@ button:disabled {
 }
 
 .scan-status {
-    display: grid;
+    display: flex;
+    align-items: start;
+    justify-content: space-between;
     gap: 4px;
     max-width: 980px;
     margin: 14px auto 0;
@@ -126,6 +128,24 @@ button:disabled {
     border: 1px solid var(--line);
     border-radius: 8px;
     background: #282f34;
+}
+
+.scan-status[hidden],
+.scan-status button[hidden] {
+    display: none;
+}
+
+.scan-status > div {
+    display: grid;
+    min-width: 0;
+    gap: 4px;
+}
+
+.scan-status button {
+    width: 34px;
+    min-height: 34px;
+    padding: 0;
+    flex: 0 0 auto;
 }
 
 .scan-status[data-state="done"] {
@@ -255,7 +275,7 @@ button:disabled {
 .photo-viewer {
     position: relative;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 390px;
+    grid-template-columns: minmax(0, 1fr);
     width: min(1500px, calc(100vw - 28px));
     height: min(920px, calc(100vh - 28px));
     min-height: 0;
@@ -264,6 +284,10 @@ button:disabled {
     border: 1px solid #444;
     border-radius: 8px;
     overflow: hidden;
+}
+
+.photo-viewer.details-open {
+    grid-template-columns: minmax(0, 1fr) 390px;
 }
 
 .viewer-stage {
@@ -346,6 +370,15 @@ button:disabled {
     overflow: auto;
     padding: 18px;
     background: var(--surface);
+}
+
+.photo-viewer:not(.details-open) .details-panel {
+    display: none;
+}
+
+#details-toggle-button[aria-pressed="true"] {
+    background: var(--accent);
+    color: #211b00;
 }
 
 .panel-header {
@@ -530,12 +563,17 @@ pre {
 
     .photo-viewer {
         grid-template-columns: 1fr;
-        grid-template-rows: minmax(0, 58vh) minmax(0, 42vh);
+        grid-template-rows: minmax(0, 1fr);
         width: 100vw;
         height: 100vh;
         margin: 0;
         border: 0;
         border-radius: 0;
+    }
+
+    .photo-viewer.details-open {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(0, 58vh) minmax(0, 42vh);
     }
 
     .viewer-actions button {
