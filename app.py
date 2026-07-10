@@ -7,6 +7,15 @@ from uuid import uuid4
 
 from flask import Flask, jsonify, render_template, request
 
+from comfy_generation import (
+    ComfyClient,
+    ComfyGenerationError,
+    ComfyUnavailable,
+    build_edit_options,
+    extract_history_filenames,
+    list_lora_catalog,
+    patch_prompt,
+)
 from gallery_db import (
     ALLOWED_ALBUM_TYPES,
     ALLOWED_LINK_TYPES,
@@ -14,6 +23,8 @@ from gallery_db import (
     create_photo_link,
     discover_albums,
     find_photo_file,
+    find_latest_output_photo_after,
+    find_output_photo_by_name,
     get_photo_detail,
     init_db,
     list_albums,
@@ -34,6 +45,7 @@ DB_PATH = BASE_DIR / "instance" / "gallery.sqlite3"
 PER_PAGE = 100
 
 app = Flask(__name__)
+COMFY_CLIENT_FACTORY = ComfyClient
 SCAN_LOCK = threading.Lock()
 SCAN_STATUS = {
     "active": False,
@@ -56,6 +68,10 @@ def ensure_ready():
     init_db(DB_PATH)
     with connect_db(DB_PATH) as conn:
         discover_albums(conn, IMAGES_ROOT)
+
+
+def get_comfy_client():
+    return COMFY_CLIENT_FACTORY()
 
 
 def selected_album_name(albums, requested):
@@ -219,6 +235,12 @@ def api_scan_status():
     return jsonify({"ok": True, "job": scan_status_snapshot()})
 
 
+@app.get("/api/comfy/status")
+def api_comfy_status():
+    available = get_comfy_client().is_available()
+    return jsonify({"ok": True, "available": available})
+
+
 @app.get("/api/photos/<int:photo_id>")
 def api_photo_detail(photo_id):
     ensure_ready()
@@ -227,6 +249,79 @@ def api_photo_detail(photo_id):
     if not detail:
         return jsonify({"ok": False, "error": "Photo not found"}), 404
     return jsonify({"ok": True, "photo": detail})
+
+
+@app.get("/api/photos/<int:photo_id>/comfy/edit-options")
+def api_comfy_edit_options(photo_id):
+    ensure_ready()
+    try:
+        with connect_db(DB_PATH) as conn:
+            detail = get_photo_detail(conn, photo_id)
+            if not detail:
+                return jsonify({"ok": False, "error": "Photo not found"}), 404
+            options = build_edit_options(detail, list_lora_catalog(conn))
+        return jsonify({"ok": True, "options": options})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.post("/api/photos/<int:photo_id>/comfy/generate")
+def api_comfy_generate(photo_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    started_at = time.time()
+    client = get_comfy_client()
+    if not client.is_available():
+        return jsonify({"ok": False, "error": "ComfyUI is not available"}), 503
+
+    try:
+        uploaded_images = {}
+        with connect_db(DB_PATH) as conn:
+            detail = get_photo_detail(conn, photo_id)
+            if not detail:
+                return jsonify({"ok": False, "error": "Photo not found"}), 404
+            for reference in payload.get("references") or []:
+                node_id = str(reference.get("node_id"))
+                target_photo_id = reference.get("photo_id")
+                if not node_id or not target_photo_id:
+                    continue
+                image_path = find_photo_file(conn, int(target_photo_id))
+                if not image_path:
+                    return jsonify({"ok": False, "error": f"Reference photo {target_photo_id} not found"}), 400
+                uploaded_images[node_id] = client.upload_image(image_path)
+            prompt, patch_info = patch_prompt(detail, payload, uploaded_images=uploaded_images)
+
+        queued = client.queue_prompt(prompt)
+        prompt_id = queued.get("prompt_id")
+        if not prompt_id:
+            raise ComfyGenerationError("ComfyUI did not return a prompt_id")
+        history = client.wait_for_history(prompt_id)
+        output_filenames = extract_history_filenames(history)
+
+        scan_albums(DB_PATH, IMAGES_ROOT, THUMBNAIL_ROOT, scan_metadata=True)
+        with connect_db(DB_PATH) as conn:
+            generated_photo_id = find_output_photo_by_name(conn, output_filenames)
+            if generated_photo_id is None:
+                generated_photo_id = find_latest_output_photo_after(conn, started_at - 1)
+            generated_photo = None
+            if generated_photo_id and generated_photo_id != photo_id:
+                create_photo_link(conn, photo_id, generated_photo_id, "variant")
+                generated_photo = get_photo_detail(conn, generated_photo_id)
+        return jsonify(
+            {
+                "ok": True,
+                "prompt_id": prompt_id,
+                "seed": patch_info.get("seed"),
+                "output_filenames": output_filenames,
+                "photo": generated_photo,
+            }
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ComfyUnavailable as exc:
+        return jsonify({"ok": False, "error": f"ComfyUI is not available: {exc}"}), 503
+    except ComfyGenerationError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
 
 
 @app.post("/api/photos/<int:photo_id>/metadata/rescan")

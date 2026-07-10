@@ -633,6 +633,48 @@ def find_photo_file(conn, photo_id):
     return Path(row["path"]) / row["relative_path"]
 
 
+def find_output_photo_by_name(conn, names):
+    normalized_names = [_normalize_relative_image_name(name) for name in names if name]
+    if not normalized_names:
+        return None
+    basenames = [Path(name).name for name in normalized_names]
+    placeholders = ",".join("?" for _ in normalized_names)
+    basename_placeholders = ",".join("?" for _ in basenames)
+    row = conn.execute(
+        f"""
+        SELECT p.id
+        FROM photos p
+        JOIN album_photos ap ON ap.photo_id=p.id AND ap.is_missing=0
+        JOIN albums a ON a.id=ap.album_id
+        WHERE a.type='output'
+          AND (
+            REPLACE(ap.relative_path, '\\', '/') IN ({placeholders})
+            OR ap.filename IN ({basename_placeholders})
+          )
+        ORDER BY ap.mtime DESC
+        LIMIT 1
+        """,
+        (*normalized_names, *basenames),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def find_latest_output_photo_after(conn, since_timestamp):
+    row = conn.execute(
+        """
+        SELECT p.id
+        FROM photos p
+        JOIN album_photos ap ON ap.photo_id=p.id AND ap.is_missing=0
+        JOIN albums a ON a.id=ap.album_id
+        WHERE a.type='output' AND ap.mtime >= ?
+        ORDER BY ap.mtime DESC
+        LIMIT 1
+        """,
+        (since_timestamp,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def upsert_tag(conn, name):
     cleaned = name.strip()
     if not cleaned:

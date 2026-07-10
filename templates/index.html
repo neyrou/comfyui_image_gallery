@@ -106,7 +106,10 @@
             <aside class="details-panel">
                 <div class="panel-header">
                     <h2 id="detail-title">Détails</h2>
-                    <button type="button" id="rescan-metadata-button">Rescan JSON</button>
+                    <div class="panel-actions">
+                        <button type="button" id="comfy-generate-button" disabled>Regenerer</button>
+                        <button type="button" id="rescan-metadata-button">Rescan JSON</button>
+                    </div>
                 </div>
                 <dl class="meta-list">
                     <dt>Albums</dt>
@@ -144,6 +147,47 @@
                     <div class="search-results" id="link-search-results"></div>
                 </section>
             </aside>
+        </section>
+    </div>
+
+    <div class="modal" id="comfy-modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close-comfy></div>
+        <section class="comfy-panel" role="dialog" aria-modal="true" aria-label="Generation ComfyUI">
+            <div class="panel-header">
+                <h2>Generation ComfyUI</h2>
+                <button type="button" data-close-comfy>×</button>
+            </div>
+            <form id="comfy-form">
+                <label class="form-field">
+                    <span>Prompt</span>
+                    <textarea id="comfy-prompt" rows="7"></textarea>
+                </label>
+                <div class="comfy-grid">
+                    <label class="form-field">
+                        <span>Seed</span>
+                        <select id="comfy-seed-mode">
+                            <option value="keep">Garder</option>
+                            <option value="random">Nouveau</option>
+                        </select>
+                    </label>
+                    <label class="form-field">
+                        <span>Steps</span>
+                        <input id="comfy-steps" type="number" min="1" step="1">
+                    </label>
+                </div>
+                <section>
+                    <h3>LoRA</h3>
+                    <div class="comfy-list" id="comfy-loras"></div>
+                </section>
+                <section>
+                    <h3>Images sources</h3>
+                    <div class="comfy-list" id="comfy-references"></div>
+                </section>
+                <div class="comfy-status" id="comfy-status"></div>
+                <div class="panel-footer">
+                    <button type="submit" id="comfy-submit-button">Lancer</button>
+                </div>
+            </form>
         </section>
     </div>
 
