@@ -633,6 +633,61 @@ def find_photo_file(conn, photo_id):
     return Path(row["path"]) / row["relative_path"]
 
 
+def find_photo_file_in_album(conn, photo_id, album_name=None):
+    params = [photo_id]
+    album_filter = ""
+    if album_name:
+        album_filter = "AND a.name=?"
+        params.append(album_name)
+    row = conn.execute(
+        f"""
+        SELECT a.id AS album_id, a.name AS album_name, a.path, ap.relative_path
+        FROM album_photos ap
+        JOIN albums a ON a.id=ap.album_id
+        WHERE ap.photo_id=? AND ap.is_missing=0 {album_filter}
+        ORDER BY CASE a.type WHEN 'output' THEN 0 WHEN 'user' THEN 1 ELSE 2 END, a.name COLLATE NOCASE
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if not row:
+        return None
+    return dict(row) | {"path": Path(row["path"]) / row["relative_path"]}
+
+
+def delete_photo(conn, photo_id, thumbnail_root):
+    photo = conn.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+    if not photo:
+        return None
+    memberships = conn.execute(
+        """
+        SELECT a.path, ap.relative_path
+        FROM album_photos ap
+        JOIN albums a ON a.id=ap.album_id
+        WHERE ap.photo_id=? AND ap.is_missing=0
+        """,
+        (photo_id,),
+    ).fetchall()
+    deleted_files = []
+    seen_paths = set()
+    for membership in memberships:
+        image_path = (Path(membership["path"]) / membership["relative_path"]).resolve()
+        if image_path in seen_paths:
+            continue
+        seen_paths.add(image_path)
+        if image_path.exists():
+            if not image_path.is_file():
+                raise OSError(f"Not a file: {image_path}")
+            image_path.unlink()
+            deleted_files.append(str(image_path))
+    thumbnail_path = Path(thumbnail_root) / f"{photo['checksum']}.jpg"
+    if thumbnail_path.exists():
+        thumbnail_path.unlink()
+        deleted_files.append(str(thumbnail_path))
+    conn.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+    return {"photo_id": photo_id, "checksum": photo["checksum"], "deleted_files": deleted_files}
+
+
 def find_output_photo_by_name(conn, names):
     normalized_names = [_normalize_relative_image_name(name) for name in names if name]
     if not normalized_names:
@@ -680,6 +735,11 @@ def import_output_photo(conn, image_path, thumbnail_root):
     album = find_output_album_for_path(conn, image_path)
     if not album:
         raise ValueError("No output album contains this generated image")
+    return import_photo_into_album(conn, image_path, album, thumbnail_root)
+
+
+def import_photo_into_album(conn, image_path, album, thumbnail_root):
+    image_path = Path(image_path)
     relative_path = image_path.relative_to(Path(album["path"])).as_posix()
     stat = image_path.stat()
     checksum = checksum_file(image_path)

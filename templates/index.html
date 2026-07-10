@@ -99,6 +99,15 @@
                     <button type="button" id="play-button" title="Diaporama">▶</button>
                     <button type="button" id="next-button" title="Suivante">›</button>
                     <button type="button" id="details-toggle-button" title="Détails">...</button>
+                    <div class="viewer-menu">
+                        <button type="button" id="photo-actions-button" title="Actions" aria-haspopup="true" aria-expanded="false">&#9776;</button>
+                        <div class="viewer-menu-dropdown" id="photo-actions-menu" hidden>
+                            <button type="button" data-album-action-open="copy">copier vers...</button>
+                            <button type="button" data-album-action-open="move">deplacer vers...</button>
+                            <button type="button" id="comfy-generate-button" disabled>regenerer cette image</button>
+                            <button type="button" id="delete-photo-button" class="danger-menu-item">Supprimer</button>
+                        </div>
+                    </div>
                     <button type="button" id="close-button" data-close-modal title="Fermer">×</button>
                 </div>
                 <div class="linked-strip" id="linked-strip"></div>
@@ -107,8 +116,7 @@
                 <div class="panel-header">
                     <h2 id="detail-title">Détails</h2>
                     <div class="panel-actions">
-                        <button type="button" id="comfy-generate-button" disabled>Regenerer</button>
-                        <button type="button" id="rescan-metadata-button">Rescan JSON</button>
+                        <button type="button" id="rescan-metadata-button">JSON &#128472;</button>
                     </div>
                 </div>
                 <dl class="meta-list">
@@ -147,6 +155,27 @@
                     <div class="search-results" id="link-search-results"></div>
                 </section>
             </aside>
+        </section>
+    </div>
+
+    <div class="modal" id="album-action-modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close-album-action></div>
+        <section class="album-action-panel" role="dialog" aria-modal="true" aria-label="Album destination">
+            <div class="panel-header">
+                <h2 id="album-action-title">Choisir un album</h2>
+                <button type="button" data-close-album-action>×</button>
+            </div>
+            <form id="album-action-form">
+                <label class="form-field">
+                    <span>Album de destination</span>
+                    <select id="album-action-destination"></select>
+                </label>
+                <div class="comfy-status" id="album-action-status"></div>
+                <div class="panel-footer">
+                    <button type="button" data-close-album-action>Annuler</button>
+                    <button type="submit" id="album-action-submit">Valider</button>
+                </div>
+            </form>
         </section>
     </div>
 

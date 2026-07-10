@@ -1,6 +1,7 @@
 import threading
 import time
 import traceback
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
@@ -21,9 +22,13 @@ from gallery_db import (
     ALLOWED_LINK_TYPES,
     connect_db,
     create_photo_link,
+    delete_photo,
     discover_albums,
     find_photo_file,
+    find_photo_file_in_album,
     get_photo_detail,
+    get_album_by_name,
+    import_photo_into_album,
     import_output_photo,
     init_db,
     list_albums,
@@ -457,6 +462,82 @@ def api_rescan_metadata(photo_id):
             return jsonify({"ok": False, "error": str(exc)}), 400
         detail = get_photo_detail(conn, photo_id)
     return jsonify({"ok": True, "photo": detail})
+
+
+def unique_destination_path(destination_dir, filename):
+    destination_dir = Path(destination_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    candidate = destination_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 1
+    while True:
+        candidate = destination_dir / f"{stem}-{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+@app.post("/api/photos/<int:photo_id>/album-action")
+def api_photo_album_action(photo_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    action = payload.get("action")
+    destination_album_name = payload.get("destination_album_name")
+    source_album_name = payload.get("source_album_name")
+    if action not in {"copy", "move"}:
+        return jsonify({"ok": False, "error": "Invalid action"}), 400
+    if not destination_album_name:
+        return jsonify({"ok": False, "error": "Destination album is required"}), 400
+
+    with connect_db(DB_PATH) as conn:
+        source = find_photo_file_in_album(conn, photo_id, source_album_name) or find_photo_file_in_album(conn, photo_id)
+        if not source or not source["path"].exists():
+            return jsonify({"ok": False, "error": "Source photo file not found"}), 404
+        destination_album = get_album_by_name(conn, destination_album_name)
+        if not destination_album:
+            return jsonify({"ok": False, "error": "Destination album not found"}), 404
+        if action == "move" and destination_album["name"] == source["album_name"]:
+            return jsonify({"ok": False, "error": "Source and destination albums are identical"}), 400
+
+        try:
+            destination_path = unique_destination_path(destination_album["path"], source["path"].name)
+            if action == "copy":
+                shutil.copy2(source["path"], destination_path)
+            else:
+                shutil.move(str(source["path"]), str(destination_path))
+        except OSError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+        imported_photo_id = import_photo_into_album(conn, destination_path, destination_album, THUMBNAIL_ROOT)
+        if action == "move":
+            conn.execute(
+                """
+                UPDATE album_photos
+                SET is_missing=1, updated_at=CURRENT_TIMESTAMP
+                WHERE album_id=? AND photo_id=? AND relative_path=?
+                """,
+                (source["album_id"], photo_id, Path(source["relative_path"]).as_posix()),
+            )
+        detail = get_photo_detail(conn, imported_photo_id)
+        albums = list_albums(conn)
+    return jsonify({"ok": True, "photo": detail, "albums": albums, "action": action})
+
+
+@app.delete("/api/photos/<int:photo_id>")
+def api_delete_photo(photo_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        try:
+            result = delete_photo(conn, photo_id, THUMBNAIL_ROOT)
+        except OSError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if not result:
+            return jsonify({"ok": False, "error": "Photo not found"}), 404
+        albums = list_albums(conn)
+    return jsonify({"ok": True, "deleted": result, "albums": albums})
 
 
 @app.put("/api/photos/<int:photo_id>/tags")

@@ -15,6 +15,8 @@ const state = {
     swipeStartX: null,
     swipeStartY: null,
     swipeStartAt: 0,
+    albumActionMode: null,
+    albumActionSource: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -139,6 +141,25 @@ function addPhotoToCurrentGallery(photo) {
     gallery.insertAdjacentHTML("afterbegin", renderGalleryItem(galleryPhoto));
 }
 
+function removePhotoFromCurrentGallery(photoId) {
+    const gallery = $("#gallery-list");
+    state.photos = state.photos.filter((item) => item.id !== photoId);
+    gallery?.querySelector(`[data-photo-id="${photoId}"]`)?.closest("li")?.remove();
+    state.currentIndex = state.photos.findIndex((item) => state.currentPhoto && item.id === state.currentPhoto.id);
+}
+
+function syncPhotoInCurrentGallery(photo) {
+    if (!state.selectedAlbum) {
+        return;
+    }
+    if (photo.memberships.some((item) => item.album_name === state.selectedAlbum.name)) {
+        addPhotoToCurrentGallery(photo);
+        state.currentIndex = state.photos.findIndex((item) => item.id === photo.id);
+        return;
+    }
+    removePhotoFromCurrentGallery(photo.id);
+}
+
 function renderGalleryItem(photo) {
     return `
         <li>
@@ -237,10 +258,149 @@ async function refreshComfyStatus() {
     updateComfyButton();
 }
 
+function togglePhotoActionsMenu() {
+    const menu = $("#photo-actions-menu");
+    const button = $("#photo-actions-button");
+    if (!menu || !button) {
+        return;
+    }
+    const willOpen = menu.hidden;
+    menu.hidden = !willOpen;
+    button.setAttribute("aria-expanded", willOpen ? "true" : "false");
+}
+
+function closePhotoActionsMenu() {
+    const menu = $("#photo-actions-menu");
+    const button = $("#photo-actions-button");
+    if (menu) {
+        menu.hidden = true;
+    }
+    if (button) {
+        button.setAttribute("aria-expanded", "false");
+    }
+}
+
+function currentSourceMembership() {
+    if (!state.currentPhoto || !state.currentPhoto.memberships.length) {
+        return null;
+    }
+    return state.currentPhoto.memberships.find((item) => item.album_name === state.selectedAlbum?.name) || state.currentPhoto.memberships[0];
+}
+
+function albumActionLabel(mode) {
+    return mode === "move" ? "Deplacer vers..." : "Copier vers...";
+}
+
+function openAlbumActionModal(mode) {
+    if (!state.currentPhoto) {
+        return;
+    }
+    closePhotoActionsMenu();
+    state.albumActionMode = mode;
+    state.albumActionSource = currentSourceMembership();
+    $("#album-action-title").textContent = albumActionLabel(mode);
+    $("#album-action-submit").textContent = mode === "move" ? "Deplacer" : "Copier";
+    $("#album-action-status").textContent = "";
+    $("#album-action-status").classList.remove("error");
+    renderAlbumActionOptions();
+    $("#album-action-modal").classList.add("open");
+    $("#album-action-modal").setAttribute("aria-hidden", "false");
+}
+
+function closeAlbumActionModal() {
+    $("#album-action-modal").classList.remove("open");
+    $("#album-action-modal").setAttribute("aria-hidden", "true");
+    state.albumActionMode = null;
+    state.albumActionSource = null;
+}
+
+function renderAlbumActionOptions() {
+    const select = $("#album-action-destination");
+    const membershipNames = new Set((state.currentPhoto?.memberships || []).map((item) => item.album_name));
+    const sourceName = state.albumActionSource?.album_name;
+    const albums = state.albums.filter((album) => {
+        if (album.scan_error) {
+            return false;
+        }
+        if (state.albumActionMode === "move") {
+            return album.name !== sourceName;
+        }
+        return !membershipNames.has(album.name);
+    });
+    select.innerHTML = albums.map((album) => (
+        `<option value="${escapeHtml(album.name)}">${escapeHtml(album.display_name || album.name)} (${escapeHtml(album.type)})</option>`
+    )).join("");
+    const disabled = albums.length === 0;
+    select.disabled = disabled;
+    $("#album-action-submit").disabled = disabled;
+    if (disabled) {
+        $("#album-action-status").textContent = "Aucun album de destination disponible.";
+    }
+}
+
+async function submitAlbumAction(event) {
+    event.preventDefault();
+    if (!state.currentPhoto || !state.albumActionMode) {
+        return;
+    }
+    const done = setBusy($("#album-action-submit"), state.albumActionMode === "move" ? "Deplacement..." : "Copie...");
+    $("#album-action-status").textContent = "";
+    try {
+        const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/album-action`, {
+            method: "POST",
+            body: JSON.stringify({
+                action: state.albumActionMode,
+                destination_album_name: $("#album-action-destination").value,
+                source_album_name: state.albumActionSource?.album_name,
+            }),
+        });
+        state.albums = data.albums || state.albums;
+        state.currentPhoto = data.photo;
+        renderPhotoDetail(data.photo);
+        syncPhotoInCurrentGallery(data.photo);
+        closeAlbumActionModal();
+    } catch (error) {
+        $("#album-action-status").textContent = error.message;
+        $("#album-action-status").classList.add("error");
+    } finally {
+        done();
+    }
+}
+
+async function deleteCurrentPhoto() {
+    if (!state.currentPhoto) {
+        return;
+    }
+    closePhotoActionsMenu();
+    const filename = state.currentPhoto.memberships[0]?.filename || state.currentPhoto.checksum.slice(0, 12);
+    if (!window.confirm(`Supprimer definitivement "${filename}" de la base et du disque ?`)) {
+        return;
+    }
+    const deletedPhotoId = state.currentPhoto.id;
+    const currentIndex = state.photos.findIndex((photo) => photo.id === deletedPhotoId);
+    const remainingPhotos = state.photos.filter((photo) => photo.id !== deletedPhotoId);
+    const nextPhoto = remainingPhotos.length && currentIndex >= 0 ? remainingPhotos[Math.min(currentIndex, remainingPhotos.length - 1)] : null;
+    try {
+        const data = await fetchJson(`/api/photos/${deletedPhotoId}`, { method: "DELETE" });
+        state.albums = data.albums || state.albums;
+        removePhotoFromCurrentGallery(deletedPhotoId);
+        if (nextPhoto) {
+            await openPhoto(nextPhoto.id);
+        } else {
+            closePhotoModal();
+            state.currentPhoto = null;
+            state.currentIndex = -1;
+        }
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
 async function openComfyModal() {
     if (!state.currentPhoto) {
         return;
     }
+    closePhotoActionsMenu();
     const modal = $("#comfy-modal");
     modal.classList.add("open");
     modal.setAttribute("aria-hidden", "false");
@@ -728,6 +888,12 @@ function bindEvents() {
     $("#admin-button")?.addEventListener("click", openAdmin);
     $("#rescan-metadata-button")?.addEventListener("click", rescanCurrentMetadata);
     $("#comfy-generate-button")?.addEventListener("click", openComfyModal);
+    $("#delete-photo-button")?.addEventListener("click", deleteCurrentPhoto);
+    $("#photo-actions-button")?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        togglePhotoActionsMenu();
+    });
+    $("#album-action-form")?.addEventListener("submit", submitAlbumAction);
     $("#comfy-form")?.addEventListener("submit", submitComfyGeneration);
     $("#comfy-references")?.addEventListener("input", (event) => {
         if (event.target.matches("[data-comfy-ref-search]")) {
@@ -746,6 +912,7 @@ function bindEvents() {
     $$("[data-close-modal]").forEach((button) => button.addEventListener("click", closePhotoModal));
     $$("[data-close-admin]").forEach((button) => button.addEventListener("click", closeAdmin));
     $$("[data-close-comfy]").forEach((button) => button.addEventListener("click", closeComfyModal));
+    $$("[data-close-album-action]").forEach((button) => button.addEventListener("click", closeAlbumActionModal));
 
     $("#gallery-list")?.addEventListener("click", (event) => {
         const button = event.target.closest("[data-photo-id]");
@@ -755,6 +922,13 @@ function bindEvents() {
     });
 
     document.body.addEventListener("click", (event) => {
+        if (!event.target.closest(".viewer-menu")) {
+            closePhotoActionsMenu();
+        }
+        const albumAction = event.target.closest("[data-album-action-open]");
+        if (albumAction) {
+            openAlbumActionModal(albumAction.dataset.albumActionOpen);
+        }
         const linked = event.target.closest("[data-open-linked]");
         if (linked) {
             openPhoto(Number(linked.dataset.openLinked)).catch((error) => alert(error.message));
@@ -781,9 +955,11 @@ function bindEvents() {
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
+            closePhotoActionsMenu();
             closePhotoModal();
             closeAdmin();
             closeComfyModal();
+            closeAlbumActionModal();
         }
         if ($("#photo-modal").classList.contains("open") && event.key === "ArrowRight") {
             navigate(1);
