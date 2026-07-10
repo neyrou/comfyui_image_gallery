@@ -12,6 +12,9 @@ const state = {
     comfyJobPollTimer: null,
     comfyPreviewVersion: null,
     comfyPollFailures: 0,
+    swipeStartX: null,
+    swipeStartY: null,
+    swipeStartAt: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -527,6 +530,50 @@ function navigate(delta) {
     openPhoto(state.photos[nextIndex].id);
 }
 
+function resetViewerSwipe() {
+    state.swipeStartX = null;
+    state.swipeStartY = null;
+    state.swipeStartAt = 0;
+}
+
+function isInteractiveSwipeTarget(target) {
+    return Boolean(target.closest("button, input, select, textarea, a, [role='button']"));
+}
+
+function handleViewerTouchStart(event) {
+    if (event.touches.length !== 1 || isInteractiveSwipeTarget(event.target)) {
+        resetViewerSwipe();
+        return;
+    }
+    const touch = event.touches[0];
+    state.swipeStartX = touch.clientX;
+    state.swipeStartY = touch.clientY;
+    state.swipeStartAt = Date.now();
+}
+
+function handleViewerTouchEnd(event) {
+    if (state.swipeStartX === null || event.changedTouches.length !== 1) {
+        resetViewerSwipe();
+        return;
+    }
+    const touch = event.changedTouches[0];
+    const deltaX = touch.clientX - state.swipeStartX;
+    const deltaY = touch.clientY - state.swipeStartY;
+    const elapsed = Date.now() - state.swipeStartAt;
+    resetViewerSwipe();
+
+    if (!$("#photo-modal").classList.contains("open") || elapsed > 1200) {
+        return;
+    }
+
+    const horizontal = Math.abs(deltaX);
+    const vertical = Math.abs(deltaY);
+    if (horizontal < 55 || horizontal < vertical * 1.4) {
+        return;
+    }
+    navigate(deltaX < 0 ? 1 : -1);
+}
+
 function toggleSlideshow() {
     if (state.playTimer) {
         stopSlideshow();
@@ -693,6 +740,9 @@ function bindEvents() {
     $("#next-button")?.addEventListener("click", () => navigate(1));
     $("#play-button")?.addEventListener("click", toggleSlideshow);
     $("#details-toggle-button")?.addEventListener("click", toggleDetailsPanel);
+    $(".viewer-stage")?.addEventListener("touchstart", handleViewerTouchStart, { passive: true });
+    $(".viewer-stage")?.addEventListener("touchend", handleViewerTouchEnd, { passive: true });
+    $(".viewer-stage")?.addEventListener("touchcancel", resetViewerSwipe, { passive: true });
     $$("[data-close-modal]").forEach((button) => button.addEventListener("click", closePhotoModal));
     $$("[data-close-admin]").forEach((button) => button.addEventListener("click", closeAdmin));
     $$("[data-close-comfy]").forEach((button) => button.addEventListener("click", closeComfyModal));

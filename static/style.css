@@ -299,6 +299,7 @@ button:disabled {
     min-width: 0;
     overflow: hidden;
     background: #050505;
+    touch-action: pan-y;
 }
 
 #viewer-image {
