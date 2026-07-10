@@ -2,3 +2,4 @@ static/thumbnails/**
 static/images/**
 instance/**
 __pycache__/**
+tests/__pycache__/**

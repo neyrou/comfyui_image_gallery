@@ -66,6 +66,7 @@ class GalleryBackendTests(unittest.TestCase):
             ],
             "links": [[1, 3, 0, 4, 0, "IMAGE"]],
         }
+        create_png(self.images_root / "output" / "ref.png", color=(10, 90, 10))
         create_png(self.images_root / "output" / "source.png", prompt=__import__("json").dumps(prompt), workflow=__import__("json").dumps(workflow))
         create_png(self.images_root / "output" / "target.png", color=(90, 10, 10))
 
@@ -82,14 +83,20 @@ class GalleryBackendTests(unittest.TestCase):
             target_id = conn.execute(
                 "SELECT p.id FROM photos p JOIN album_photos ap ON ap.photo_id=p.id WHERE ap.filename='target.png'"
             ).fetchone()["id"]
+            ref_id = conn.execute(
+                "SELECT p.id FROM photos p JOIN album_photos ap ON ap.photo_id=p.id WHERE ap.filename='ref.png'"
+            ).fetchone()["id"]
 
         rescan = client.post(f"/api/photos/{source_id}/metadata/rescan")
         self.assertEqual(rescan.status_code, 200)
-        self.assertEqual(rescan.get_json()["photo"]["metadata"]["prompt"], "prompt from png")
+        rescanned_photo = rescan.get_json()["photo"]
+        self.assertEqual(rescanned_photo["metadata"]["prompt"], "prompt from png")
+        original_links = [link for link in rescanned_photo["links"] if link["type"] == "original"]
+        self.assertEqual(original_links[0]["linked_photo_id"], ref_id)
 
         link = client.post(f"/api/photos/{source_id}/links", json={"target_photo_id": target_id, "type": "variant"})
         self.assertEqual(link.status_code, 200)
-        self.assertEqual(link.get_json()["photo"]["links"][0]["type"], "variant")
+        self.assertIn("variant", [item["type"] for item in link.get_json()["photo"]["links"]])
 
 
 if __name__ == "__main__":

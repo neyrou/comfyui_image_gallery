@@ -398,7 +398,47 @@ def rescan_metadata(conn, photo_id, image_path):
             "INSERT OR IGNORE INTO photo_used_images(photo_id, image_name) VALUES (?, ?)",
             (photo_id, image_name),
         )
+        for source_photo_id in find_source_photo_ids_for_used_image(conn, photo_id, image_name):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO photo_links(source_photo_id, target_photo_id, type)
+                VALUES (?, ?, 'original')
+                """,
+                (photo_id, source_photo_id),
+            )
     return extracted
+
+
+def find_source_photo_ids_for_used_image(conn, current_photo_id, image_name):
+    normalized = _normalize_relative_image_name(image_name)
+    basename = Path(normalized).name
+    exact_rows = conn.execute(
+        """
+        SELECT DISTINCT photo_id
+        FROM album_photos
+        WHERE is_missing=0
+          AND photo_id != ?
+          AND REPLACE(relative_path, '\\', '/') = ?
+        """,
+        (current_photo_id, normalized),
+    ).fetchall()
+    rows = exact_rows
+    if not rows and basename:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT photo_id
+            FROM album_photos
+            WHERE is_missing=0
+              AND photo_id != ?
+              AND filename = ?
+            """,
+            (current_photo_id, basename),
+        ).fetchall()
+    return [row["photo_id"] for row in rows]
+
+
+def _normalize_relative_image_name(image_name):
+    return str(image_name).replace("\\", "/").lstrip("/")
 
 
 def _string_or_none(value):
