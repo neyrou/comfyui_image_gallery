@@ -17,6 +17,7 @@ const state = {
     swipeStartAt: 0,
     albumActionMode: null,
     albumActionSource: null,
+    photoModalHistoryActive: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -66,20 +67,39 @@ function setBusy(button, busyText) {
     };
 }
 
-async function openPhoto(photoId) {
+async function openPhoto(photoId, options = {}) {
+    const modal = $("#photo-modal");
+    const wasOpen = modal.classList.contains("open");
     const data = await fetchJson(`/api/photos/${photoId}`);
     state.currentPhoto = data.photo;
     state.currentIndex = state.photos.findIndex((photo) => photo.id === photoId);
     renderPhotoDetail(data.photo);
     applyDetailsVisibility();
-    $("#photo-modal").classList.add("open");
-    $("#photo-modal").setAttribute("aria-hidden", "false");
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+    if (!wasOpen && !options.skipHistory && !state.photoModalHistoryActive) {
+        window.history.pushState({ ...(window.history.state || {}), photoModal: true }, "", window.location.href);
+        state.photoModalHistoryActive = true;
+    }
 }
 
-function closePhotoModal() {
+function closePhotoModal(options = {}) {
+    const modal = $("#photo-modal");
+    if (!modal.classList.contains("open")) {
+        state.photoModalHistoryActive = false;
+        return;
+    }
+    if (!options.fromHistory && state.photoModalHistoryActive) {
+        window.history.back();
+        return;
+    }
     stopSlideshow();
-    $("#photo-modal").classList.remove("open");
-    $("#photo-modal").setAttribute("aria-hidden", "true");
+    closePhotoActionsMenu();
+    closeComfyModal();
+    closeAlbumActionModal();
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden", "true");
+    state.photoModalHistoryActive = false;
 }
 
 function renderPhotoDetail(photo) {
@@ -966,6 +986,12 @@ function bindEvents() {
         }
         if ($("#photo-modal").classList.contains("open") && event.key === "ArrowLeft") {
             navigate(-1);
+        }
+    });
+
+    window.addEventListener("popstate", () => {
+        if ($("#photo-modal").classList.contains("open") || state.photoModalHistoryActive) {
+            closePhotoModal({ fromHistory: true });
         }
     });
 }
