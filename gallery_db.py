@@ -544,7 +544,8 @@ def get_photo_detail(conn, photo_id):
         return None
     memberships = conn.execute(
         """
-        SELECT a.id AS album_id, a.name AS album_name, a.type, ap.relative_path, ap.filename
+        SELECT a.id AS album_id, a.name AS album_name, a.type, a.path AS album_path,
+               a.scan_error, ap.relative_path, ap.filename
         FROM album_photos ap
         JOIN albums a ON a.id = ap.album_id
         WHERE ap.photo_id=? AND ap.is_missing=0
@@ -565,15 +566,32 @@ def get_photo_detail(conn, photo_id):
         """,
         (photo_id,),
     ).fetchall()
-    first = memberships[0] if memberships else None
+    serialized_memberships = []
+    first_available = None
+    for row in memberships:
+        membership = dict(row)
+        file_path = Path(membership.pop("album_path")) / membership["relative_path"]
+        try:
+            available = file_path.is_file()
+        except OSError:
+            available = False
+        membership["available"] = available
+        membership["original_url"] = (
+            f"/static/images/{quote(membership['album_name'])}/{quote(membership['relative_path'])}"
+            if available
+            else None
+        )
+        serialized_memberships.append(membership)
+        if available and first_available is None:
+            first_available = membership
     return {
         "id": photo["id"],
         "checksum": photo["checksum"],
         "width": photo["width"],
         "height": photo["height"],
         "thumbnail_url": f"/static/thumbnails/{photo['checksum']}.jpg",
-        "original_url": f"/static/images/{quote(first['album_name'])}/{quote(first['relative_path'])}" if first else None,
-        "memberships": [dict(row) for row in memberships],
+        "original_url": first_available["original_url"] if first_available else None,
+        "memberships": serialized_memberships,
         "tags": [dict(row) for row in tags],
         "metadata": dict(metadata) if metadata else None,
         "loras": [dict(row) for row in loras],
@@ -617,20 +635,24 @@ def list_photo_links(conn, photo_id):
 
 
 def find_photo_file(conn, photo_id):
-    row = conn.execute(
+    rows = conn.execute(
         """
         SELECT a.path, ap.relative_path
         FROM album_photos ap
         JOIN albums a ON a.id=ap.album_id
         WHERE ap.photo_id=? AND ap.is_missing=0
         ORDER BY CASE a.type WHEN 'output' THEN 0 WHEN 'user' THEN 1 ELSE 2 END
-        LIMIT 1
         """,
         (photo_id,),
-    ).fetchone()
-    if not row:
-        return None
-    return Path(row["path"]) / row["relative_path"]
+    ).fetchall()
+    for row in rows:
+        candidate = Path(row["path"]) / row["relative_path"]
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def find_photo_file_in_album(conn, photo_id, album_name=None):
@@ -639,20 +661,24 @@ def find_photo_file_in_album(conn, photo_id, album_name=None):
     if album_name:
         album_filter = "AND a.name=?"
         params.append(album_name)
-    row = conn.execute(
+    rows = conn.execute(
         f"""
         SELECT a.id AS album_id, a.name AS album_name, a.path, ap.relative_path
         FROM album_photos ap
         JOIN albums a ON a.id=ap.album_id
         WHERE ap.photo_id=? AND ap.is_missing=0 {album_filter}
         ORDER BY CASE a.type WHEN 'output' THEN 0 WHEN 'user' THEN 1 ELSE 2 END, a.name COLLATE NOCASE
-        LIMIT 1
         """,
         params,
-    ).fetchone()
-    if not row:
-        return None
-    return dict(row) | {"path": Path(row["path"]) / row["relative_path"]}
+    ).fetchall()
+    for row in rows:
+        candidate = Path(row["path"]) / row["relative_path"]
+        try:
+            if candidate.is_file():
+                return dict(row) | {"path": candidate}
+        except OSError:
+            continue
+    return None
 
 
 def delete_photo(conn, photo_id, thumbnail_root):

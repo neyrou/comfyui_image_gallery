@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image, PngImagePlugin
 
 import app as app_module
-from gallery_db import connect_db, list_albums, list_gallery_photos, scan_albums
+from gallery_db import connect_db, find_photo_file, get_photo_detail, list_albums, list_gallery_photos, scan_albums
 
 
 def create_png(path, color=(20, 40, 60), prompt=None, workflow=None):
@@ -49,6 +49,27 @@ class GalleryBackendTests(unittest.TestCase):
             self.assertTrue(photos[0]["favorite"])
             self.assertEqual(photos[0]["album_count"], 2)
             self.assertEqual(photos[0]["user_album_count"], 1)
+
+    def test_photo_uses_available_album_when_another_membership_is_offline(self):
+        offline_album = self.images_root / "A-offline"
+        offline_album.mkdir()
+        available_image = self.images_root / "output" / "same.png"
+        offline_image = offline_album / "same.png"
+        create_png(available_image)
+        shutil.copyfile(available_image, offline_image)
+
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        shutil.rmtree(offline_album)
+
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            detail = get_photo_detail(conn, photo_id)
+            memberships = {item["album_name"]: item for item in detail["memberships"]}
+
+            self.assertFalse(memberships["A-offline"]["available"])
+            self.assertTrue(memberships["output"]["available"])
+            self.assertIn("/output/same.png", detail["original_url"])
+            self.assertEqual(find_photo_file(conn, photo_id), available_image)
 
     def test_api_rescan_metadata_and_photo_links(self):
         prompt = {

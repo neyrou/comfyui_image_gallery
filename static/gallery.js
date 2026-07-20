@@ -15,6 +15,16 @@ const state = {
     swipeStartX: null,
     swipeStartY: null,
     swipeStartAt: 0,
+    viewerLoadId: 0,
+    zoomScale: 1,
+    zoomTranslateX: 0,
+    zoomTranslateY: 0,
+    pinchStartDistance: null,
+    pinchStartScale: 1,
+    panStartX: null,
+    panStartY: null,
+    panStartTranslateX: 0,
+    panStartTranslateY: 0,
     albumActionMode: null,
     albumActionSource: null,
     photoModalHistoryActive: false,
@@ -70,7 +80,21 @@ function setBusy(button, busyText) {
 async function openPhoto(photoId, options = {}) {
     const modal = $("#photo-modal");
     const wasOpen = modal.classList.contains("open");
-    const data = await fetchJson(`/api/photos/${photoId}`);
+    const loadId = ++state.viewerLoadId;
+    resetViewerZoom();
+    setViewerLoading(true);
+    let data;
+    try {
+        data = await fetchJson(`/api/photos/${photoId}`);
+    } catch (error) {
+        if (loadId === state.viewerLoadId) {
+            setViewerLoading(false);
+        }
+        throw error;
+    }
+    if (loadId !== state.viewerLoadId) {
+        return;
+    }
     state.currentPhoto = data.photo;
     state.currentIndex = state.photos.findIndex((photo) => photo.id === photoId);
     renderPhotoDetail(data.photo);
@@ -81,6 +105,35 @@ async function openPhoto(photoId, options = {}) {
         window.history.pushState({ ...(window.history.state || {}), photoModal: true }, "", window.location.href);
         state.photoModalHistoryActive = true;
     }
+    await loadViewerImage(data.photo.original_url || data.photo.thumbnail_url, loadId);
+}
+
+function setViewerLoading(loading) {
+    const indicator = $("#viewer-loading");
+    if (indicator) {
+        indicator.hidden = !loading;
+    }
+}
+
+function loadViewerImage(url, loadId) {
+    return new Promise((resolve) => {
+        const preload = new Image();
+        preload.onload = () => {
+            if (loadId === state.viewerLoadId) {
+                resetViewerZoom();
+                $("#viewer-image").src = url;
+                setViewerLoading(false);
+            }
+            resolve();
+        };
+        preload.onerror = () => {
+            if (loadId === state.viewerLoadId) {
+                setViewerLoading(false);
+            }
+            resolve();
+        };
+        preload.src = url;
+    });
 }
 
 function closePhotoModal(options = {}) {
@@ -103,11 +156,16 @@ function closePhotoModal(options = {}) {
 }
 
 function renderPhotoDetail(photo) {
-    $("#viewer-image").src = photo.original_url || photo.thumbnail_url;
     $("#viewer-image").alt = photo.memberships[0]?.filename || photo.checksum;
     $("#detail-title").textContent = photo.memberships[0]?.filename || photo.checksum.slice(0, 12);
     $("#detail-albums").innerHTML = photo.memberships
-        .map((membership) => `<span class="tag">${escapeHtml(membership.album_name)} · ${escapeHtml(membership.type)}</span>`)
+        .map((membership) => `
+            <span class="tag album-membership ${membership.available ? "" : "unavailable"}"
+                  title="${membership.available ? "Album disponible" : "Album non joignable"}">
+                ${membership.available ? "" : '<span class="album-unavailable-icon" aria-label="Album non joignable">⚠</span>'}
+                ${escapeHtml(membership.album_name)} · ${escapeHtml(membership.type)}
+            </span>
+        `)
         .join("");
     const metadata = photo.metadata || {};
     $("#detail-seed").textContent = metadata.seed_noise || metadata.seed || "-";
@@ -716,11 +774,64 @@ function resetViewerSwipe() {
     state.swipeStartAt = 0;
 }
 
+function resetViewerZoom() {
+    state.zoomScale = 1;
+    state.zoomTranslateX = 0;
+    state.zoomTranslateY = 0;
+    state.pinchStartDistance = null;
+    state.pinchStartScale = 1;
+    state.panStartX = null;
+    state.panStartY = null;
+    applyViewerTransform();
+}
+
+function applyViewerTransform() {
+    $("#viewer-image").style.transform = `translate3d(${state.zoomTranslateX}px, ${state.zoomTranslateY}px, 0) scale(${state.zoomScale})`;
+}
+
+function clampViewerTranslation() {
+    const image = $("#viewer-image");
+    const stage = $(".viewer-stage");
+    if (!image.naturalWidth || !image.naturalHeight || !stage.clientWidth || !stage.clientHeight) {
+        return;
+    }
+    const fitScale = Math.min(stage.clientWidth / image.naturalWidth, stage.clientHeight / image.naturalHeight);
+    const renderedWidth = image.naturalWidth * fitScale * state.zoomScale;
+    const renderedHeight = image.naturalHeight * fitScale * state.zoomScale;
+    const maxX = Math.max(0, (renderedWidth - stage.clientWidth) / 2);
+    const maxY = Math.max(0, (renderedHeight - stage.clientHeight) / 2);
+    state.zoomTranslateX = Math.min(maxX, Math.max(-maxX, state.zoomTranslateX));
+    state.zoomTranslateY = Math.min(maxY, Math.max(-maxY, state.zoomTranslateY));
+}
+
+function touchDistance(touches) {
+    return Math.hypot(
+        touches[0].clientX - touches[1].clientX,
+        touches[0].clientY - touches[1].clientY,
+    );
+}
+
 function isInteractiveSwipeTarget(target) {
     return Boolean(target.closest("button, input, select, textarea, a, [role='button']"));
 }
 
 function handleViewerTouchStart(event) {
+    if (event.touches.length === 2 && !isInteractiveSwipeTarget(event.target)) {
+        resetViewerSwipe();
+        state.panStartX = null;
+        state.panStartY = null;
+        state.pinchStartDistance = touchDistance(event.touches);
+        state.pinchStartScale = state.zoomScale;
+        return;
+    }
+    if (event.touches.length === 1 && state.zoomScale > 1 && !isInteractiveSwipeTarget(event.target)) {
+        resetViewerSwipe();
+        state.panStartX = event.touches[0].clientX;
+        state.panStartY = event.touches[0].clientY;
+        state.panStartTranslateX = state.zoomTranslateX;
+        state.panStartTranslateY = state.zoomTranslateY;
+        return;
+    }
     if (event.touches.length !== 1 || isInteractiveSwipeTarget(event.target)) {
         resetViewerSwipe();
         return;
@@ -731,7 +842,48 @@ function handleViewerTouchStart(event) {
     state.swipeStartAt = Date.now();
 }
 
+function handleViewerTouchMove(event) {
+    if (event.touches.length === 1 && state.panStartX !== null) {
+        event.preventDefault();
+        state.zoomTranslateX = state.panStartTranslateX + event.touches[0].clientX - state.panStartX;
+        state.zoomTranslateY = state.panStartTranslateY + event.touches[0].clientY - state.panStartY;
+        clampViewerTranslation();
+        applyViewerTransform();
+        return;
+    }
+    if (event.touches.length !== 2 || state.pinchStartDistance === null) {
+        return;
+    }
+    event.preventDefault();
+    const scale = state.pinchStartScale * (touchDistance(event.touches) / state.pinchStartDistance);
+    state.zoomScale = Math.min(5, Math.max(1, scale));
+    clampViewerTranslation();
+    applyViewerTransform();
+}
+
+function handleViewerTouchCancel() {
+    resetViewerSwipe();
+    state.pinchStartDistance = null;
+    state.pinchStartScale = state.zoomScale;
+    state.panStartX = null;
+    state.panStartY = null;
+}
+
 function handleViewerTouchEnd(event) {
+    if (state.pinchStartDistance !== null) {
+        if (event.touches.length < 2) {
+            state.pinchStartDistance = null;
+            state.pinchStartScale = state.zoomScale;
+        }
+        resetViewerSwipe();
+        return;
+    }
+    if (state.panStartX !== null) {
+        state.panStartX = null;
+        state.panStartY = null;
+        resetViewerSwipe();
+        return;
+    }
     if (state.swipeStartX === null || event.changedTouches.length !== 1) {
         resetViewerSwipe();
         return;
@@ -927,8 +1079,9 @@ function bindEvents() {
     $("#play-button")?.addEventListener("click", toggleSlideshow);
     $("#details-toggle-button")?.addEventListener("click", toggleDetailsPanel);
     $(".viewer-stage")?.addEventListener("touchstart", handleViewerTouchStart, { passive: true });
+    $(".viewer-stage")?.addEventListener("touchmove", handleViewerTouchMove, { passive: false });
     $(".viewer-stage")?.addEventListener("touchend", handleViewerTouchEnd, { passive: true });
-    $(".viewer-stage")?.addEventListener("touchcancel", resetViewerSwipe, { passive: true });
+    $(".viewer-stage")?.addEventListener("touchcancel", handleViewerTouchCancel, { passive: true });
     $$("[data-close-modal]").forEach((button) => button.addEventListener("click", closePhotoModal));
     $$("[data-close-admin]").forEach((button) => button.addEventListener("click", closeAdmin));
     $$("[data-close-comfy]").forEach((button) => button.addEventListener("click", closeComfyModal));

@@ -94,6 +94,9 @@
         <section class="photo-viewer" role="dialog" aria-modal="true" aria-label="Photo">
             <div class="viewer-stage">
                 <img id="viewer-image" alt="">
+                <div class="viewer-loading" id="viewer-loading" role="status" aria-label="Chargement de l'image" hidden>
+                    <span class="viewer-spinner" aria-hidden="true"></span>
+                </div>
                 <div class="viewer-actions">
                     <button type="button" id="prev-button" title="Précédente">‹</button>
                     <button type="button" id="play-button" title="Diaporama">▶</button>
