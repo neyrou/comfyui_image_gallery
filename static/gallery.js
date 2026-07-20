@@ -28,6 +28,7 @@ const state = {
     albumActionMode: null,
     albumActionSource: null,
     photoModalHistoryActive: false,
+    tagFilterDraft: {},
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -68,12 +69,14 @@ function setBusy(button, busyText) {
     if (!button) {
         return () => {};
     }
-    const previous = button.textContent;
+    const previous = button.innerHTML;
     button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     button.textContent = busyText;
     return () => {
         button.disabled = false;
-        button.textContent = previous;
+        button.removeAttribute("aria-busy");
+        button.innerHTML = previous;
     };
 }
 
@@ -923,6 +926,112 @@ function stopSlideshow() {
     $("#play-button").textContent = "▶";
 }
 
+function appliedTagFilterState(tagName) {
+    if ((state.tagFilters?.include || []).includes(tagName)) {
+        return "true";
+    }
+    if ((state.tagFilters?.exclude || []).includes(tagName)) {
+        return "false";
+    }
+    return "any";
+}
+
+function renderTagFilters() {
+    const container = $("#tag-filter-list");
+    const tagStats = state.albumTagStats || [];
+    if (!tagStats.length) {
+        container.innerHTML = '<p class="muted tag-filter-empty">Aucun tag photo dans cet album.</p>';
+        return;
+    }
+    const maxOccurrence = Math.max(...tagStats.map((tag) => Number(tag.occurrence_count) || 0), 1);
+    container.innerHTML = tagStats.map((tag) => {
+        const tagId = String(tag.id);
+        const selected = state.tagFilterDraft[tagId] || "any";
+        const occurrence = Number(tag.occurrence_count) || 0;
+        const progress = Math.min(100, Math.max(0, (occurrence / maxOccurrence) * 100));
+        const escapedName = escapeHtml(tag.name);
+        return `
+            <div class="tag-filter-row">
+                <span class="tag-filter-name" title="${escapedName}">${escapedName}</span>
+                <span class="tag-filter-count" style="--tag-progress: ${progress}%" title="${occurrence} occurrence${occurrence > 1 ? "s" : ""}">
+                    ${occurrence}
+                </span>
+                <div class="tag-filter-toggle" role="group" aria-label="Filtre ${escapedName}">
+                    ${["any", "true", "false"].map((value) => `
+                        <button type="button"
+                                class="tag-filter-choice is-${value}${selected === value ? " is-selected" : ""}"
+                                data-tag-filter-id="${tagId}"
+                                data-tag-filter-value="${value}"
+                                aria-pressed="${selected === value}">
+                            ${value === "any" ? "Any" : value === "true" ? "True" : "False"}
+                        </button>
+                    `).join("")}
+                </div>
+            </div>
+        `;
+    }).join("");
+}
+
+function openTagFilter() {
+    state.tagFilterDraft = {};
+    (state.albumTagStats || []).forEach((tag) => {
+        state.tagFilterDraft[String(tag.id)] = appliedTagFilterState(tag.name);
+    });
+    renderTagFilters();
+    $("#tag-filter-modal").classList.add("open");
+    $("#tag-filter-modal").setAttribute("aria-hidden", "false");
+}
+
+function sameTagSet(left, right) {
+    const leftSet = new Set(left || []);
+    const rightSet = new Set(right || []);
+    return leftSet.size === rightSet.size && [...leftSet].every((value) => rightSet.has(value));
+}
+
+function applyTagFilters() {
+    const include = [];
+    const exclude = [];
+    (state.albumTagStats || []).forEach((tag) => {
+        const value = state.tagFilterDraft[String(tag.id)] || "any";
+        if (value === "true") {
+            include.push(tag.name);
+        } else if (value === "false") {
+            exclude.push(tag.name);
+        }
+    });
+    const currentInclude = state.tagFilters?.include || [];
+    const currentExclude = state.tagFilters?.exclude || [];
+    if (sameTagSet(include, currentInclude) && sameTagSet(exclude, currentExclude)) {
+        return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.delete("include_tag");
+    url.searchParams.delete("exclude_tag");
+    include.forEach((tagName) => url.searchParams.append("include_tag", tagName));
+    exclude.forEach((tagName) => url.searchParams.append("exclude_tag", tagName));
+    url.searchParams.set("page", "1");
+    window.location.href = url.toString();
+}
+
+function closeTagFilter() {
+    const modal = $("#tag-filter-modal");
+    if (!modal.classList.contains("open")) {
+        return;
+    }
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden", "true");
+    applyTagFilters();
+}
+
+function chooseTagFilter(event) {
+    const button = event.target.closest("[data-tag-filter-value]");
+    if (!button) {
+        return;
+    }
+    state.tagFilterDraft[button.dataset.tagFilterId] = button.dataset.tagFilterValue;
+    renderTagFilters();
+}
+
 function openAdmin() {
     renderAlbumAdmin();
     $("#admin-modal").classList.add("open");
@@ -970,7 +1079,7 @@ async function saveAlbum(event) {
 }
 
 async function scanAlbums() {
-    const done = setBusy($("#scan-button"), "Scan...");
+    const done = setBusy($("#scan-button"), "…");
     try {
         state.scanStatusClosed = false;
         const data = await fetchJson("/api/scan", { method: "POST", body: JSON.stringify({ metadata: false }) });
@@ -1039,7 +1148,7 @@ async function resumeScanStatusIfNeeded() {
     try {
         const data = await fetchJson("/api/scan/status");
         if (data.job.active) {
-            const done = setBusy($("#scan-button"), "Scan...");
+            const done = setBusy($("#scan-button"), "…");
             renderScanStatus(data.job, { force: true });
             startScanPolling(done);
         }
@@ -1052,6 +1161,7 @@ function bindEvents() {
     $("#album-select")?.addEventListener("change", (event) => {
         window.location.href = `?album=${encodeURIComponent(event.target.value)}&page=1`;
     });
+    $("#filter-button")?.addEventListener("click", openTagFilter);
     $("#scan-button")?.addEventListener("click", scanAlbums);
     $("#scan-status-close")?.addEventListener("click", () => {
         state.scanStatusClosed = true;
@@ -1125,6 +1235,8 @@ function bindEvents() {
             saveAlbum(event).catch((error) => alert(error.message));
         }
     });
+    $("#tag-filter-list")?.addEventListener("click", chooseTagFilter);
+    $$('[data-close-tag-filter]').forEach((button) => button.addEventListener("click", closeTagFilter));
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
@@ -1133,6 +1245,7 @@ function bindEvents() {
             closeAdmin();
             closeComfyModal();
             closeAlbumActionModal();
+            closeTagFilter();
         }
         if ($("#photo-modal").classList.contains("open") && event.key === "ArrowRight") {
             navigate(1);

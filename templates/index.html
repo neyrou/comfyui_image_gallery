@@ -30,8 +30,23 @@
                     {% endfor %}
                 </select>
             </label>
-            <button id="scan-button" type="button">Rescan albums</button>
-            <button id="admin-button" type="button">Gérer</button>
+            <button id="filter-button" class="toolbar-icon-button{% if filter_active %} is-active{% endif %}" type="button"
+                    title="Filtrer par tags" aria-label="Filtrer par tags" aria-pressed="{{ 'true' if filter_active else 'false' }}">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 5h16l-6 7v5l-4 2v-7z"></path>
+                </svg>
+            </button>
+            <button id="scan-button" class="toolbar-icon-button" type="button" title="Rescan albums" aria-label="Rescan albums">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 11a8 8 0 1 0-2.34 5.66"></path>
+                    <path d="M20 4v7h-7"></path>
+                </svg>
+            </button>
+            <button id="admin-button" class="toolbar-icon-button" type="button" title="Gérer les albums" aria-label="Gérer les albums">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"></path>
+                </svg>
+            </button>
         </div>
     </header>
 
@@ -67,24 +82,29 @@
             </ul>
         {% else %}
             <section class="empty-state">
-                <h2>Aucune image scannée</h2>
-                <p>Lance un rescan si les dossiers viennent d’être ajoutés ou si les albums sont des liens symboliques.</p>
+                {% if filter_active %}
+                    <h2>Aucune photo ne correspond aux filtres</h2>
+                    <p>Modifie ou réinitialise les filtres de tags pour afficher davantage de photos.</p>
+                {% else %}
+                    <h2>Aucune image scannée</h2>
+                    <p>Lance un rescan si les dossiers viennent d’être ajoutés ou si les albums sont des liens symboliques.</p>
+                {% endif %}
             </section>
         {% endif %}
 
         <nav class="pagination" aria-label="Pagination">
             {% if selected_album and page > 1 %}
-                <a href="?album={{ selected_album.name }}&page=1">Première</a>
-                <a href="?album={{ selected_album.name }}&page={{ page - 1 }}">Précédente</a>
+                <a href="{{ pagination_urls[1] }}">Première</a>
+                <a href="{{ pagination_urls[page - 1] }}">Précédente</a>
             {% endif %}
             {% if selected_album %}
                 {% for p in range(1, total_pages + 1) %}
-                    <a href="?album={{ selected_album.name }}&page={{ p }}" {% if p == page %}class="current-page"{% endif %}>{{ p }}</a>
+                    <a href="{{ pagination_urls[p] }}" {% if p == page %}class="current-page"{% endif %}>{{ p }}</a>
                 {% endfor %}
             {% endif %}
             {% if selected_album and page < total_pages %}
-                <a href="?album={{ selected_album.name }}&page={{ page + 1 }}">Suivante</a>
-                <a href="?album={{ selected_album.name }}&page={{ total_pages }}">Dernière</a>
+                <a href="{{ pagination_urls[page + 1] }}">Suivante</a>
+                <a href="{{ pagination_urls[total_pages] }}">Dernière</a>
             {% endif %}
         </nav>
     </main>
@@ -237,6 +257,20 @@
         </section>
     </div>
 
+    <div class="modal" id="tag-filter-modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close-tag-filter></div>
+        <section class="tag-filter-panel" role="dialog" aria-modal="true" aria-labelledby="tag-filter-title">
+            <div class="panel-header">
+                <div>
+                    <h2 id="tag-filter-title">Filtrer par tags</h2>
+                    <small>Les filtres sont appliqués à la fermeture.</small>
+                </div>
+                <button type="button" data-close-tag-filter title="Fermer" aria-label="Fermer">×</button>
+            </div>
+            <div class="tag-filter-list" id="tag-filter-list"></div>
+        </section>
+    </div>
+
     <footer class="footer">All images are copyrighted © 2023</footer>
 
     <script>
@@ -244,7 +278,12 @@
             albums: {{ albums|tojson }},
             photos: {{ photos|tojson }},
             selectedAlbum: {{ selected_album|tojson }},
-            allowedAlbumTypes: {{ allowed_album_types|tojson }}
+            allowedAlbumTypes: {{ allowed_album_types|tojson }},
+            albumTagStats: {{ album_tag_stats|tojson }},
+            tagFilters: {
+                include: {{ include_tags|tojson }},
+                exclude: {{ exclude_tags|tojson }}
+            }
         };
     </script>
     <script src="{{ url_for('static', filename='gallery.js') }}"></script>

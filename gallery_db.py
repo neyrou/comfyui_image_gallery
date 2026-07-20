@@ -124,6 +124,7 @@ def init_db(db_path):
 
             CREATE INDEX IF NOT EXISTS idx_album_photos_album ON album_photos(album_id, mtime DESC);
             CREATE INDEX IF NOT EXISTS idx_album_photos_photo ON album_photos(photo_id);
+            CREATE INDEX IF NOT EXISTS idx_photo_tags_tag_photo ON photo_tags(tag_id, photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_links_source ON photo_links(source_photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_links_target ON photo_links(target_photo_id);
             """
@@ -474,17 +475,62 @@ def get_album_by_name(conn, name):
     return conn.execute("SELECT * FROM albums WHERE name=?", (name,)).fetchone()
 
 
-def list_gallery_photos(conn, album_name, page=1, per_page=100):
+def _normalized_tag_names(tag_names):
+    return list(dict.fromkeys(name.strip() for name in (tag_names or []) if name and name.strip()))
+
+
+def _photo_tag_filter_sql(include_tags, exclude_tags, photo_id_expression="ap.photo_id"):
+    clauses = []
+    params = []
+    for tag_name in _normalized_tag_names(include_tags):
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM photo_tags filter_pt
+                JOIN tags filter_t ON filter_t.id = filter_pt.tag_id
+                WHERE filter_pt.photo_id = {photo_id_expression} AND filter_t.name = ?
+            )
+            """
+        )
+        params.append(tag_name)
+
+    excluded = _normalized_tag_names(exclude_tags)
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM photo_tags excluded_pt
+                JOIN tags excluded_t ON excluded_t.id = excluded_pt.tag_id
+                WHERE excluded_pt.photo_id = {photo_id_expression}
+                  AND excluded_t.name IN ({placeholders})
+            )
+            """
+        )
+        params.extend(excluded)
+
+    return " AND ".join(clauses), params
+
+
+def list_gallery_photos(conn, album_name, page=1, per_page=100, include_tags=None, exclude_tags=None):
     album = get_album_by_name(conn, album_name)
     if not album:
         return None, [], 0
+    filter_sql, filter_params = _photo_tag_filter_sql(include_tags, exclude_tags)
+    filter_clause = f" AND {filter_sql}" if filter_sql else ""
     total = conn.execute(
-        "SELECT COUNT(*) AS total FROM album_photos WHERE album_id=? AND is_missing=0",
-        (album["id"],),
+        f"""
+        SELECT COUNT(*) AS total
+        FROM album_photos ap
+        WHERE ap.album_id=? AND ap.is_missing=0{filter_clause}
+        """,
+        (album["id"], *filter_params),
     ).fetchone()["total"]
     offset = max(page - 1, 0) * per_page
     rows = conn.execute(
-        """
+        f"""
         SELECT p.*, ap.relative_path, ap.filename, ap.mtime, ap.file_size AS album_file_size,
                a.name AS album_name,
                fav.has_output, fav.has_user, fav.album_count, fav.user_album_count,
@@ -505,14 +551,33 @@ def list_gallery_photos(conn, album_name, page=1, per_page=100):
             WHERE ap2.is_missing = 0
             GROUP BY ap2.photo_id
         ) fav ON fav.photo_id = p.id
-        WHERE ap.album_id=? AND ap.is_missing=0
+        WHERE ap.album_id=? AND ap.is_missing=0{filter_clause}
         GROUP BY p.id, ap.relative_path
         ORDER BY ap.mtime DESC
         LIMIT ? OFFSET ?
         """,
-        (album["id"], per_page, offset),
+        (album["id"], *filter_params, per_page, offset),
     ).fetchall()
     return dict(album), [serialize_gallery_photo(row) for row in rows], total
+
+
+def list_album_tag_stats(conn, album_name):
+    album = get_album_by_name(conn, album_name)
+    if not album:
+        return []
+    rows = conn.execute(
+        """
+        SELECT t.id, t.name, COUNT(*) AS occurrence_count
+        FROM album_photos ap
+        JOIN photo_tags pt ON pt.photo_id = ap.photo_id
+        JOIN tags t ON t.id = pt.tag_id
+        WHERE ap.album_id=? AND ap.is_missing=0
+        GROUP BY t.id, t.name
+        ORDER BY occurrence_count DESC, t.name COLLATE NOCASE
+        """,
+        (album["id"],),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def serialize_gallery_photo(row):

@@ -4,6 +4,7 @@ import traceback
 import shutil
 from copy import deepcopy
 from pathlib import Path
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from flask import Flask, Response, jsonify, render_template, request
@@ -31,6 +32,7 @@ from gallery_db import (
     import_photo_into_album,
     import_output_photo,
     init_db,
+    list_album_tag_stats,
     list_albums,
     list_gallery_photos,
     list_tags,
@@ -231,6 +233,17 @@ def selected_album_name(albums, requested):
     return albums[0]["name"] if albums else None
 
 
+def normalized_query_tag_names(values):
+    return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
+
+
+def gallery_page_url(album_name, page, include_tags=None, exclude_tags=None):
+    params = [("album", album_name), ("page", page)]
+    params.extend(("include_tag", tag_name) for tag_name in include_tags or [])
+    params.extend(("exclude_tag", tag_name) for tag_name in exclude_tags or [])
+    return f"?{urlencode(params)}"
+
+
 def scan_status_snapshot():
     with SCAN_LOCK:
         return deepcopy(SCAN_STATUS)
@@ -301,12 +314,34 @@ def image_gallery():
     ensure_ready()
     page = max(request.args.get("page", 1, type=int), 1)
     requested_album = request.args.get("album")
+    include_tags = normalized_query_tag_names(request.args.getlist("include_tag"))
+    exclude_tags = normalized_query_tag_names(request.args.getlist("exclude_tag"))
     with connect_db(DB_PATH) as conn:
         albums = list_albums(conn)
         album_name = selected_album_name(albums, requested_album)
-        album, photos, total = list_gallery_photos(conn, album_name, page=page, per_page=PER_PAGE) if album_name else (None, [], 0)
+        album, photos, total = (
+            list_gallery_photos(
+                conn,
+                album_name,
+                page=page,
+                per_page=PER_PAGE,
+                include_tags=include_tags,
+                exclude_tags=exclude_tags,
+            )
+            if album_name
+            else (None, [], 0)
+        )
+        album_tag_stats = list_album_tag_stats(conn, album_name) if album_name else []
         tags = list_tags(conn)
     total_pages = max((total + PER_PAGE - 1) // PER_PAGE, 1)
+    pagination_urls = (
+        {
+            page_number: gallery_page_url(album_name, page_number, include_tags, exclude_tags)
+            for page_number in range(1, total_pages + 1)
+        }
+        if album_name
+        else {}
+    )
     return render_template(
         "index.html",
         albums=albums,
@@ -315,6 +350,11 @@ def image_gallery():
         tags=tags,
         page=page,
         total_pages=total_pages,
+        pagination_urls=pagination_urls,
+        album_tag_stats=album_tag_stats,
+        include_tags=include_tags,
+        exclude_tags=exclude_tags,
+        filter_active=bool(include_tags or exclude_tags),
         allowed_album_types=sorted(ALLOWED_ALBUM_TYPES),
         allowed_link_types=sorted(ALLOWED_LINK_TYPES),
     )

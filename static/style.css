@@ -79,6 +79,30 @@ small {
     gap: 10px;
 }
 
+.toolbar-icon-button {
+    display: grid;
+    place-items: center;
+    width: 42px;
+    min-width: 42px;
+    padding: 0;
+}
+
+.toolbar-icon-button svg {
+    width: 21px;
+    height: 21px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.toolbar-icon-button.is-active {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #211b00;
+}
+
 .field {
     display: grid;
     gap: 4px;
@@ -439,7 +463,8 @@ button:disabled {
 .details-panel,
 .admin-panel,
 .album-action-panel,
-.comfy-panel {
+.comfy-panel,
+.tag-filter-panel {
     position: relative;
     overflow: auto;
     padding: 18px;
@@ -477,7 +502,8 @@ button:disabled {
 
 .details-panel h2,
 .admin-panel h2,
-.comfy-panel h2 {
+.comfy-panel h2,
+.tag-filter-panel h2 {
     font-size: 20px;
 }
 
@@ -607,6 +633,111 @@ pre {
     margin: 14px auto;
     border: 1px solid #444;
     border-radius: 8px;
+}
+
+.tag-filter-panel {
+    width: min(680px, calc(100vw - 28px));
+    max-height: min(860px, calc(100vh - 28px));
+    margin: 14px auto;
+    border: 1px solid #444;
+    border-radius: 8px;
+}
+
+.tag-filter-list {
+    display: grid;
+    gap: 8px;
+}
+
+.tag-filter-empty {
+    padding: 18px 0;
+    text-align: center;
+}
+
+.tag-filter-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 64px 162px;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 9px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #292929;
+    white-space: nowrap;
+}
+
+.tag-filter-name {
+    min-width: 0;
+    overflow: hidden;
+    font-weight: 700;
+    text-overflow: ellipsis;
+}
+
+.tag-filter-count {
+    position: relative;
+    isolation: isolate;
+    display: grid;
+    place-items: center;
+    min-height: 34px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: #202020;
+    font-variant-numeric: tabular-nums;
+}
+
+.tag-filter-count::before {
+    position: absolute;
+    z-index: -1;
+    inset: 0 auto 0 0;
+    width: var(--tag-progress, 0%);
+    background: rgba(255, 212, 71, 0.42);
+    content: "";
+}
+
+.tag-filter-toggle {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    width: 162px;
+}
+
+.tag-filter-choice {
+    min-width: 0;
+    min-height: 34px;
+    padding: 4px 6px;
+    border-radius: 0;
+    font-size: 12px;
+}
+
+.tag-filter-choice:first-child {
+    border-radius: 5px 0 0 5px;
+}
+
+.tag-filter-choice:last-child {
+    border-radius: 0 5px 5px 0;
+}
+
+.tag-filter-choice + .tag-filter-choice {
+    margin-left: -1px;
+}
+
+.tag-filter-choice.is-selected {
+    position: relative;
+    z-index: 1;
+    border-color: #aaa;
+    background: #555;
+}
+
+.tag-filter-choice.is-true.is-selected {
+    border-color: #55cf7b;
+    background: #247a43;
+    color: #fff;
+}
+
+.tag-filter-choice.is-false.is-selected {
+    border-color: var(--danger);
+    background: #9d3333;
+    color: #fff;
 }
 
 .album-membership.unavailable {
@@ -773,6 +904,12 @@ pre {
         white-space: nowrap;
     }
 
+    .toolbar > .toolbar-icon-button {
+        width: 48px;
+        min-width: 48px;
+        padding: 0;
+    }
+
     .image-list {
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 10px;
@@ -823,10 +960,27 @@ pre {
 
     .admin-panel,
     .album-action-panel,
-    .comfy-panel {
+    .comfy-panel,
+    .tag-filter-panel {
         width: 100vw;
         max-height: 100vh;
         margin: 0;
         border-radius: 0;
+    }
+
+    .tag-filter-row {
+        grid-template-columns: minmax(0, 1fr) 52px 135px;
+        gap: 6px;
+        padding: 8px;
+    }
+
+    .tag-filter-toggle {
+        width: 135px;
+    }
+
+    .tag-filter-choice {
+        min-height: 38px;
+        padding: 3px;
+        font-size: 11px;
     }
 }
