@@ -29,6 +29,7 @@ from gallery_db import (
     create_photo_link,
     delete_photo,
     discover_albums,
+    ensure_thumbnail,
     find_photo_file,
     find_photo_file_in_album,
     get_photo_detail,
@@ -802,6 +803,25 @@ def api_rescan_metadata(photo_id):
         except OSError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         detail = get_photo_detail(conn, photo_id)
+    return jsonify({"ok": True, "photo": detail})
+
+
+@app.post("/api/photos/<int:photo_id>/thumbnail/refresh")
+def api_refresh_thumbnail(photo_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        image_path = find_photo_file(conn, photo_id)
+        if not image_path:
+            return jsonify({"ok": False, "error": "No file found for this photo"}), 404
+        photo = conn.execute("SELECT checksum FROM photos WHERE id=?", (photo_id,)).fetchone()
+        if not photo:
+            return jsonify({"ok": False, "error": "Photo not found"}), 404
+        try:
+            ensure_thumbnail(image_path, THUMBNAIL_ROOT, photo["checksum"], force=True)
+        except OSError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        detail = get_photo_detail(conn, photo_id)
+    detail["thumbnail_url"] = f'{detail["thumbnail_url"]}?v={time.time_ns()}'
     return jsonify({"ok": True, "photo": detail})
 
 

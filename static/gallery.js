@@ -531,6 +531,31 @@ async function rescanCurrentMetadata() {
     }
 }
 
+async function refreshCurrentThumbnail() {
+    if (!state.currentPhoto) {
+        return;
+    }
+    closePhotoActionsMenu();
+    const photoId = state.currentPhoto.id;
+    const done = setBusy($("#refresh-thumbnail-button"), "...");
+    try {
+        const data = await fetchJson(`/api/photos/${photoId}/thumbnail/refresh`, { method: "POST", body: "{}" });
+        state.currentPhoto = data.photo;
+        const galleryPhoto = state.photos.find((photo) => photo.id === photoId);
+        if (galleryPhoto) {
+            galleryPhoto.thumbnail_url = data.photo.thumbnail_url;
+        }
+        const thumbnail = document.querySelector(`[data-gallery-photo-id="${photoId}"] .thumbnail img`);
+        if (thumbnail) {
+            thumbnail.src = data.photo.thumbnail_url;
+        }
+    } catch (error) {
+        alert(error.message);
+    } finally {
+        done();
+    }
+}
+
 function updateComfyButton() {
     const button = $("#comfy-generate-button");
     if (!button) {
@@ -1913,6 +1938,7 @@ function bindEvents() {
         toggleSelectionActionsMenu();
     });
     $("#rescan-metadata-button")?.addEventListener("click", rescanCurrentMetadata);
+    $("#refresh-thumbnail-button")?.addEventListener("click", refreshCurrentThumbnail);
     $("#scan-photo-faces-button")?.addEventListener("click", scanCurrentPhotoFaces);
     $("#face-automatic-scan")?.addEventListener("change", setAutomaticFaceScan);
     $("#scan-album-faces-button")?.addEventListener("click", () => {

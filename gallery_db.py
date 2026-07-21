@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from metadata_extractor import extract_from_image
 
@@ -479,13 +479,14 @@ def upsert_photo(conn, checksum, width, height, file_size):
     return conn.execute("SELECT id FROM photos WHERE checksum=?", (checksum,)).fetchone()["id"]
 
 
-def ensure_thumbnail(image_path, thumbnail_root, checksum):
+def ensure_thumbnail(image_path, thumbnail_root, checksum, force=False):
     thumbnail_root = Path(thumbnail_root)
     thumbnail_root.mkdir(parents=True, exist_ok=True)
     thumbnail_path = thumbnail_root / f"{checksum}.jpg"
-    if thumbnail_path.exists():
+    if thumbnail_path.exists() and not force:
         return thumbnail_path
     with Image.open(image_path) as image:
+        image = ImageOps.exif_transpose(image)
         image.thumbnail((260, 260), Image.LANCZOS)
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")

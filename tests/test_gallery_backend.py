@@ -27,6 +27,13 @@ def create_png(path, color=(20, 40, 60), prompt=None, workflow=None):
     Image.new("RGB", (24, 24), color).save(path, pnginfo=info)
 
 
+def create_oriented_jpeg(path):
+    image = Image.new("RGB", (40, 20), (20, 40, 60))
+    exif = Image.Exif()
+    exif[274] = 6
+    image.save(path, exif=exif)
+
+
 class GalleryBackendTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -58,6 +65,28 @@ class GalleryBackendTests(unittest.TestCase):
             self.assertTrue(photos[0]["favorite"])
             self.assertEqual(photos[0]["album_count"], 2)
             self.assertEqual(photos[0]["user_album_count"], 1)
+
+    def test_thumbnail_applies_exif_orientation_and_can_be_refreshed(self):
+        image_path = self.images_root / "output" / "oriented.jpg"
+        create_oriented_jpeg(image_path)
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            photo = conn.execute("SELECT id, checksum FROM photos").fetchone()
+        thumbnail_path = self.thumbnails / f'{photo["checksum"]}.jpg'
+        with Image.open(thumbnail_path) as thumbnail:
+            self.assertEqual(thumbnail.size, (20, 40))
+
+        Image.new("RGB", (5, 5), (255, 0, 0)).save(thumbnail_path)
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        response = app_module.app.test_client().post(f'/api/photos/{photo["id"]}/thumbnail/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertRegex(response.get_json()["photo"]["thumbnail_url"], r"\.jpg\?v=\d+$")
+        with Image.open(thumbnail_path) as thumbnail:
+            self.assertEqual(thumbnail.size, (20, 40))
 
     def test_photo_uses_available_album_when_another_membership_is_offline(self):
         offline_album = self.images_root / "A-offline"
