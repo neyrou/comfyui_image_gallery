@@ -1,3 +1,5 @@
+import io
+import json
 import threading
 import time
 import traceback
@@ -7,7 +9,9 @@ from pathlib import Path
 from urllib.parse import urlencode
 from uuid import uuid4
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
+from PIL import Image
+from werkzeug.utils import secure_filename
 
 from comfy_generation import (
     ComfyClient,
@@ -43,20 +47,49 @@ from gallery_db import (
     set_photo_tags,
     update_photo_tags,
     update_album,
+    add_gallery_face_reference,
+    add_imported_face_reference,
+    create_face_identity,
+    create_face_import,
+    create_face_scan_job,
+    decide_face_match,
+    delete_face_identity,
+    get_current_face_scan_job,
+    get_face_identity,
+    get_face_import,
+    get_face_reference,
+    get_face_scan_job,
+    get_face_setting,
+    list_face_identities,
+    photo_face_cache_valid,
+    photo_ids_for_face_scope,
+    rematch_photo_faces,
+    replace_photo_faces,
+    set_face_setting,
+    update_face_identity,
 )
+from face_recognition import FaceRecognitionError, FaceRecognitionUnavailable, InsightFaceEngine
 
 
 BASE_DIR = Path(__file__).resolve().parent
 IMAGES_ROOT = BASE_DIR / "static" / "images"
 THUMBNAIL_ROOT = BASE_DIR / "static" / "thumbnails"
 DB_PATH = BASE_DIR / "instance" / "gallery.sqlite3"
+FACE_REFERENCE_ROOT = BASE_DIR / "instance" / "face_references"
 PER_PAGE = 100
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 COMFY_CLIENT_FACTORY = ComfyClient
+FACE_ENGINE_FACTORY = InsightFaceEngine
 SCAN_LOCK = threading.Lock()
 COMFY_JOB_LOCK = threading.Lock()
+FACE_WORKER_LOCK = threading.Lock()
+FACE_ENGINE_LOCK = threading.Lock()
 COMFY_JOBS = {}
+FACE_WORKER_THREAD = None
+FACE_ENGINE_INSTANCE = None
+FACE_RECOVERED_DATABASES = set()
 SCAN_STATUS = {
     "active": False,
     "job_id": None,
@@ -78,10 +111,225 @@ def ensure_ready():
     init_db(DB_PATH)
     with connect_db(DB_PATH) as conn:
         discover_albums(conn, IMAGES_ROOT)
+    recover_face_jobs()
 
 
 def get_comfy_client():
     return COMFY_CLIENT_FACTORY()
+
+
+def get_face_engine():
+    global FACE_ENGINE_INSTANCE
+    with FACE_ENGINE_LOCK:
+        if FACE_ENGINE_INSTANCE is None:
+            FACE_ENGINE_INSTANCE = FACE_ENGINE_FACTORY()
+        return FACE_ENGINE_INSTANCE
+
+
+def recover_face_jobs():
+    database_key = str(Path(DB_PATH).resolve())
+    with FACE_WORKER_LOCK:
+        if database_key in FACE_RECOVERED_DATABASES:
+            return
+        with connect_db(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE face_scan_jobs SET state='queued', message='Reprise apres redemarrage' WHERE state='running'"
+            )
+            conn.execute(
+                "UPDATE face_scan_jobs SET state='cancelled', message='Analyse annulee', finished_at=CURRENT_TIMESTAMP WHERE state='cancel_requested'"
+            )
+            conn.execute("UPDATE face_scan_items SET state='queued' WHERE state='running'")
+            queued = conn.execute("SELECT 1 FROM face_scan_jobs WHERE state='queued' LIMIT 1").fetchone()
+        FACE_RECOVERED_DATABASES.add(database_key)
+    if queued:
+        start_face_worker()
+
+
+def start_face_worker():
+    global FACE_WORKER_THREAD
+    with FACE_WORKER_LOCK:
+        if FACE_WORKER_THREAD and FACE_WORKER_THREAD.is_alive():
+            return FACE_WORKER_THREAD
+        FACE_WORKER_THREAD = threading.Thread(target=run_face_job_queue, daemon=True, name="face-recognition")
+        FACE_WORKER_THREAD.start()
+        return FACE_WORKER_THREAD
+
+
+def run_face_job_queue():
+    global FACE_WORKER_THREAD
+    try:
+        while True:
+            with connect_db(DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT id FROM face_scan_jobs WHERE state='queued' ORDER BY created_at LIMIT 1"
+                ).fetchone()
+            if not row:
+                return
+            run_face_job(row["id"])
+    finally:
+        with FACE_WORKER_LOCK:
+            if FACE_WORKER_THREAD is threading.current_thread():
+                FACE_WORKER_THREAD = None
+        with connect_db(DB_PATH) as conn:
+            queued = conn.execute("SELECT 1 FROM face_scan_jobs WHERE state='queued' LIMIT 1").fetchone()
+        if queued:
+            start_face_worker()
+
+
+def run_face_job(job_id):
+    with connect_db(DB_PATH) as conn:
+        job = get_face_scan_job(conn, job_id)
+        if not job or job["state"] not in {"queued", "running"}:
+            return job
+        conn.execute(
+            """
+            UPDATE face_scan_jobs
+            SET state='running', message='Chargement du modele', started_at=COALESCE(started_at, CURRENT_TIMESTAMP),
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (job_id,),
+        )
+    engine = None
+    if job["mode"] == "detect":
+        try:
+            engine = get_face_engine()
+            # Force dependency/model validation before consuming job items.
+            engine._load()
+        except (FaceRecognitionUnavailable, FaceRecognitionError) as exc:
+            with connect_db(DB_PATH) as conn:
+                conn.execute(
+                    """
+                    UPDATE face_scan_jobs SET state='error', message=?, error=?, finished_at=CURRENT_TIMESTAMP,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?
+                    """,
+                    (str(exc), str(exc), job_id),
+                )
+                return get_face_scan_job(conn, job_id)
+
+    while True:
+        with connect_db(DB_PATH) as conn:
+            job = get_face_scan_job(conn, job_id)
+            if not job:
+                return None
+            if job["state"] == "cancel_requested":
+                conn.execute(
+                    "UPDATE face_scan_jobs SET state='cancelled', message='Analyse annulee', finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (job_id,),
+                )
+                return get_face_scan_job(conn, job_id)
+            item = conn.execute(
+                "SELECT photo_id FROM face_scan_items WHERE job_id=? AND state='queued' ORDER BY photo_id LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if not item:
+                conn.execute(
+                    "UPDATE face_scan_jobs SET state='done', message='Analyse terminee', finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (job_id,),
+                )
+                return get_face_scan_job(conn, job_id)
+            photo_id = item["photo_id"]
+            conn.execute(
+                "UPDATE face_scan_items SET state='running', updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND photo_id=?",
+                (job_id, photo_id),
+            )
+            conn.execute(
+                "UPDATE face_scan_jobs SET message=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (f"Photo {photo_id}", job_id),
+            )
+
+        try:
+            with connect_db(DB_PATH) as conn:
+                photo = conn.execute("SELECT id, checksum FROM photos WHERE id=?", (photo_id,)).fetchone()
+                if not photo:
+                    raise ValueError("Photo not found")
+                mode = job["mode"]
+                image_path = find_photo_file(conn, photo_id) if mode == "detect" else None
+                if mode == "detect" and not image_path:
+                    raise ValueError("No file found for this photo")
+                cached = mode == "match" or photo_face_cache_valid(
+                    conn, photo_id, photo["checksum"], engine.model_name, engine.model_version
+                )
+            if mode == "detect" and not cached:
+                detections = engine.analyze_path(image_path)
+                with connect_db(DB_PATH) as conn:
+                    replace_photo_faces(
+                        conn,
+                        photo_id,
+                        photo["checksum"],
+                        detections,
+                        engine.model_name,
+                        engine.model_version,
+                        engine.provider,
+                    )
+            with connect_db(DB_PATH) as conn:
+                summary = rematch_photo_faces(conn, photo_id)
+                conn.execute(
+                    "UPDATE face_scan_items SET state='done', error=NULL, updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND photo_id=?",
+                    (job_id, photo_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE face_scan_jobs
+                    SET processed=processed+1, recognized=recognized+?, pending=pending+?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (summary["recognized"], summary["pending"], job_id),
+                )
+        except Exception as exc:
+            print(f"[face] job {job_id}, photo {photo_id}: {exc}", flush=True)
+            with connect_db(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE face_scan_items SET state='error', error=?, updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND photo_id=?",
+                    (str(exc), job_id, photo_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE face_scan_jobs SET processed=processed+1, errors_count=errors_count+1,
+                        message=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
+                    """,
+                    (f"Erreur photo {photo_id}: {exc}", job_id),
+                )
+
+
+def enqueue_face_job(scope, photo_ids, mode="detect", params=None, sync=False):
+    job_id = str(uuid4())
+    with connect_db(DB_PATH) as conn:
+        job = create_face_scan_job(conn, job_id, scope, photo_ids, mode=mode, params=params)
+    if sync:
+        return run_face_job(job_id)
+    start_face_worker()
+    return job
+
+
+def enqueue_rematch_all(sync=False):
+    with connect_db(DB_PATH) as conn:
+        photo_ids = photo_ids_for_face_scope(conn, "rematch", mode="match")
+    if not photo_ids:
+        return None
+    return enqueue_face_job("rematch", photo_ids, mode="match", sync=sync)
+
+
+def enqueue_automatic_face_scan():
+    with connect_db(DB_PATH) as conn:
+        if not get_face_setting(conn, "automatic_scan", False):
+            return None
+        engine = get_face_engine()
+        rows = conn.execute(
+            """
+            SELECT p.id
+            FROM photos p
+            JOIN album_photos ap ON ap.photo_id=p.id AND ap.is_missing=0
+            LEFT JOIN face_photo_scans fps ON fps.photo_id=p.id
+                AND fps.checksum=p.checksum AND fps.model_name=? AND fps.model_version=?
+            WHERE fps.photo_id IS NULL
+            GROUP BY p.id
+            ORDER BY p.id
+            """,
+            (engine.model_name, engine.model_version),
+        ).fetchall()
+    photo_ids = [row["id"] for row in rows]
+    return enqueue_face_job("automatic", photo_ids, mode="detect") if photo_ids else None
 
 
 def create_comfy_job(photo_id, payload):
@@ -254,6 +502,8 @@ def normalized_batch_photo_ids(payload):
 
 
 def missing_photo_ids(conn, photo_ids):
+    if not photo_ids:
+        return []
     placeholders = ",".join("?" for _ in photo_ids)
     existing = {
         row["id"]
@@ -345,6 +595,7 @@ def run_scan_job(job_id, scan_metadata):
             finished_at=time.time(),
             summary=summary,
         )
+        enqueue_automatic_face_scan()
         print(f"[scan] job {job_id} done: {summary}", flush=True)
     except Exception as exc:
         print(f"[scan] job {job_id} failed: {exc}", flush=True)
@@ -439,6 +690,7 @@ def api_scan():
     payload = request.get_json(silent=True) or {}
     if payload.get("sync"):
         summary = scan_albums(DB_PATH, IMAGES_ROOT, THUMBNAIL_ROOT, scan_metadata=bool(payload.get("metadata")))
+        enqueue_automatic_face_scan()
         return jsonify({"ok": True, "summary": summary})
 
     with SCAN_LOCK:
@@ -802,9 +1054,350 @@ def api_tags():
         return jsonify({"ok": True, "tags": list_tags(conn)})
 
 
+@app.get("/api/face/status")
+def api_face_status():
+    ensure_ready()
+    engine = get_face_engine()
+    with connect_db(DB_PATH) as conn:
+        job = get_current_face_scan_job(conn)
+        automatic_scan = bool(get_face_setting(conn, "automatic_scan", False))
+    return jsonify(
+        {
+            "ok": True,
+            "engine": engine.configuration(),
+            "automatic_scan": automatic_scan,
+            "job": job,
+        }
+    )
+
+
+@app.patch("/api/face/settings")
+def api_face_settings():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    if "automatic_scan" not in payload:
+        return jsonify({"ok": False, "error": "automatic_scan is required"}), 400
+    with connect_db(DB_PATH) as conn:
+        set_face_setting(conn, "automatic_scan", bool(payload["automatic_scan"]))
+    return jsonify({"ok": True, "automatic_scan": bool(payload["automatic_scan"])})
+
+
+@app.get("/api/face/identities")
+def api_face_identities():
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        identities = list_face_identities(conn)
+    return jsonify({"ok": True, "identities": identities})
+
+
+@app.post("/api/face/identities")
+def api_create_face_identity():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        with connect_db(DB_PATH) as conn:
+            identity = create_face_identity(
+                conn,
+                payload.get("tag_name", ""),
+                payload.get("review_threshold", 0.40),
+                payload.get("automatic_threshold", 0.55),
+                payload.get("margin_threshold", 0.08),
+                payload.get("enabled", True),
+            )
+        return jsonify({"ok": True, "identity": identity}), 201
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.patch("/api/face/identities/<int:identity_id>")
+def api_update_face_identity(identity_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    allowed = {"tag_name", "review_threshold", "automatic_threshold", "margin_threshold", "enabled"}
+    try:
+        with connect_db(DB_PATH) as conn:
+            identity = update_face_identity(conn, identity_id, **{key: value for key, value in payload.items() if key in allowed})
+        if not identity:
+            return jsonify({"ok": False, "error": "Face identity not found"}), 404
+        job = enqueue_rematch_all()
+        return jsonify({"ok": True, "identity": identity, "job": job})
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.delete("/api/face/identities/<int:identity_id>")
+def api_delete_face_identity(identity_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        deleted = delete_face_identity(conn, identity_id)
+    if not deleted:
+        return jsonify({"ok": False, "error": "Face identity not found"}), 404
+    job = enqueue_rematch_all()
+    return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/face/identities/<int:identity_id>/references/gallery")
+def api_add_gallery_face_reference(identity_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        face_id = int(payload.get("face_id"))
+        with connect_db(DB_PATH) as conn:
+            reference_id = add_gallery_face_reference(conn, identity_id, face_id)
+            identity = get_face_identity(conn, identity_id)
+        job = enqueue_rematch_all()
+        return jsonify({"ok": True, "reference_id": reference_id, "identity": identity, "job": job}), 201
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.post("/api/face/imports")
+def api_create_face_import():
+    ensure_ready()
+    uploaded = request.files.get("file")
+    if not uploaded or not uploaded.filename:
+        return jsonify({"ok": False, "error": "Reference image is required"}), 400
+    suffix = Path(secure_filename(uploaded.filename)).suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return jsonify({"ok": False, "error": "Unsupported reference image format"}), 400
+    FACE_REFERENCE_ROOT.mkdir(parents=True, exist_ok=True)
+    token = str(uuid4())
+    image_path = FACE_REFERENCE_ROOT / f"{token}{suffix}"
+    uploaded.save(image_path)
+    try:
+        engine = get_face_engine()
+        detections = engine.analyze_path(image_path)
+        if not detections:
+            image_path.unlink(missing_ok=True)
+            return jsonify({"ok": False, "error": "No face detected in this reference"}), 400
+        with connect_db(DB_PATH) as conn:
+            create_face_import(
+                conn,
+                token,
+                image_path,
+                secure_filename(uploaded.filename),
+                detections,
+                engine.model_name,
+                engine.model_version,
+            )
+            imported = get_face_import(conn, token)
+        return jsonify({"ok": True, "import": imported}), 201
+    except (FaceRecognitionUnavailable, FaceRecognitionError, OSError, ValueError) as exc:
+        image_path.unlink(missing_ok=True)
+        return jsonify({"ok": False, "error": str(exc)}), 503 if isinstance(exc, FaceRecognitionUnavailable) else 400
+
+
+@app.post("/api/face/identities/<int:identity_id>/references/import")
+def api_add_imported_face_reference(identity_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        token = str(payload.get("token") or "")
+        face_index = int(payload.get("face_index"))
+        with connect_db(DB_PATH) as conn:
+            reference_id = add_imported_face_reference(conn, identity_id, token, face_index)
+            identity = get_face_identity(conn, identity_id)
+        job = enqueue_rematch_all()
+        return jsonify({"ok": True, "reference_id": reference_id, "identity": identity, "job": job}), 201
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.delete("/api/face/references/<int:reference_id>")
+def api_delete_face_reference(reference_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        reference = get_face_reference(conn, reference_id)
+        if not reference:
+            return jsonify({"ok": False, "error": "Face reference not found"}), 404
+        file_path = reference["file_path"]
+        conn.execute("DELETE FROM face_references WHERE id=?", (reference_id,))
+        still_used = (
+            conn.execute("SELECT 1 FROM face_references WHERE file_path=? LIMIT 1", (file_path,)).fetchone()
+            if file_path
+            else None
+        )
+    if file_path and not still_used:
+        candidate = Path(file_path).resolve()
+        root = FACE_REFERENCE_ROOT.resolve()
+        if root in candidate.parents:
+            candidate.unlink(missing_ok=True)
+    job = enqueue_rematch_all()
+    return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/face/jobs")
+def api_create_face_job():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    scope = payload.get("scope", "all")
+    mode = payload.get("mode", "detect")
+    try:
+        with connect_db(DB_PATH) as conn:
+            photo_ids = photo_ids_for_face_scope(
+                conn,
+                scope,
+                photo_ids=payload.get("photo_ids"),
+                album_name=payload.get("album_name"),
+                mode=mode,
+            )
+            missing = missing_photo_ids(conn, photo_ids)
+            if missing:
+                return jsonify({"ok": False, "error": f"Photos not found: {', '.join(map(str, missing))}"}), 404
+        job = enqueue_face_job(
+            scope,
+            photo_ids,
+            mode=mode,
+            params={"album_name": payload.get("album_name")},
+            sync=bool(payload.get("sync")),
+        )
+        return jsonify({"ok": True, "job": job}), 200 if payload.get("sync") else 202
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.get("/api/face/jobs/current")
+def api_current_face_job():
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        return jsonify({"ok": True, "job": get_current_face_scan_job(conn)})
+
+
+@app.get("/api/face/jobs/<job_id>")
+def api_face_job(job_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        job = get_face_scan_job(conn, job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Face scan job not found"}), 404
+    return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/face/jobs/<job_id>/cancel")
+def api_cancel_face_job(job_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        job = get_face_scan_job(conn, job_id)
+        if not job:
+            return jsonify({"ok": False, "error": "Face scan job not found"}), 404
+        if job["active"]:
+            conn.execute(
+                "UPDATE face_scan_jobs SET state='cancel_requested', message='Annulation demandee', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (job_id,),
+            )
+        job = get_face_scan_job(conn, job_id)
+    return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/face/jobs/<job_id>/resume")
+def api_resume_face_job(job_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        job = get_face_scan_job(conn, job_id)
+        if not job:
+            return jsonify({"ok": False, "error": "Face scan job not found"}), 404
+        conn.execute(
+            "UPDATE face_scan_items SET state='queued', error=NULL WHERE job_id=? AND state='error'", (job_id,)
+        )
+        conn.execute(
+            """
+            UPDATE face_scan_jobs SET state='queued', total=(SELECT COUNT(*) FROM face_scan_items WHERE job_id=?),
+                processed=(SELECT COUNT(*) FROM face_scan_items WHERE job_id=? AND state='done'),
+                errors_count=0, error=NULL, message='Reprise en attente', finished_at=NULL, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (job_id, job_id, job_id),
+        )
+        job = get_face_scan_job(conn, job_id)
+    start_face_worker()
+    return jsonify({"ok": True, "job": job}), 202
+
+
+@app.post("/api/photo-faces/<int:face_id>/decision")
+def api_decide_face_match(face_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        with connect_db(DB_PATH) as conn:
+            photo_id = decide_face_match(conn, face_id, int(payload.get("identity_id")), payload.get("decision"))
+            photo = get_photo_detail(conn, photo_id)
+        return jsonify({"ok": True, "photo": photo})
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+def _cropped_face_response(image_path, bbox):
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        left, top, right, bottom = (float(value) for value in bbox)
+        padding = max(right - left, bottom - top) * 0.20
+        crop_box = (
+            max(0, int(left - padding)),
+            max(0, int(top - padding)),
+            min(image.width, int(right + padding)),
+            min(image.height, int(bottom + padding)),
+        )
+        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            raise ValueError("Invalid face bounding box")
+        cropped = image.crop(crop_box)
+        cropped.thumbnail((320, 320), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        cropped.save(buffer, format="JPEG", quality=90)
+    buffer.seek(0)
+    return send_file(buffer, mimetype="image/jpeg", max_age=0)
+
+
+@app.get("/api/photo-faces/<int:face_id>/crop")
+def api_photo_face_crop(face_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        face = conn.execute("SELECT photo_id, bbox_json FROM photo_faces WHERE id=?", (face_id,)).fetchone()
+        if not face:
+            return jsonify({"ok": False, "error": "Detected face not found"}), 404
+        image_path = find_photo_file(conn, face["photo_id"])
+    if not image_path:
+        return jsonify({"ok": False, "error": "Face source image not found"}), 404
+    return _cropped_face_response(image_path, json.loads(face["bbox_json"]))
+
+
+@app.get("/api/face-references/<int:reference_id>/crop")
+def api_face_reference_crop(reference_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        reference = get_face_reference(conn, reference_id)
+        if not reference:
+            return jsonify({"ok": False, "error": "Face reference not found"}), 404
+        image_path = (
+            find_photo_file(conn, reference["source_photo_id"])
+            if reference["source_photo_id"]
+            else Path(reference["file_path"])
+        )
+    if not image_path or not Path(image_path).is_file():
+        return jsonify({"ok": False, "error": "Reference image not found"}), 404
+    return _cropped_face_response(image_path, json.loads(reference["bbox_json"]))
+
+
+@app.get("/api/face-imports/<token>/faces/<int:face_index>/crop")
+def api_face_import_crop(token, face_index):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        imported = conn.execute("SELECT file_path FROM face_imports WHERE token=?", (token,)).fetchone()
+        face = conn.execute(
+            "SELECT bbox_json FROM face_import_faces WHERE import_token=? AND face_index=?", (token, face_index)
+        ).fetchone()
+    if not imported or not face or not Path(imported["file_path"]).is_file():
+        return jsonify({"ok": False, "error": "Imported face not found"}), 404
+    return _cropped_face_response(imported["file_path"], json.loads(face["bbox_json"]))
+
+
 @app.errorhandler(404)
 def not_found(_error):
     return jsonify({"ok": False, "error": "Not found"}), 404
+
+
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify({"ok": False, "error": "Reference image is too large (25 MB maximum)"}), 413
 
 
 if __name__ == "__main__":

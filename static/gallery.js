@@ -38,6 +38,11 @@ const state = {
     longPressStartX: 0,
     longPressStartY: 0,
     suppressPhotoClickId: null,
+    faceIdentities: [],
+    faceStatus: null,
+    faceJobPollTimer: null,
+    faceJobStatusClosed: false,
+    faceImport: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -336,9 +341,58 @@ function renderPhotoDetail(photo) {
     $("#detail-prompt").textContent = metadata.prompt || "Aucun prompt extrait.";
     $("#detail-tags").innerHTML = renderTags(photo.tags);
     $("#photo-tags-input").value = photo.tags.map((tag) => tag.name).join(", ");
+    renderPhotoFaces(photo.face_analysis);
     renderLinks(photo.links);
     renderLinkedStrip(photo.links);
     refreshComfyStatus();
+}
+
+function renderPhotoFaces(analysis) {
+    const container = $("#detail-faces");
+    if (!container) {
+        return;
+    }
+    if (!analysis?.scanned) {
+        container.innerHTML = '<span class="muted">Photo non analysee.</span>';
+        return;
+    }
+    if (!analysis.faces?.length) {
+        container.innerHTML = '<span class="muted">Aucun visage detecte.</span>';
+        return;
+    }
+    const identityOptions = state.faceIdentities.map((identity) =>
+        `<option value="${identity.id}">${escapeHtml(identity.tag_name)}</option>`
+    ).join("");
+    container.innerHTML = analysis.faces.map((face) => {
+        const match = face.match;
+        const score = match ? Number(match.score).toFixed(3) : null;
+        const stateLabel = match?.state === "automatic" ? "Tag automatique"
+            : match?.state === "pending" ? "A confirmer"
+            : match?.state === "confirmed" ? "Confirme"
+            : match?.state === "rejected" ? "Rejete"
+            : "Inconnu";
+        return `
+            <article class="face-detail-card" data-face-id="${face.id}">
+                <img src="${face.crop_url}" alt="Visage ${face.face_index + 1}">
+                <div class="face-detail-content">
+                    <strong>${match ? escapeHtml(match.tag_name) : "Visage inconnu"}</strong>
+                    <small class="face-match-state is-${escapeHtml(match?.state || "unknown")}">
+                        ${stateLabel}${score ? ` · ${score}` : ""}
+                    </small>
+                    ${match && match.state !== "rejected" ? `
+                        <div class="face-card-actions">
+                            ${match.state !== "confirmed" ? `<button type="button" data-face-decision="confirmed" data-identity-id="${match.identity_id}">Confirmer</button>` : ""}
+                            <button type="button" data-face-decision="rejected" data-identity-id="${match.identity_id}">Rejeter</button>
+                        </div>
+                    ` : ""}
+                    <div class="face-reference-action">
+                        <select data-face-reference-identity ${identityOptions ? "" : "disabled"}>${identityOptions || '<option>Aucune identite</option>'}</select>
+                        <button type="button" data-add-gallery-reference ${identityOptions ? "" : "disabled"}>Reference</button>
+                    </div>
+                </div>
+            </article>
+        `;
+    }).join("");
 }
 
 function galleryPhotoFromDetail(photo) {
@@ -979,6 +1033,23 @@ async function scanSelectedMetadata() {
     }
 }
 
+async function scanSelectedFaces() {
+    const photoIds = selectedPhotoIds();
+    if (!photoIds.length) {
+        return;
+    }
+    closeSelectionActionsMenu();
+    try {
+        const job = await startFaceJob("selection", { photo_ids: photoIds });
+        setSelectionStatus(`Reconnaissance faciale lancee sur ${photoIds.length} photo(s).`);
+        if (job) {
+            pollFaceJob(job.id);
+        }
+    } catch (error) {
+        setSelectionStatus(error.message, true);
+    }
+}
+
 function openBatchTagModal() {
     if (!state.selectedPhotoIds.size) {
         return;
@@ -1044,6 +1115,8 @@ function handleBatchAction(action) {
         openBatchAlbumActionModal();
     } else if (action === "scan") {
         scanSelectedMetadata();
+    } else if (action === "faces") {
+        scanSelectedFaces();
     } else if (action === "tags") {
         openBatchTagModal();
     }
@@ -1356,6 +1429,348 @@ function chooseTagFilter(event) {
     renderTagFilters();
 }
 
+async function loadFaceIdentities() {
+    const data = await fetchJson("/api/face/identities");
+    state.faceIdentities = data.identities || [];
+    renderFaceIdentities();
+    if (state.currentPhoto) {
+        renderPhotoFaces(state.currentPhoto.face_analysis);
+    }
+    return state.faceIdentities;
+}
+
+async function refreshFaceStatus() {
+    const data = await fetchJson("/api/face/status");
+    state.faceStatus = data;
+    const engine = data.engine || {};
+    const engineStatus = $("#face-engine-status");
+    if (engineStatus) {
+        engineStatus.textContent = engine.configured
+            ? `${engine.model_name} · ${engine.provider || "provider choisi au chargement"} · local`
+            : !engine.model_present
+                ? `Modele absent : ${engine.model_directory}`
+                : "Dependances absentes : installez InsightFace et ONNX Runtime";
+        engineStatus.classList.toggle("error", !engine.configured);
+    }
+    const automatic = $("#face-automatic-scan");
+    if (automatic) {
+        automatic.checked = Boolean(data.automatic_scan);
+    }
+    renderFaceJobStatus(data.job);
+    return data;
+}
+
+function renderFaceJobStatus(job, options = {}) {
+    const box = $("#face-job-status");
+    if (!box || !job) {
+        return;
+    }
+    if (!options.force && !job.active && job.state !== "error") {
+        return;
+    }
+    if (state.faceJobStatusClosed && !job.active) {
+        return;
+    }
+    box.hidden = false;
+    box.dataset.state = job.state;
+    $("#face-job-status-title").textContent = job.state === "done" ? "Visages analyses"
+        : job.state === "error" ? "Reconnaissance en erreur"
+        : job.state === "cancelled" ? "Reconnaissance annulee"
+        : "Reconnaissance faciale";
+    $("#face-job-status-message").textContent = job.error || job.message || job.state;
+    const percent = job.total ? Math.round((job.processed / job.total) * 100) : 0;
+    $("#face-job-status-detail").textContent = `${job.processed}/${job.total} (${percent} %) · ${job.recognized} reconnu(s) · ${job.pending} a confirmer · ${job.errors_count} erreur(s)`;
+    $("#face-job-status-close").hidden = Boolean(job.active);
+    const cancel = $("#cancel-face-job-button");
+    const resume = $("#resume-face-job-button");
+    if (cancel) {
+        cancel.hidden = !job.active || job.state === "cancel_requested";
+        cancel.dataset.jobId = job.id;
+    }
+    if (resume) {
+        resume.hidden = !["error", "cancelled"].includes(job.state);
+        resume.dataset.jobId = job.id;
+    }
+}
+
+async function startFaceJob(scope, extra = {}) {
+    state.faceJobStatusClosed = false;
+    const data = await fetchJson("/api/face/jobs", {
+        method: "POST",
+        body: JSON.stringify({ scope, mode: "detect", ...extra }),
+    });
+    renderFaceJobStatus(data.job, { force: true });
+    pollFaceJob(data.job.id);
+    return data.job;
+}
+
+function pollFaceJob(jobId) {
+    window.clearInterval(state.faceJobPollTimer);
+    state.faceJobPollTimer = window.setInterval(async () => {
+        try {
+            const data = await fetchJson(`/api/face/jobs/${jobId}`);
+            renderFaceJobStatus(data.job, { force: true });
+            if (!data.job.active) {
+                window.clearInterval(state.faceJobPollTimer);
+                await refreshCurrentPhotoDetail();
+            }
+        } catch (_error) {
+            window.clearInterval(state.faceJobPollTimer);
+        }
+    }, 1000);
+}
+
+async function refreshCurrentPhotoDetail() {
+    if (!state.currentPhoto) {
+        return;
+    }
+    const data = await fetchJson(`/api/photos/${state.currentPhoto.id}`);
+    state.currentPhoto = data.photo;
+    renderPhotoDetail(data.photo);
+    syncPhotoInCurrentGallery(data.photo);
+}
+
+async function scanCurrentPhotoFaces() {
+    if (!state.currentPhoto) {
+        return;
+    }
+    const done = setBusy($("#scan-photo-faces-button"), "Analyse...");
+    try {
+        await startFaceJob("photo", { photo_ids: [state.currentPhoto.id] });
+    } catch (error) {
+        alert(error.message);
+    } finally {
+        done();
+    }
+}
+
+async function setAutomaticFaceScan(event) {
+    try {
+        const data = await fetchJson("/api/face/settings", {
+            method: "PATCH",
+            body: JSON.stringify({ automatic_scan: event.target.checked }),
+        });
+        event.target.checked = Boolean(data.automatic_scan);
+    } catch (error) {
+        event.target.checked = !event.target.checked;
+        alert(error.message);
+    }
+}
+
+async function openFaceAdmin() {
+    $("#face-admin-modal").classList.add("open");
+    $("#face-admin-modal").setAttribute("aria-hidden", "false");
+    try {
+        await Promise.all([refreshFaceStatus(), loadFaceIdentities()]);
+    } catch (error) {
+        $("#face-engine-status").textContent = error.message;
+        $("#face-engine-status").classList.add("error");
+    }
+}
+
+function closeFaceAdmin() {
+    $("#face-admin-modal")?.classList.remove("open");
+    $("#face-admin-modal")?.setAttribute("aria-hidden", "true");
+}
+
+function renderFaceIdentities() {
+    const container = $("#face-identity-list");
+    const target = $("#face-reference-identity");
+    if (target) {
+        target.innerHTML = state.faceIdentities.length
+            ? state.faceIdentities.map((identity) => `<option value="${identity.id}">${escapeHtml(identity.tag_name)}</option>`).join("")
+            : '<option value="">Creez une identite</option>';
+        target.disabled = !state.faceIdentities.length;
+    }
+    if (!container) {
+        return;
+    }
+    if (!state.faceIdentities.length) {
+        container.innerHTML = '<p class="muted">Aucune identite configuree.</p>';
+        return;
+    }
+    container.innerHTML = state.faceIdentities.map((identity) => `
+        <form class="face-identity-card" data-face-identity-id="${identity.id}">
+            <div class="face-identity-title">
+                <input name="tag_name" value="${escapeHtml(identity.tag_name)}" aria-label="Tag de l'identite">
+                <label class="checkbox-field"><input name="enabled" type="checkbox" ${identity.enabled ? "checked" : ""}> Active</label>
+            </div>
+            <div class="face-threshold-grid">
+                <label>Revue <input name="review_threshold" type="number" min="0" max="1" step="0.01" value="${identity.review_threshold}"></label>
+                <label>Auto <input name="automatic_threshold" type="number" min="0" max="1" step="0.01" value="${identity.automatic_threshold}"></label>
+                <label>Marge <input name="margin_threshold" type="number" min="0" max="1" step="0.01" value="${identity.margin_threshold}"></label>
+            </div>
+            <div class="face-reference-summary ${identity.reference_count < 3 ? "warning" : ""}">
+                ${identity.reference_count} reference(s)${identity.reference_count < 3 ? " · 3 minimum recommandees" : ""}
+            </div>
+            <div class="face-reference-grid">
+                ${(identity.references || []).map((reference) => `
+                    <div class="face-reference-thumb">
+                        <img src="${reference.crop_url}" alt="Reference ${escapeHtml(identity.tag_name)}">
+                        <button type="button" data-delete-face-reference="${reference.id}" title="Supprimer">&times;</button>
+                    </div>
+                `).join("")}
+            </div>
+            <div class="face-identity-actions">
+                <button type="submit">Enregistrer</button>
+                <button type="button" class="danger" data-delete-face-identity="${identity.id}">Supprimer</button>
+            </div>
+        </form>
+    `).join("");
+}
+
+async function createFaceIdentity(event) {
+    event.preventDefault();
+    const tagName = $("#face-identity-tag").value.trim();
+    if (!tagName) {
+        return;
+    }
+    await fetchJson("/api/face/identities", {
+        method: "POST",
+        body: JSON.stringify({ tag_name: tagName }),
+    });
+    $("#face-identity-tag").value = "";
+    await loadFaceIdentities();
+}
+
+async function saveFaceIdentity(event) {
+    event.preventDefault();
+    const form = event.target;
+    const data = new FormData(form);
+    const response = await fetchJson(`/api/face/identities/${form.dataset.faceIdentityId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+            tag_name: data.get("tag_name"),
+            enabled: data.get("enabled") === "on",
+            review_threshold: Number(data.get("review_threshold")),
+            automatic_threshold: Number(data.get("automatic_threshold")),
+            margin_threshold: Number(data.get("margin_threshold")),
+        }),
+    });
+    if (response.job) {
+        renderFaceJobStatus(response.job, { force: true });
+        pollFaceJob(response.job.id);
+    }
+    await loadFaceIdentities();
+}
+
+async function importFaceReference(event) {
+    event.preventDefault();
+    const file = $("#face-reference-file").files[0];
+    if (!file || !$("#face-reference-identity").value) {
+        return;
+    }
+    const status = $("#face-import-status");
+    const button = event.target.querySelector('button[type="submit"]');
+    const done = setBusy(button, "Detection...");
+    status.textContent = "Analyse locale de la reference...";
+    status.classList.remove("error");
+    const body = new FormData();
+    body.append("file", file);
+    try {
+        const response = await fetch("/api/face/imports", { method: "POST", body });
+        const data = await response.json();
+        if (!response.ok || data.ok === false) {
+            throw new Error(data.error || "Erreur d'import");
+        }
+        state.faceImport = data.import;
+        status.textContent = `${data.import.faces.length} visage(s) detecte(s). Choisissez la reference.`;
+        renderFaceImportCandidates();
+    } catch (error) {
+        status.textContent = error.message;
+        status.classList.add("error");
+    } finally {
+        done();
+    }
+}
+
+function renderFaceImportCandidates() {
+    const container = $("#face-import-candidates");
+    const imported = state.faceImport;
+    container.innerHTML = imported?.faces?.map((face) => `
+        <button type="button" class="face-import-candidate" data-add-imported-face="${face.face_index}">
+            <img src="${face.crop_url}" alt="Visage importe ${face.face_index + 1}">
+            <span>Utiliser ce visage</span>
+        </button>
+    `).join("") || "";
+}
+
+async function addImportedFaceReference(faceIndex) {
+    const identityId = Number($("#face-reference-identity").value);
+    if (!identityId || !state.faceImport) {
+        return;
+    }
+    const data = await fetchJson(`/api/face/identities/${identityId}/references/import`, {
+        method: "POST",
+        body: JSON.stringify({ token: state.faceImport.token, face_index: faceIndex }),
+    });
+    state.faceImport = null;
+    $("#face-reference-file").value = "";
+    $("#face-import-candidates").innerHTML = "";
+    $("#face-import-status").textContent = "Reference ajoutee.";
+    if (data.job) {
+        renderFaceJobStatus(data.job, { force: true });
+        pollFaceJob(data.job.id);
+    }
+    await loadFaceIdentities();
+}
+
+async function addGalleryFaceReference(faceCard) {
+    const identityId = Number(faceCard.querySelector("[data-face-reference-identity]").value);
+    const faceId = Number(faceCard.dataset.faceId);
+    const data = await fetchJson(`/api/face/identities/${identityId}/references/gallery`, {
+        method: "POST",
+        body: JSON.stringify({ face_id: faceId }),
+    });
+    if (data.job) {
+        renderFaceJobStatus(data.job, { force: true });
+        pollFaceJob(data.job.id);
+    }
+    await loadFaceIdentities();
+}
+
+async function decideFace(faceId, identityId, decision) {
+    const data = await fetchJson(`/api/photo-faces/${faceId}/decision`, {
+        method: "POST",
+        body: JSON.stringify({ identity_id: identityId, decision }),
+    });
+    state.currentPhoto = data.photo;
+    renderPhotoDetail(data.photo);
+    syncPhotoInCurrentGallery(data.photo);
+}
+
+async function deleteFaceIdentity(identityId) {
+    if (!window.confirm("Supprimer cette identite faciale ? Le tag manuel sera conserve.")) {
+        return;
+    }
+    const data = await fetchJson(`/api/face/identities/${identityId}`, { method: "DELETE" });
+    if (data.job) {
+        renderFaceJobStatus(data.job, { force: true });
+        pollFaceJob(data.job.id);
+    }
+    await loadFaceIdentities();
+}
+
+async function deleteFaceReference(referenceId) {
+    const data = await fetchJson(`/api/face/references/${referenceId}`, { method: "DELETE" });
+    if (data.job) {
+        renderFaceJobStatus(data.job, { force: true });
+        pollFaceJob(data.job.id);
+    }
+    await loadFaceIdentities();
+}
+
+async function cancelFaceJob(jobId) {
+    const data = await fetchJson(`/api/face/jobs/${jobId}/cancel`, { method: "POST", body: "{}" });
+    renderFaceJobStatus(data.job, { force: true });
+}
+
+async function resumeFaceJob(jobId) {
+    const data = await fetchJson(`/api/face/jobs/${jobId}/resume`, { method: "POST", body: "{}" });
+    renderFaceJobStatus(data.job, { force: true });
+    pollFaceJob(data.job.id);
+}
+
 function openAdmin() {
     renderAlbumAdmin();
     $("#admin-modal").classList.add("open");
@@ -1492,11 +1907,36 @@ function bindEvents() {
         $("#scan-status").hidden = true;
     });
     $("#admin-button")?.addEventListener("click", openAdmin);
+    $("#face-admin-button")?.addEventListener("click", openFaceAdmin);
     $("#selection-actions-button")?.addEventListener("click", (event) => {
         event.stopPropagation();
         toggleSelectionActionsMenu();
     });
     $("#rescan-metadata-button")?.addEventListener("click", rescanCurrentMetadata);
+    $("#scan-photo-faces-button")?.addEventListener("click", scanCurrentPhotoFaces);
+    $("#face-automatic-scan")?.addEventListener("change", setAutomaticFaceScan);
+    $("#scan-album-faces-button")?.addEventListener("click", () => {
+        if (state.selectedAlbum?.name) {
+            startFaceJob("album", { album_name: state.selectedAlbum.name }).catch((error) => alert(error.message));
+        }
+    });
+    $("#scan-all-faces-button")?.addEventListener("click", () => {
+        startFaceJob("all").catch((error) => alert(error.message));
+    });
+    $("#cancel-face-job-button")?.addEventListener("click", (event) => {
+        cancelFaceJob(event.currentTarget.dataset.jobId).catch((error) => alert(error.message));
+    });
+    $("#resume-face-job-button")?.addEventListener("click", (event) => {
+        resumeFaceJob(event.currentTarget.dataset.jobId).catch((error) => alert(error.message));
+    });
+    $("#face-job-status-close")?.addEventListener("click", () => {
+        state.faceJobStatusClosed = true;
+        $("#face-job-status").hidden = true;
+    });
+    $("#face-identity-create-form")?.addEventListener("submit", (event) => {
+        createFaceIdentity(event).catch((error) => alert(error.message));
+    });
+    $("#face-reference-import-form")?.addEventListener("submit", importFaceReference);
     $("#comfy-generate-button")?.addEventListener("click", openComfyModal);
     $("#delete-photo-button")?.addEventListener("click", deleteCurrentPhoto);
     $("#photo-actions-button")?.addEventListener("click", (event) => {
@@ -1587,6 +2027,31 @@ function bindEvents() {
         if (comfyReference) {
             selectComfyReference(comfyReference);
         }
+        const faceDecision = event.target.closest("[data-face-decision]");
+        if (faceDecision) {
+            const card = faceDecision.closest("[data-face-id]");
+            decideFace(
+                Number(card.dataset.faceId),
+                Number(faceDecision.dataset.identityId),
+                faceDecision.dataset.faceDecision,
+            ).catch((error) => alert(error.message));
+        }
+        const galleryReference = event.target.closest("[data-add-gallery-reference]");
+        if (galleryReference) {
+            addGalleryFaceReference(galleryReference.closest("[data-face-id]")).catch((error) => alert(error.message));
+        }
+        const importedFace = event.target.closest("[data-add-imported-face]");
+        if (importedFace) {
+            addImportedFaceReference(Number(importedFace.dataset.addImportedFace)).catch((error) => alert(error.message));
+        }
+        const deleteIdentity = event.target.closest("[data-delete-face-identity]");
+        if (deleteIdentity) {
+            deleteFaceIdentity(Number(deleteIdentity.dataset.deleteFaceIdentity)).catch((error) => alert(error.message));
+        }
+        const deleteReference = event.target.closest("[data-delete-face-reference]");
+        if (deleteReference) {
+            deleteFaceReference(Number(deleteReference.dataset.deleteFaceReference)).catch((error) => alert(error.message));
+        }
     });
 
     $("#album-admin-list")?.addEventListener("submit", (event) => {
@@ -1596,6 +2061,12 @@ function bindEvents() {
     });
     $("#tag-filter-list")?.addEventListener("click", chooseTagFilter);
     $$('[data-close-tag-filter]').forEach((button) => button.addEventListener("click", closeTagFilter));
+    $$('[data-close-face-admin]').forEach((button) => button.addEventListener("click", closeFaceAdmin));
+    $("#face-identity-list")?.addEventListener("submit", (event) => {
+        if (event.target.matches(".face-identity-card")) {
+            saveFaceIdentity(event).catch((error) => alert(error.message));
+        }
+    });
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
@@ -1620,6 +2091,7 @@ function bindEvents() {
             closeAdmin();
             closeComfyModal();
             closeTagFilter();
+            closeFaceAdmin();
         }
         if ($("#photo-modal").classList.contains("open") && event.key === "ArrowRight") {
             navigate(1);
@@ -1636,6 +2108,19 @@ function bindEvents() {
     });
 }
 
+async function resumeFaceRecognitionState() {
+    try {
+        await loadFaceIdentities();
+        const data = await refreshFaceStatus();
+        if (data.job?.active) {
+            renderFaceJobStatus(data.job, { force: true });
+            pollFaceJob(data.job.id);
+        }
+    } catch (_error) {
+        // Face recognition remains optional until its local model is configured.
+    }
+}
+
 function debounce(fn, delay) {
     let timer = null;
     return (...args) => {
@@ -1648,3 +2133,4 @@ bindEvents();
 renderSelectionState();
 resumeScanStatusIfNeeded();
 refreshComfyStatus();
+resumeFaceRecognitionState();

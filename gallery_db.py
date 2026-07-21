@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import struct
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -35,6 +36,8 @@ def connect_db(db_path):
 
 def init_db(db_path):
     with connect_db(db_path) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS albums (
@@ -80,6 +83,7 @@ def init_db(db_path):
             CREATE TABLE IF NOT EXISTS photo_tags (
                 photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                source TEXT NOT NULL DEFAULT 'manual',
                 PRIMARY KEY(photo_id, tag_id)
             );
 
@@ -122,13 +126,141 @@ def init_db(db_path):
                 PRIMARY KEY(photo_id, image_name)
             );
 
+            CREATE TABLE IF NOT EXISTS face_identities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag_id INTEGER NOT NULL UNIQUE REFERENCES tags(id) ON DELETE CASCADE,
+                review_threshold REAL NOT NULL DEFAULT 0.40,
+                automatic_threshold REAL NOT NULL DEFAULT 0.55,
+                margin_threshold REAL NOT NULL DEFAULT 0.08,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS face_photo_scans (
+                photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                checksum TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                provider TEXT,
+                faces_count INTEGER NOT NULL DEFAULT 0,
+                scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS photo_faces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                face_index INTEGER NOT NULL,
+                bbox_json TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                embedding BLOB NOT NULL,
+                embedding_dimensions INTEGER NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(photo_id, model_name, model_version, face_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS face_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                identity_id INTEGER NOT NULL REFERENCES face_identities(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL CHECK(source_type IN ('gallery', 'upload')),
+                source_photo_id INTEGER REFERENCES photos(id) ON DELETE SET NULL,
+                source_face_id INTEGER REFERENCES photo_faces(id) ON DELETE SET NULL,
+                file_path TEXT,
+                bbox_json TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                embedding BLOB NOT NULL,
+                embedding_dimensions INTEGER NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS face_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_id INTEGER NOT NULL REFERENCES photo_faces(id) ON DELETE CASCADE,
+                identity_id INTEGER NOT NULL REFERENCES face_identities(id) ON DELETE CASCADE,
+                score REAL NOT NULL,
+                second_best_score REAL,
+                state TEXT NOT NULL CHECK(state IN ('automatic', 'pending', 'confirmed', 'rejected')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                decided_at TEXT,
+                UNIQUE(face_id, identity_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS face_imports (
+                token TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS face_import_faces (
+                import_token TEXT NOT NULL REFERENCES face_imports(token) ON DELETE CASCADE,
+                face_index INTEGER NOT NULL,
+                bbox_json TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                embedding BLOB NOT NULL,
+                embedding_dimensions INTEGER NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                PRIMARY KEY(import_token, face_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS face_scan_jobs (
+                id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'detect',
+                state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'cancel_requested', 'cancelled', 'done', 'error')),
+                total INTEGER NOT NULL DEFAULT 0,
+                processed INTEGER NOT NULL DEFAULT 0,
+                recognized INTEGER NOT NULL DEFAULT 0,
+                pending INTEGER NOT NULL DEFAULT 0,
+                errors_count INTEGER NOT NULL DEFAULT 0,
+                message TEXT,
+                error TEXT,
+                params_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS face_scan_items (
+                job_id TEXT NOT NULL REFERENCES face_scan_jobs(id) ON DELETE CASCADE,
+                photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued', 'running', 'done', 'error')),
+                error TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(job_id, photo_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS face_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE INDEX IF NOT EXISTS idx_album_photos_album ON album_photos(album_id, mtime DESC);
             CREATE INDEX IF NOT EXISTS idx_album_photos_photo ON album_photos(photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_tags_tag_photo ON photo_tags(tag_id, photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_links_source ON photo_links(source_photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_links_target ON photo_links(target_photo_id);
+            CREATE INDEX IF NOT EXISTS idx_photo_faces_photo ON photo_faces(photo_id);
+            CREATE INDEX IF NOT EXISTS idx_face_references_identity ON face_references(identity_id);
+            CREATE INDEX IF NOT EXISTS idx_face_matches_face_state ON face_matches(face_id, state);
+            CREATE INDEX IF NOT EXISTS idx_face_scan_items_state ON face_scan_items(job_id, state);
             """
         )
+        _ensure_column(conn, "photo_tags", "source", "TEXT NOT NULL DEFAULT 'manual'")
+
+
+def _ensure_column(conn, table_name, column_name, definition):
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 
 def album_type_from_name(name):
@@ -624,7 +756,7 @@ def get_photo_detail(conn, photo_id):
     links = list_photo_links(conn, photo_id)
     tags = conn.execute(
         """
-        SELECT t.id, t.name FROM tags t
+        SELECT t.id, t.name, pt.source FROM tags t
         JOIN photo_tags pt ON pt.tag_id=t.id
         WHERE pt.photo_id=?
         ORDER BY t.name COLLATE NOCASE
@@ -662,6 +794,7 @@ def get_photo_detail(conn, photo_id):
         "loras": [dict(row) for row in loras],
         "used_images": [row["image_name"] for row in used_images],
         "links": links,
+        "face_analysis": list_photo_faces(conn, photo_id),
     }
 
 
@@ -909,7 +1042,10 @@ def set_photo_tags(conn, photo_id, tag_names):
     conn.execute("DELETE FROM photo_tags WHERE photo_id=?", (photo_id,))
     for name in tag_names:
         tag = upsert_tag(conn, name)
-        conn.execute("INSERT OR IGNORE INTO photo_tags(photo_id, tag_id) VALUES (?, ?)", (photo_id, tag["id"]))
+        conn.execute(
+            "INSERT OR REPLACE INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, 'manual')",
+            (photo_id, tag["id"]),
+        )
 
 
 def update_photo_tags(conn, photo_ids, tag_names, operation):
@@ -918,7 +1054,10 @@ def update_photo_tags(conn, photo_ids, tag_names, operation):
     if operation == "add":
         tag_ids = [upsert_tag(conn, name)["id"] for name in tag_names]
         conn.executemany(
-            "INSERT OR IGNORE INTO photo_tags(photo_id, tag_id) VALUES (?, ?)",
+            """
+            INSERT INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, 'manual')
+            ON CONFLICT(photo_id, tag_id) DO UPDATE SET source='manual'
+            """,
             ((photo_id, tag_id) for photo_id in photo_ids for tag_id in tag_ids),
         )
         return
@@ -950,6 +1089,586 @@ def set_album_tags(conn, album_id, tag_names):
 
 def list_tags(conn):
     return [dict(row) for row in conn.execute("SELECT * FROM tags ORDER BY name COLLATE NOCASE").fetchall()]
+
+
+def embedding_to_blob(embedding):
+    values = tuple(float(value) for value in embedding)
+    if not values:
+        raise ValueError("Face embedding is empty")
+    return struct.pack(f"<{len(values)}f", *values), len(values)
+
+
+def embedding_from_blob(blob, dimensions):
+    dimensions = int(dimensions)
+    if dimensions <= 0 or len(blob) != dimensions * 4:
+        raise ValueError("Invalid face embedding payload")
+    return struct.unpack(f"<{dimensions}f", blob)
+
+
+def _validate_face_thresholds(review_threshold, automatic_threshold, margin_threshold):
+    review = float(review_threshold)
+    automatic = float(automatic_threshold)
+    margin = float(margin_threshold)
+    if not 0 <= review <= automatic <= 1:
+        raise ValueError("Thresholds must satisfy 0 <= review <= automatic <= 1")
+    if not 0 <= margin <= 1:
+        raise ValueError("Margin threshold must be between 0 and 1")
+    return review, automatic, margin
+
+
+def create_face_identity(
+    conn,
+    tag_name,
+    review_threshold=0.40,
+    automatic_threshold=0.55,
+    margin_threshold=0.08,
+    enabled=True,
+):
+    review, automatic, margin = _validate_face_thresholds(
+        review_threshold, automatic_threshold, margin_threshold
+    )
+    tag = upsert_tag(conn, tag_name)
+    existing = conn.execute("SELECT id FROM face_identities WHERE tag_id=?", (tag["id"],)).fetchone()
+    if existing:
+        raise ValueError("This tag already has a face identity")
+    cursor = conn.execute(
+        """
+        INSERT INTO face_identities(tag_id, review_threshold, automatic_threshold, margin_threshold, enabled)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (tag["id"], review, automatic, margin, int(bool(enabled))),
+    )
+    return get_face_identity(conn, cursor.lastrowid)
+
+
+def get_face_identity(conn, identity_id):
+    row = conn.execute(
+        """
+        SELECT fi.*, t.name AS tag_name,
+               COUNT(fr.id) AS reference_count
+        FROM face_identities fi
+        JOIN tags t ON t.id=fi.tag_id
+        LEFT JOIN face_references fr ON fr.identity_id=fi.id
+        WHERE fi.id=?
+        GROUP BY fi.id
+        """,
+        (identity_id,),
+    ).fetchone()
+    return _serialize_face_identity(conn, row) if row else None
+
+
+def list_face_identities(conn, include_references=True):
+    rows = conn.execute(
+        """
+        SELECT fi.*, t.name AS tag_name,
+               COUNT(fr.id) AS reference_count
+        FROM face_identities fi
+        JOIN tags t ON t.id=fi.tag_id
+        LEFT JOIN face_references fr ON fr.identity_id=fi.id
+        GROUP BY fi.id
+        ORDER BY t.name COLLATE NOCASE
+        """
+    ).fetchall()
+    identities = []
+    for row in rows:
+        data = _serialize_face_identity(conn, row)
+        if not include_references:
+            data.pop("references", None)
+        identities.append(data)
+    return identities
+
+
+def _serialize_face_identity(conn, row):
+    data = dict(row)
+    data["enabled"] = bool(data["enabled"])
+    references = conn.execute(
+        """
+        SELECT id, identity_id, source_type, source_photo_id, source_face_id, file_path,
+               bbox_json, detection_score, model_name, model_version, created_at
+        FROM face_references WHERE identity_id=? ORDER BY id
+        """,
+        (data["id"],),
+    ).fetchall()
+    data["references"] = [
+        dict(reference)
+        | {
+            "bbox": json.loads(reference["bbox_json"]),
+            "crop_url": f"/api/face-references/{reference['id']}/crop",
+        }
+        for reference in references
+    ]
+    return data
+
+
+def update_face_identity(conn, identity_id, **updates):
+    current = get_face_identity(conn, identity_id)
+    if not current:
+        return None
+    review, automatic, margin = _validate_face_thresholds(
+        updates.get("review_threshold", current["review_threshold"]),
+        updates.get("automatic_threshold", current["automatic_threshold"]),
+        updates.get("margin_threshold", current["margin_threshold"]),
+    )
+    tag_id = current["tag_id"]
+    if updates.get("tag_name") is not None:
+        tag = upsert_tag(conn, updates["tag_name"])
+        conflict = conn.execute(
+            "SELECT id FROM face_identities WHERE tag_id=? AND id!=?", (tag["id"], identity_id)
+        ).fetchone()
+        if conflict:
+            raise ValueError("This tag already has a face identity")
+        tag_id = tag["id"]
+    enabled = int(bool(updates.get("enabled", current["enabled"])))
+    conn.execute(
+        """
+        UPDATE face_identities
+        SET tag_id=?, review_threshold=?, automatic_threshold=?, margin_threshold=?, enabled=?,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+        """,
+        (tag_id, review, automatic, margin, enabled, identity_id),
+    )
+    return get_face_identity(conn, identity_id)
+
+
+def delete_face_identity(conn, identity_id):
+    row = conn.execute("SELECT tag_id FROM face_identities WHERE id=?", (identity_id,)).fetchone()
+    if not row:
+        return False
+    conn.execute(
+        "DELETE FROM photo_tags WHERE tag_id=? AND source IN ('face_auto', 'face_confirmed')",
+        (row["tag_id"],),
+    )
+    conn.execute("DELETE FROM face_identities WHERE id=?", (identity_id,))
+    return True
+
+
+def replace_photo_faces(conn, photo_id, checksum, detections, model_name, model_version, provider=None):
+    conn.execute(
+        "DELETE FROM photo_tags WHERE photo_id=? AND source IN ('face_auto', 'face_confirmed')",
+        (photo_id,),
+    )
+    conn.execute("DELETE FROM photo_faces WHERE photo_id=?", (photo_id,))
+    face_ids = []
+    for face_index, detection in enumerate(detections):
+        blob, dimensions = embedding_to_blob(detection.embedding)
+        cursor = conn.execute(
+            """
+            INSERT INTO photo_faces(
+                photo_id, face_index, bbox_json, detection_score, embedding, embedding_dimensions,
+                model_name, model_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                photo_id,
+                face_index,
+                json.dumps(list(detection.bbox)),
+                float(detection.detection_score),
+                blob,
+                dimensions,
+                model_name,
+                model_version,
+            ),
+        )
+        face_ids.append(cursor.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO face_photo_scans(photo_id, checksum, model_name, model_version, provider, faces_count, scanned_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(photo_id) DO UPDATE SET
+            checksum=excluded.checksum,
+            model_name=excluded.model_name,
+            model_version=excluded.model_version,
+            provider=excluded.provider,
+            faces_count=excluded.faces_count,
+            scanned_at=CURRENT_TIMESTAMP
+        """,
+        (photo_id, checksum, model_name, model_version, provider, len(face_ids)),
+    )
+    return face_ids
+
+
+def photo_face_cache_valid(conn, photo_id, checksum, model_name, model_version):
+    row = conn.execute(
+        "SELECT checksum, model_name, model_version FROM face_photo_scans WHERE photo_id=?", (photo_id,)
+    ).fetchone()
+    return bool(
+        row
+        and row["checksum"] == checksum
+        and row["model_name"] == model_name
+        and row["model_version"] == model_version
+    )
+
+
+def _reference_embeddings(conn, model_name, model_version):
+    rows = conn.execute(
+        """
+        SELECT fr.identity_id, fr.embedding, fr.embedding_dimensions
+        FROM face_references fr
+        JOIN face_identities fi ON fi.id=fr.identity_id
+        WHERE fi.enabled=1 AND fr.model_name=? AND fr.model_version=?
+        """,
+        (model_name, model_version),
+    ).fetchall()
+    return [
+        {"identity_id": row["identity_id"], "embedding": embedding_from_blob(row["embedding"], row["embedding_dimensions"])}
+        for row in rows
+    ]
+
+
+def rematch_photo_faces(conn, photo_id):
+    from face_recognition import classify_identity
+
+    faces = conn.execute("SELECT * FROM photo_faces WHERE photo_id=? ORDER BY face_index", (photo_id,)).fetchall()
+    identities = list_face_identities(conn, include_references=False)
+    references_by_model = {}
+    recognized_identity_ids = set()
+    confirmed_identity_ids = set()
+    pending_count = 0
+    for face in faces:
+        existing_decisions = conn.execute(
+            "SELECT identity_id, state FROM face_matches WHERE face_id=? AND state IN ('confirmed', 'rejected')",
+            (face["id"],),
+        ).fetchall()
+        rejected_ids = {row["identity_id"] for row in existing_decisions if row["state"] == "rejected"}
+        confirmed_ids = {row["identity_id"] for row in existing_decisions if row["state"] == "confirmed"}
+        conn.execute(
+            "DELETE FROM face_matches WHERE face_id=? AND state IN ('automatic', 'pending')", (face["id"],)
+        )
+        if confirmed_ids:
+            confirmed_identity_ids.update(confirmed_ids)
+            continue
+        model_key = (face["model_name"], face["model_version"])
+        if model_key not in references_by_model:
+            references_by_model[model_key] = _reference_embeddings(conn, *model_key)
+        references = references_by_model[model_key]
+        embedding = embedding_from_blob(face["embedding"], face["embedding_dimensions"])
+        result = classify_identity(embedding, identities, references, rejected_ids)
+        if not result:
+            continue
+        conn.execute(
+            """
+            INSERT INTO face_matches(face_id, identity_id, score, second_best_score, state)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(face_id, identity_id) DO UPDATE SET
+                score=excluded.score,
+                second_best_score=excluded.second_best_score,
+                state=CASE WHEN face_matches.state IN ('confirmed', 'rejected') THEN face_matches.state ELSE excluded.state END,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                face["id"],
+                result["identity_id"],
+                result["score"],
+                result["second_best_score"],
+                result["state"],
+            ),
+        )
+        if result["state"] == "automatic":
+            recognized_identity_ids.add(result["identity_id"])
+        else:
+            pending_count += 1
+    _synchronize_face_tags(conn, photo_id, recognized_identity_ids, confirmed_identity_ids)
+    return {"recognized": len(recognized_identity_ids | confirmed_identity_ids), "pending": pending_count}
+
+
+def _synchronize_face_tags(conn, photo_id, automatic_identity_ids, confirmed_identity_ids):
+    desired = set(automatic_identity_ids) | set(confirmed_identity_ids)
+    desired_tag_ids = {
+        row["id"]: row["tag_id"]
+        for row in conn.execute(
+            "SELECT id, tag_id FROM face_identities WHERE id IN ({})".format(
+                ",".join("?" for _ in desired) or "NULL"
+            ),
+            tuple(desired),
+        ).fetchall()
+    }
+    if desired_tag_ids:
+        placeholders = ",".join("?" for _ in desired_tag_ids.values())
+        conn.execute(
+            f"""
+            DELETE FROM photo_tags
+            WHERE photo_id=? AND source IN ('face_auto', 'face_confirmed')
+              AND tag_id NOT IN ({placeholders})
+            """,
+            (photo_id, *desired_tag_ids.values()),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM photo_tags WHERE photo_id=? AND source IN ('face_auto', 'face_confirmed')", (photo_id,)
+        )
+    for identity_id, tag_id in desired_tag_ids.items():
+        source = "face_confirmed" if identity_id in confirmed_identity_ids else "face_auto"
+        conn.execute(
+            """
+            INSERT INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, ?)
+            ON CONFLICT(photo_id, tag_id) DO UPDATE SET
+                source=CASE WHEN photo_tags.source='manual' THEN 'manual' ELSE excluded.source END
+            """,
+            (photo_id, tag_id, source),
+        )
+
+
+def list_photo_faces(conn, photo_id):
+    faces = conn.execute("SELECT * FROM photo_faces WHERE photo_id=? ORDER BY face_index", (photo_id,)).fetchall()
+    results = []
+    for face in faces:
+        match = conn.execute(
+            """
+            SELECT fm.*, t.name AS tag_name
+            FROM face_matches fm
+            JOIN face_identities fi ON fi.id=fm.identity_id
+            JOIN tags t ON t.id=fi.tag_id
+            WHERE fm.face_id=?
+            ORDER BY CASE fm.state WHEN 'confirmed' THEN 0 WHEN 'automatic' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END,
+                     fm.score DESC
+            LIMIT 1
+            """,
+            (face["id"],),
+        ).fetchone()
+        results.append(
+            {
+                "id": face["id"],
+                "face_index": face["face_index"],
+                "bbox": json.loads(face["bbox_json"]),
+                "detection_score": face["detection_score"],
+                "model_name": face["model_name"],
+                "model_version": face["model_version"],
+                "crop_url": f"/api/photo-faces/{face['id']}/crop",
+                "match": dict(match) if match else None,
+            }
+        )
+    scan = conn.execute("SELECT * FROM face_photo_scans WHERE photo_id=?", (photo_id,)).fetchone()
+    return {"scanned": bool(scan), "scan": dict(scan) if scan else None, "faces": results}
+
+
+def add_gallery_face_reference(conn, identity_id, face_id):
+    identity = get_face_identity(conn, identity_id)
+    face = conn.execute("SELECT * FROM photo_faces WHERE id=?", (face_id,)).fetchone()
+    if not identity:
+        raise ValueError("Face identity not found")
+    if not face:
+        raise ValueError("Detected face not found")
+    existing = conn.execute(
+        "SELECT id FROM face_references WHERE identity_id=? AND source_face_id=?", (identity_id, face_id)
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    cursor = conn.execute(
+        """
+        INSERT INTO face_references(
+            identity_id, source_type, source_photo_id, source_face_id, bbox_json, detection_score,
+            embedding, embedding_dimensions, model_name, model_version
+        ) VALUES (?, 'gallery', ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            identity_id,
+            face["photo_id"],
+            face_id,
+            face["bbox_json"],
+            face["detection_score"],
+            face["embedding"],
+            face["embedding_dimensions"],
+            face["model_name"],
+            face["model_version"],
+        ),
+    )
+    return cursor.lastrowid
+
+
+def create_face_import(conn, token, file_path, original_name, detections, model_name, model_version):
+    conn.execute(
+        "INSERT INTO face_imports(token, file_path, original_name) VALUES (?, ?, ?)",
+        (token, str(file_path), original_name),
+    )
+    for face_index, detection in enumerate(detections):
+        blob, dimensions = embedding_to_blob(detection.embedding)
+        conn.execute(
+            """
+            INSERT INTO face_import_faces(
+                import_token, face_index, bbox_json, detection_score, embedding, embedding_dimensions,
+                model_name, model_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                token,
+                face_index,
+                json.dumps(list(detection.bbox)),
+                detection.detection_score,
+                blob,
+                dimensions,
+                model_name,
+                model_version,
+            ),
+        )
+
+
+def get_face_import(conn, token):
+    imported = conn.execute("SELECT * FROM face_imports WHERE token=?", (token,)).fetchone()
+    if not imported:
+        return None
+    faces = conn.execute(
+        "SELECT face_index, bbox_json, detection_score, model_name, model_version FROM face_import_faces WHERE import_token=? ORDER BY face_index",
+        (token,),
+    ).fetchall()
+    return dict(imported) | {
+        "faces": [
+            dict(face)
+            | {
+                "bbox": json.loads(face["bbox_json"]),
+                "crop_url": f"/api/face-imports/{token}/faces/{face['face_index']}/crop",
+            }
+            for face in faces
+        ]
+    }
+
+
+def add_imported_face_reference(conn, identity_id, token, face_index):
+    identity = get_face_identity(conn, identity_id)
+    imported = conn.execute("SELECT * FROM face_imports WHERE token=?", (token,)).fetchone()
+    face = conn.execute(
+        "SELECT * FROM face_import_faces WHERE import_token=? AND face_index=?", (token, face_index)
+    ).fetchone()
+    if not identity:
+        raise ValueError("Face identity not found")
+    if not imported or not face:
+        raise ValueError("Imported face not found")
+    cursor = conn.execute(
+        """
+        INSERT INTO face_references(
+            identity_id, source_type, file_path, bbox_json, detection_score, embedding,
+            embedding_dimensions, model_name, model_version
+        ) VALUES (?, 'upload', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            identity_id,
+            imported["file_path"],
+            face["bbox_json"],
+            face["detection_score"],
+            face["embedding"],
+            face["embedding_dimensions"],
+            face["model_name"],
+            face["model_version"],
+        ),
+    )
+    conn.execute("DELETE FROM face_imports WHERE token=?", (token,))
+    return cursor.lastrowid
+
+
+def get_face_reference(conn, reference_id):
+    return conn.execute("SELECT * FROM face_references WHERE id=?", (reference_id,)).fetchone()
+
+
+def decide_face_match(conn, face_id, identity_id, decision):
+    if decision not in {"confirmed", "rejected"}:
+        raise ValueError("Decision must be confirmed or rejected")
+    face = conn.execute("SELECT * FROM photo_faces WHERE id=?", (face_id,)).fetchone()
+    identity = conn.execute("SELECT * FROM face_identities WHERE id=?", (identity_id,)).fetchone()
+    if not face or not identity:
+        raise ValueError("Face or identity not found")
+    match = conn.execute(
+        "SELECT * FROM face_matches WHERE face_id=? AND identity_id=?", (face_id, identity_id)
+    ).fetchone()
+    score = match["score"] if match else 1.0
+    second_score = match["second_best_score"] if match else None
+    conn.execute(
+        """
+        INSERT INTO face_matches(face_id, identity_id, score, second_best_score, state, decided_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(face_id, identity_id) DO UPDATE SET
+            state=excluded.state, decided_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+        """,
+        (face_id, identity_id, score, second_score, decision),
+    )
+    rematch_photo_faces(conn, face["photo_id"])
+    return face["photo_id"]
+
+
+def get_face_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM face_settings WHERE key=?", (key,)).fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row["value"])
+    except json.JSONDecodeError:
+        return row["value"]
+
+
+def set_face_setting(conn, key, value):
+    conn.execute(
+        """
+        INSERT INTO face_settings(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
+        """,
+        (key, json.dumps(value)),
+    )
+
+
+def create_face_scan_job(conn, job_id, scope, photo_ids, mode="detect", params=None):
+    if scope not in {"selection", "album", "all", "automatic", "rematch", "photo"}:
+        raise ValueError("Invalid face scan scope")
+    if mode not in {"detect", "match"}:
+        raise ValueError("Invalid face scan mode")
+    photo_ids = list(dict.fromkeys(int(photo_id) for photo_id in photo_ids))
+    if not photo_ids:
+        raise ValueError("No photos to analyze")
+    conn.execute(
+        """
+        INSERT INTO face_scan_jobs(id, scope, mode, state, total, message, params_json)
+        VALUES (?, ?, ?, 'queued', ?, 'En attente', ?)
+        """,
+        (job_id, scope, mode, len(photo_ids), json.dumps(params or {})),
+    )
+    conn.executemany(
+        "INSERT INTO face_scan_items(job_id, photo_id) VALUES (?, ?)",
+        ((job_id, photo_id) for photo_id in photo_ids),
+    )
+    return get_face_scan_job(conn, job_id)
+
+
+def get_face_scan_job(conn, job_id):
+    row = conn.execute("SELECT * FROM face_scan_jobs WHERE id=?", (job_id,)).fetchone()
+    return _serialize_face_scan_job(row) if row else None
+
+
+def get_current_face_scan_job(conn):
+    row = conn.execute(
+        """
+        SELECT * FROM face_scan_jobs
+        ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'cancel_requested' THEN 1 WHEN 'queued' THEN 2 ELSE 3 END,
+                 created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return _serialize_face_scan_job(row) if row else None
+
+
+def _serialize_face_scan_job(row):
+    data = dict(row)
+    data["active"] = data["state"] in {"queued", "running", "cancel_requested"}
+    data["params"] = json.loads(data.pop("params_json") or "{}")
+    return data
+
+
+def photo_ids_for_face_scope(conn, scope, photo_ids=None, album_name=None, mode="detect"):
+    if scope in {"selection", "photo"}:
+        return list(dict.fromkeys(int(photo_id) for photo_id in (photo_ids or [])))
+    if scope == "album":
+        rows = conn.execute(
+            """
+            SELECT DISTINCT ap.photo_id FROM album_photos ap
+            JOIN albums a ON a.id=ap.album_id
+            WHERE a.name=? AND ap.is_missing=0
+            """,
+            (album_name,),
+        ).fetchall()
+    elif mode == "match" or scope == "rematch":
+        rows = conn.execute("SELECT photo_id FROM face_photo_scans ORDER BY photo_id").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT DISTINCT photo_id FROM album_photos WHERE is_missing=0 ORDER BY photo_id"
+        ).fetchall()
+    return [row["photo_id"] for row in rows]
 
 
 def search_photos(conn, query, limit=30):

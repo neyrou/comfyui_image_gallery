@@ -1,0 +1,4 @@
+# Install one ONNX Runtime backend separately; do not install both.
+# GPU NVIDIA: python -m pip install onnxruntime-gpu
+# CPU only:   python -m pip install onnxruntime
+insightface>=1.0.1

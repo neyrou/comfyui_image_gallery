@@ -1,0 +1,265 @@
+import io
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+
+from PIL import Image
+
+import app as app_module
+from face_recognition import FaceDetection, classify_identity, select_onnx_providers
+from gallery_db import (
+    add_gallery_face_reference,
+    connect_db,
+    create_face_identity,
+    decide_face_match,
+    get_photo_detail,
+    init_db,
+    photo_face_cache_valid,
+    rematch_photo_faces,
+    replace_photo_faces,
+    scan_albums,
+    update_photo_tags,
+)
+
+
+class FakeFaceEngine:
+    model_name = "buffalo_l"
+    model_version = "buffalo_l-v1"
+    provider = "CPUExecutionProvider"
+
+    def _load(self):
+        return self
+
+    def configuration(self):
+        return {
+            "model_name": self.model_name,
+            "model_version": self.model_version,
+            "model_root": "fake",
+            "model_directory": "fake/models/buffalo_l",
+            "model_present": True,
+            "configured": True,
+            "provider": self.provider,
+        }
+
+    def analyze_path(self, _image_path):
+        return [FaceDetection((2, 2, 22, 22), 0.99, (1.0, 0.0, 0.0))]
+
+
+def create_png(path, color=(20, 40, 60)):
+    Image.new("RGB", (32, 32), color).save(path)
+
+
+class FaceRecognitionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.images_root = self.root / "static" / "images"
+        self.thumbnails = self.root / "static" / "thumbnails"
+        self.db_path = self.root / "instance" / "gallery.sqlite3"
+        self.references = self.root / "instance" / "face_references"
+        (self.images_root / "output").mkdir(parents=True)
+        self.previous = {
+            "DB_PATH": app_module.DB_PATH,
+            "IMAGES_ROOT": app_module.IMAGES_ROOT,
+            "THUMBNAIL_ROOT": app_module.THUMBNAIL_ROOT,
+            "FACE_REFERENCE_ROOT": app_module.FACE_REFERENCE_ROOT,
+            "FACE_ENGINE_FACTORY": app_module.FACE_ENGINE_FACTORY,
+            "FACE_ENGINE_INSTANCE": app_module.FACE_ENGINE_INSTANCE,
+        }
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        app_module.FACE_REFERENCE_ROOT = self.references
+        app_module.FACE_ENGINE_FACTORY = FakeFaceEngine
+        app_module.FACE_ENGINE_INSTANCE = FakeFaceEngine()
+        app_module.FACE_RECOVERED_DATABASES.clear()
+
+    def tearDown(self):
+        for name, value in self.previous.items():
+            setattr(app_module, name, value)
+        app_module.FACE_RECOVERED_DATABASES.clear()
+        self.tmp.cleanup()
+
+    def test_classification_uses_best_reference_threshold_and_margin(self):
+        identities = [
+            {"id": 1, "enabled": True, "review_threshold": 0.4, "automatic_threshold": 0.55, "margin_threshold": 0.08},
+            {"id": 2, "enabled": True, "review_threshold": 0.4, "automatic_threshold": 0.55, "margin_threshold": 0.08},
+        ]
+        references = [
+            {"identity_id": 1, "embedding": (1.0, 0.0)},
+            {"identity_id": 1, "embedding": (0.8, 0.6)},
+            {"identity_id": 2, "embedding": (0.0, 1.0)},
+        ]
+        result = classify_identity((0.99, 0.05), identities, references)
+        self.assertEqual(result["identity_id"], 1)
+        self.assertEqual(result["state"], "automatic")
+
+        close_references = references + [{"identity_id": 2, "embedding": (0.98, 0.08)}]
+        ambiguous = classify_identity((1.0, 0.0), identities, close_references)
+        self.assertEqual(ambiguous["state"], "pending")
+        self.assertIsNone(classify_identity((0.0, -1.0), identities, references))
+        self.assertEqual(
+            select_onnx_providers(["CPUExecutionProvider", "CUDAExecutionProvider"]),
+            ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        self.assertEqual(select_onnx_providers(["CPUExecutionProvider"]), ["CPUExecutionProvider"])
+
+    def test_existing_photo_tags_are_migrated_as_manual(self):
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE photos (id INTEGER PRIMARY KEY, checksum TEXT NOT NULL UNIQUE);
+                CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT);
+                CREATE TABLE photo_tags (
+                    photo_id INTEGER NOT NULL REFERENCES photos(id),
+                    tag_id INTEGER NOT NULL REFERENCES tags(id),
+                    PRIMARY KEY(photo_id, tag_id)
+                );
+                INSERT INTO photos(id, checksum) VALUES (1, 'abc');
+                INSERT INTO tags(id, name) VALUES (1, 'legacy');
+                INSERT INTO photo_tags(photo_id, tag_id) VALUES (1, 1);
+                """
+            )
+            conn.commit()
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            row = conn.execute("SELECT source FROM photo_tags WHERE photo_id=1 AND tag_id=1").fetchone()
+            self.assertEqual(row["source"], "manual")
+
+    def test_manual_tag_survives_rematch_and_rejection_persists(self):
+        create_png(self.images_root / "output" / "reference.png")
+        create_png(self.images_root / "output" / "target.png", (80, 30, 10))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute("SELECT filename, photo_id FROM album_photos").fetchall()
+            }
+            identity = create_face_identity(conn, "Alice")
+            reference_face_id = replace_photo_faces(
+                conn,
+                ids["reference.png"],
+                conn.execute("SELECT checksum FROM photos WHERE id=?", (ids["reference.png"],)).fetchone()["checksum"],
+                [FaceDetection((1, 1, 20, 20), 0.99, (1.0, 0.0))],
+                "buffalo_l",
+                "buffalo_l-v1",
+                "CPUExecutionProvider",
+            )[0]
+            add_gallery_face_reference(conn, identity["id"], reference_face_id)
+            target_face_ids = replace_photo_faces(
+                conn,
+                ids["target.png"],
+                conn.execute("SELECT checksum FROM photos WHERE id=?", (ids["target.png"],)).fetchone()["checksum"],
+                [
+                    FaceDetection((2, 2, 21, 21), 0.98, (0.99, 0.05)),
+                    FaceDetection((22, 2, 31, 21), 0.96, (0.98, 0.08)),
+                ],
+                "buffalo_l",
+                "buffalo_l-v1",
+                "CPUExecutionProvider",
+            )
+            target_face_id = target_face_ids[0]
+            target_checksum = conn.execute(
+                "SELECT checksum FROM photos WHERE id=?", (ids["target.png"],)
+            ).fetchone()["checksum"]
+            self.assertTrue(
+                photo_face_cache_valid(
+                    conn, ids["target.png"], target_checksum, "buffalo_l", "buffalo_l-v1"
+                )
+            )
+            self.assertFalse(
+                photo_face_cache_valid(
+                    conn, ids["target.png"], target_checksum, "buffalo_l", "buffalo_l-v2"
+                )
+            )
+            summary = rematch_photo_faces(conn, ids["target.png"])
+            self.assertEqual(summary["recognized"], 1)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) AS total FROM photo_tags WHERE photo_id=?", (ids["target.png"],)).fetchone()["total"],
+                1,
+            )
+            source = conn.execute(
+                "SELECT source FROM photo_tags WHERE photo_id=?", (ids["target.png"],)
+            ).fetchone()["source"]
+            self.assertEqual(source, "face_auto")
+
+            update_photo_tags(conn, [ids["target.png"]], ["Alice"], "add")
+            decide_face_match(conn, target_face_id, identity["id"], "rejected")
+            rematch_photo_faces(conn, ids["target.png"])
+            tag = conn.execute(
+                """
+                SELECT pt.source FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                WHERE pt.photo_id=? AND t.name='Alice'
+                """,
+                (ids["target.png"],),
+            ).fetchone()
+            self.assertEqual(tag["source"], "manual")
+            decision = conn.execute(
+                "SELECT state FROM face_matches WHERE face_id=? AND identity_id=?",
+                (target_face_id, identity["id"]),
+            ).fetchone()
+            self.assertEqual(decision["state"], "rejected")
+
+    def test_sync_job_api_detects_faces_and_adds_automatic_tag(self):
+        create_png(self.images_root / "output" / "reference.png")
+        create_png(self.images_root / "output" / "target.png", (60, 30, 90))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        client = app_module.app.test_client()
+
+        first = client.post("/api/face/jobs", json={"scope": "all", "sync": True})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()["job"]["state"], "done")
+        with connect_db(self.db_path) as conn:
+            identity = create_face_identity(conn, "Alice")
+            rows = conn.execute(
+                """
+                SELECT pf.id AS face_id, pf.photo_id, ap.filename
+                FROM photo_faces pf JOIN album_photos ap ON ap.photo_id=pf.photo_id
+                ORDER BY ap.filename
+                """
+            ).fetchall()
+            reference = next(row for row in rows if row["filename"] == "reference.png")
+            target = next(row for row in rows if row["filename"] == "target.png")
+            add_gallery_face_reference(conn, identity["id"], reference["face_id"])
+
+        second = client.post(
+            "/api/face/jobs",
+            json={"scope": "selection", "photo_ids": [target["photo_id"]], "sync": True},
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.get_json()["job"]["recognized"], 1)
+        detail = client.get(f"/api/photos/{target['photo_id']}").get_json()["photo"]
+        self.assertEqual(detail["tags"][0]["name"], "Alice")
+        self.assertEqual(detail["tags"][0]["source"], "face_auto")
+        self.assertEqual(detail["face_analysis"]["faces"][0]["match"]["state"], "automatic")
+
+    def test_reference_upload_requires_selection_and_stays_outside_static(self):
+        init_db(self.db_path)
+        client = app_module.app.test_client()
+        identity = client.post("/api/face/identities", json={"tag_name": "Celine"}).get_json()["identity"]
+        buffer = io.BytesIO()
+        Image.new("RGB", (32, 32), (20, 30, 40)).save(buffer, format="PNG")
+        buffer.seek(0)
+        response = client.post(
+            "/api/face/imports",
+            data={"file": (buffer, "portrait.png")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 201)
+        imported = response.get_json()["import"]
+        self.assertEqual(len(imported["faces"]), 1)
+        self.assertTrue(Path(imported["file_path"]).is_relative_to(self.references))
+
+        added = client.post(
+            f"/api/face/identities/{identity['id']}/references/import",
+            json={"token": imported["token"], "face_index": 0},
+        )
+        self.assertEqual(added.status_code, 201)
+        self.assertEqual(added.get_json()["identity"]["reference_count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
