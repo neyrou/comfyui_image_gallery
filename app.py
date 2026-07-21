@@ -41,6 +41,7 @@ from gallery_db import (
     scan_albums,
     search_photos,
     set_photo_tags,
+    update_photo_tags,
     update_album,
 )
 
@@ -235,6 +236,54 @@ def selected_album_name(albums, requested):
 
 def normalized_query_tag_names(values):
     return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
+
+
+def normalized_batch_photo_ids(payload):
+    values = payload.get("photo_ids")
+    if not isinstance(values, list) or not values:
+        raise ValueError("photo_ids must be a non-empty list")
+    photo_ids = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("photo_ids must contain positive integers")
+        if value not in photo_ids:
+            photo_ids.append(value)
+    if len(photo_ids) > 100:
+        raise ValueError("A maximum of 100 photos can be processed at once")
+    return photo_ids
+
+
+def missing_photo_ids(conn, photo_ids):
+    placeholders = ",".join("?" for _ in photo_ids)
+    existing = {
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM photos WHERE id IN ({placeholders})",
+            photo_ids,
+        ).fetchall()
+    }
+    return [photo_id for photo_id in photo_ids if photo_id not in existing]
+
+
+def photo_membership_summary(conn, photo_id):
+    row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT ap.album_id) AS album_count,
+               COUNT(DISTINCT CASE WHEN a.type='user' THEN ap.album_id END) AS user_album_count,
+               MAX(CASE WHEN a.type='output' THEN 1 ELSE 0 END) AS has_output,
+               MAX(CASE WHEN a.type='user' THEN 1 ELSE 0 END) AS has_user
+        FROM album_photos ap
+        JOIN albums a ON a.id=ap.album_id
+        WHERE ap.photo_id=? AND ap.is_missing=0
+        """,
+        (photo_id,),
+    ).fetchone()
+    return {
+        "photo_id": photo_id,
+        "album_count": row["album_count"],
+        "user_album_count": row["user_album_count"],
+        "favorite": bool(row["has_output"] and row["has_user"]),
+    }
 
 
 def gallery_page_url(album_name, page, include_tags=None, exclude_tags=None):
@@ -504,6 +553,42 @@ def api_rescan_metadata(photo_id):
     return jsonify({"ok": True, "photo": detail})
 
 
+@app.post("/api/photos/batch/metadata/rescan")
+def api_batch_rescan_metadata():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        photo_ids = normalized_batch_photo_ids(payload)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    results = []
+    with connect_db(DB_PATH) as conn:
+        missing = missing_photo_ids(conn, photo_ids)
+        if missing:
+            return jsonify({"ok": False, "error": f"Photos not found: {', '.join(map(str, missing))}"}), 404
+        for photo_id in photo_ids:
+            image_path = find_photo_file(conn, photo_id)
+            if not image_path:
+                results.append({"photo_id": photo_id, "status": "failed", "error": "No file found for this photo"})
+                continue
+            try:
+                rescan_metadata(conn, photo_id, image_path)
+                results.append({"photo_id": photo_id, "status": "scanned"})
+            except OSError as exc:
+                results.append({"photo_id": photo_id, "status": "failed", "error": str(exc)})
+
+    scanned = sum(result["status"] == "scanned" for result in results)
+    failed = len(results) - scanned
+    return jsonify(
+        {
+            "ok": True,
+            "summary": {"requested": len(photo_ids), "scanned": scanned, "failed": failed},
+            "results": results,
+        }
+    )
+
+
 def unique_destination_path(destination_dir, filename):
     destination_dir = Path(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
@@ -566,6 +651,66 @@ def api_photo_album_action(photo_id):
     return jsonify({"ok": True, "photo": detail, "albums": albums, "action": action})
 
 
+@app.post("/api/photos/batch/album-copy")
+def api_batch_album_copy():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        photo_ids = normalized_batch_photo_ids(payload)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    source_album_name = payload.get("source_album_name")
+    destination_album_name = payload.get("destination_album_name")
+    if not source_album_name or not destination_album_name:
+        return jsonify({"ok": False, "error": "Source and destination albums are required"}), 400
+    if source_album_name == destination_album_name:
+        return jsonify({"ok": False, "error": "Source and destination albums are identical"}), 400
+
+    results = []
+    with connect_db(DB_PATH) as conn:
+        missing = missing_photo_ids(conn, photo_ids)
+        if missing:
+            return jsonify({"ok": False, "error": f"Photos not found: {', '.join(map(str, missing))}"}), 404
+        if not get_album_by_name(conn, source_album_name):
+            return jsonify({"ok": False, "error": "Source album not found"}), 404
+        destination_album = get_album_by_name(conn, destination_album_name)
+        if not destination_album:
+            return jsonify({"ok": False, "error": "Destination album not found"}), 404
+        if destination_album["scan_error"]:
+            return jsonify({"ok": False, "error": "Destination album is unavailable"}), 400
+
+        for photo_id in photo_ids:
+            if find_photo_file_in_album(conn, photo_id, destination_album_name):
+                results.append(photo_membership_summary(conn, photo_id) | {"status": "skipped"})
+                continue
+            source = find_photo_file_in_album(conn, photo_id, source_album_name) or find_photo_file_in_album(conn, photo_id)
+            if not source or not source["path"].exists():
+                results.append({"photo_id": photo_id, "status": "failed", "error": "Source photo file not found"})
+                continue
+            try:
+                destination_path = unique_destination_path(destination_album["path"], source["path"].name)
+                shutil.copy2(source["path"], destination_path)
+                import_photo_into_album(conn, destination_path, destination_album, THUMBNAIL_ROOT)
+                results.append(photo_membership_summary(conn, photo_id) | {"status": "copied"})
+            except (OSError, ValueError) as exc:
+                results.append({"photo_id": photo_id, "status": "failed", "error": str(exc)})
+
+        albums = list_albums(conn)
+
+    copied = sum(result["status"] == "copied" for result in results)
+    skipped = sum(result["status"] == "skipped" for result in results)
+    failed = sum(result["status"] == "failed" for result in results)
+    return jsonify(
+        {
+            "ok": True,
+            "summary": {"requested": len(photo_ids), "copied": copied, "skipped": skipped, "failed": failed},
+            "results": results,
+            "albums": albums,
+        }
+    )
+
+
 @app.delete("/api/photos/<int:photo_id>")
 def api_delete_photo(photo_id):
     ensure_ready()
@@ -588,6 +733,38 @@ def api_set_photo_tags(photo_id):
         set_photo_tags(conn, photo_id, tags)
         detail = get_photo_detail(conn, photo_id)
     return jsonify({"ok": True, "photo": detail})
+
+
+@app.patch("/api/photos/batch/tags")
+def api_batch_photo_tags():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        photo_ids = normalized_batch_photo_ids(payload)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    operation = payload.get("operation")
+    raw_tags = payload.get("tags")
+    if operation not in {"add", "remove"}:
+        return jsonify({"ok": False, "error": "operation must be 'add' or 'remove'"}), 400
+    if not isinstance(raw_tags, list) or any(not isinstance(tag, str) for tag in raw_tags):
+        return jsonify({"ok": False, "error": "tags must be a list of strings"}), 400
+    tags = list(dict.fromkeys(tag.strip() for tag in raw_tags if tag.strip()))
+    if not tags:
+        return jsonify({"ok": False, "error": "At least one tag is required"}), 400
+
+    with connect_db(DB_PATH) as conn:
+        missing = missing_photo_ids(conn, photo_ids)
+        if missing:
+            return jsonify({"ok": False, "error": f"Photos not found: {', '.join(map(str, missing))}"}), 404
+        update_photo_tags(conn, photo_ids, tags, operation)
+    return jsonify(
+        {
+            "ok": True,
+            "summary": {"requested": len(photo_ids), "updated": len(photo_ids), "operation": operation, "tags": tags},
+        }
+    )
 
 
 @app.get("/api/photos/search")

@@ -128,6 +128,174 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertEqual(link.status_code, 200)
         self.assertIn("variant", [item["type"] for item in link.get_json()["photo"]["links"]])
 
+    def test_batch_tags_add_remove_and_validate_atomically(self):
+        create_png(self.images_root / "output" / "one.png")
+        create_png(self.images_root / "output" / "two.png", color=(30, 50, 70))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute("SELECT filename, photo_id FROM album_photos").fetchall()
+            }
+            set_photo_tags(conn, photo_ids["one.png"], ["old", "remove-me"])
+            set_photo_tags(conn, photo_ids["two.png"], ["old"])
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+
+        added = client.patch(
+            "/api/photos/batch/tags",
+            json={
+                "photo_ids": [photo_ids["one.png"], photo_ids["two.png"], photo_ids["one.png"]],
+                "operation": "add",
+                "tags": [" new ", "new", "old", ""],
+            },
+        )
+        self.assertEqual(added.status_code, 200)
+        self.assertEqual(added.get_json()["summary"]["updated"], 2)
+
+        removed = client.patch(
+            "/api/photos/batch/tags",
+            json={
+                "photo_ids": list(photo_ids.values()),
+                "operation": "remove",
+                "tags": ["remove-me", "not-present"],
+            },
+        )
+        self.assertEqual(removed.status_code, 200)
+        with connect_db(self.db_path) as conn:
+            one_tags = {tag["name"] for tag in get_photo_detail(conn, photo_ids["one.png"])["tags"]}
+            two_tags = {tag["name"] for tag in get_photo_detail(conn, photo_ids["two.png"])["tags"]}
+        self.assertEqual(one_tags, {"old", "new"})
+        self.assertEqual(two_tags, {"old", "new"})
+
+        invalid = client.patch(
+            "/api/photos/batch/tags",
+            json={"photo_ids": [photo_ids["one.png"]], "operation": "replace", "tags": ["bad"]},
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(
+            client.patch(
+                "/api/photos/batch/tags",
+                json={"photo_ids": [], "operation": "add", "tags": ["bad"]},
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            client.patch(
+                "/api/photos/batch/tags",
+                json={"photo_ids": list(range(1, 102)), "operation": "add", "tags": ["bad"]},
+            ).status_code,
+            400,
+        )
+        missing = client.patch(
+            "/api/photos/batch/tags",
+            json={"photo_ids": [photo_ids["one.png"], 999999], "operation": "add", "tags": ["atomic"]},
+        )
+        self.assertEqual(missing.status_code, 404)
+        with connect_db(self.db_path) as conn:
+            one_tags = {tag["name"] for tag in get_photo_detail(conn, photo_ids["one.png"])["tags"]}
+        self.assertNotIn("atomic", one_tags)
+
+    def test_batch_album_copy_skips_collisions_and_continues_after_failure(self):
+        one = self.images_root / "output" / "one.png"
+        two = self.images_root / "output" / "two.png"
+        missing = self.images_root / "output" / "missing.png"
+        create_png(one, color=(10, 20, 30))
+        create_png(two, color=(20, 30, 40))
+        create_png(missing, color=(30, 40, 50))
+        shutil.copyfile(one, self.images_root / "Celine" / "already-one.png")
+        create_png(self.images_root / "Celine" / "two.png", color=(90, 80, 70))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute(
+                    """
+                    SELECT ap.filename, ap.photo_id
+                    FROM album_photos ap JOIN albums a ON a.id=ap.album_id
+                    WHERE a.name='output'
+                    """
+                ).fetchall()
+            }
+        missing.unlink()
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+        response = client.post(
+            "/api/photos/batch/album-copy",
+            json={
+                "photo_ids": [photo_ids["one.png"], photo_ids["two.png"], photo_ids["missing.png"]],
+                "source_album_name": "output",
+                "destination_album_name": "Celine",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["summary"], {"requested": 3, "copied": 1, "skipped": 1, "failed": 1})
+        statuses = {result["photo_id"]: result for result in data["results"]}
+        self.assertEqual(statuses[photo_ids["one.png"]]["status"], "skipped")
+        self.assertTrue(statuses[photo_ids["one.png"]]["favorite"])
+        self.assertEqual(statuses[photo_ids["two.png"]]["status"], "copied")
+        self.assertTrue(statuses[photo_ids["two.png"]]["favorite"])
+        self.assertEqual(statuses[photo_ids["missing.png"]]["status"], "failed")
+        self.assertTrue((self.images_root / "Celine" / "two-1.png").is_file())
+
+        repeated = client.post(
+            "/api/photos/batch/album-copy",
+            json={
+                "photo_ids": [photo_ids["two.png"]],
+                "source_album_name": "output",
+                "destination_album_name": "Celine",
+            },
+        )
+        self.assertEqual(repeated.get_json()["summary"]["skipped"], 1)
+        self.assertFalse((self.images_root / "Celine" / "two-2.png").exists())
+
+    def test_batch_metadata_scan_continues_after_unreadable_file(self):
+        prompt = {"1": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "batch prompt"}}}
+        valid = self.images_root / "output" / "valid.png"
+        broken = self.images_root / "output" / "broken.png"
+        create_png(valid, prompt=__import__("json").dumps(prompt))
+        create_png(broken, color=(80, 30, 20))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute("SELECT filename, photo_id FROM album_photos").fetchall()
+            }
+        broken.write_bytes(b"not an image")
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+        response = client.post(
+            "/api/photos/batch/metadata/rescan",
+            json={"photo_ids": [photo_ids["valid.png"], photo_ids["broken.png"]]},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["summary"], {"requested": 2, "scanned": 1, "failed": 1})
+        with connect_db(self.db_path) as conn:
+            self.assertEqual(get_photo_detail(conn, photo_ids["valid.png"])["metadata"]["prompt"], "batch prompt")
+
+    def test_gallery_renders_multi_selection_controls(self):
+        create_png(self.images_root / "output" / "one.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        response = app_module.app.test_client().get("/?album=output")
+        html = response.get_data(as_text=True)
+        self.assertIn('id="selection-actions"', html)
+        self.assertIn('data-batch-action="album"', html)
+        self.assertIn('class="selection-checkbox"', html)
+        self.assertIn('id="batch-tag-modal"', html)
+
     def test_album_tag_stats_and_gallery_filters(self):
         output_files = {
             "one.png": (20, 30, 40),

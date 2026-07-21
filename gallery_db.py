@@ -912,6 +912,35 @@ def set_photo_tags(conn, photo_id, tag_names):
         conn.execute("INSERT OR IGNORE INTO photo_tags(photo_id, tag_id) VALUES (?, ?)", (photo_id, tag["id"]))
 
 
+def update_photo_tags(conn, photo_ids, tag_names, operation):
+    photo_ids = list(dict.fromkeys(photo_ids))
+    tag_names = _normalized_tag_names(tag_names)
+    if operation == "add":
+        tag_ids = [upsert_tag(conn, name)["id"] for name in tag_names]
+        conn.executemany(
+            "INSERT OR IGNORE INTO photo_tags(photo_id, tag_id) VALUES (?, ?)",
+            ((photo_id, tag_id) for photo_id in photo_ids for tag_id in tag_ids),
+        )
+        return
+
+    placeholders = ",".join("?" for _ in tag_names)
+    tag_ids = [
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM tags WHERE name IN ({placeholders})",
+            tag_names,
+        ).fetchall()
+    ]
+    if not tag_ids:
+        return
+    photo_placeholders = ",".join("?" for _ in photo_ids)
+    tag_placeholders = ",".join("?" for _ in tag_ids)
+    conn.execute(
+        f"DELETE FROM photo_tags WHERE photo_id IN ({photo_placeholders}) AND tag_id IN ({tag_placeholders})",
+        (*photo_ids, *tag_ids),
+    )
+
+
 def set_album_tags(conn, album_id, tag_names):
     conn.execute("DELETE FROM album_tags WHERE album_id=?", (album_id,))
     for name in tag_names:

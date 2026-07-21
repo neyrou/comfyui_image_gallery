@@ -47,8 +47,21 @@
                     <path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"></path>
                 </svg>
             </button>
+            <div class="selection-actions" id="selection-actions" hidden>
+                <button id="selection-actions-button" type="button" aria-haspopup="true" aria-expanded="false">
+                    S&eacute;lection (<span id="selection-count">0</span>)
+                </button>
+                <div class="selection-actions-dropdown" id="selection-actions-menu" hidden>
+                    <button type="button" data-batch-action="album">Ajouter &agrave; l'album</button>
+                    <button type="button" data-batch-action="scan">Scan JSON</button>
+                    <button type="button" data-batch-action="tags">Edit tag</button>
+                    <button type="button" data-batch-action="clear">Unselect all</button>
+                </div>
+            </div>
         </div>
     </header>
+
+    <div class="selection-status" id="selection-status" role="status" aria-live="polite" hidden></div>
 
     {% if selected_album and selected_album.scan_error %}
         <div class="notice">Album illisible: {{ selected_album.scan_error }}</div>
@@ -67,7 +80,7 @@
         {% if photos %}
             <ul class="image-list" id="gallery-list">
                 {% for photo in photos %}
-                    <li>
+                    <li class="gallery-item" data-gallery-photo-id="{{ photo.id }}">
                         <button class="thumbnail" type="button" data-photo-id="{{ photo.id }}">
                             <img src="{{ photo.thumbnail_url }}" alt="{{ photo.filename }}" loading="lazy">
                             {% if photo.favorite %}
@@ -77,6 +90,8 @@
                             {% endif %}
                             <span class="filename">{{ photo.filename }}</span>
                         </button>
+                        <input class="selection-checkbox" type="checkbox" data-select-photo-id="{{ photo.id }}"
+                               aria-label="S&eacute;lectionner {{ photo.filename }}">
                     </li>
                 {% endfor %}
             </ul>
@@ -197,6 +212,34 @@
                 <div class="panel-footer">
                     <button type="button" data-close-album-action>Annuler</button>
                     <button type="submit" id="album-action-submit">Valider</button>
+                </div>
+            </form>
+        </section>
+    </div>
+
+    <div class="modal" id="batch-tag-modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close-batch-tags></div>
+        <section class="batch-tag-panel" role="dialog" aria-modal="true" aria-labelledby="batch-tag-title">
+            <div class="panel-header">
+                <h2 id="batch-tag-title">Edit tag</h2>
+                <button type="button" data-close-batch-tags>&times;</button>
+            </div>
+            <form id="batch-tag-form">
+                <label class="form-field">
+                    <span>Op&eacute;ration</span>
+                    <select id="batch-tag-operation">
+                        <option value="add" selected>Ajouter</option>
+                        <option value="remove">Supprimer</option>
+                    </select>
+                </label>
+                <label class="form-field">
+                    <span>Tags s&eacute;par&eacute;s par des virgules</span>
+                    <input id="batch-tag-input" type="text" placeholder="portrait, favori, a trier" autocomplete="off">
+                </label>
+                <div class="comfy-status" id="batch-tag-status"></div>
+                <div class="panel-footer">
+                    <button type="button" data-close-batch-tags>Annuler</button>
+                    <button type="submit" id="batch-tag-submit">Appliquer</button>
                 </div>
             </form>
         </section>

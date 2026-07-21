@@ -27,8 +27,17 @@ const state = {
     panStartTranslateY: 0,
     albumActionMode: null,
     albumActionSource: null,
+    albumActionBatch: false,
     photoModalHistoryActive: false,
     tagFilterDraft: {},
+    selectionMode: false,
+    selectedPhotoIds: new Set(),
+    longPressTimer: null,
+    longPressPointerId: null,
+    longPressPhotoId: null,
+    longPressStartX: 0,
+    longPressStartY: 0,
+    suppressPhotoClickId: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -51,6 +60,152 @@ function escapeHtml(value) {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+}
+
+const LONG_PRESS_DELAY = 500;
+const LONG_PRESS_MOVE_TOLERANCE = 10;
+
+function selectedPhotoIds() {
+    return Array.from(state.selectedPhotoIds);
+}
+
+function setSelectionStatus(message, isError = false) {
+    const status = $("#selection-status");
+    if (!status) {
+        return;
+    }
+    status.textContent = message || "";
+    status.hidden = !message;
+    status.classList.toggle("error", Boolean(isError));
+}
+
+function closeSelectionActionsMenu() {
+    const menu = $("#selection-actions-menu");
+    const button = $("#selection-actions-button");
+    if (menu) {
+        menu.hidden = true;
+    }
+    if (button) {
+        button.setAttribute("aria-expanded", "false");
+    }
+}
+
+function toggleSelectionActionsMenu() {
+    const menu = $("#selection-actions-menu");
+    const button = $("#selection-actions-button");
+    if (!menu || !button || !state.selectedPhotoIds.size) {
+        return;
+    }
+    const willOpen = menu.hidden;
+    menu.hidden = !willOpen;
+    button.setAttribute("aria-expanded", willOpen ? "true" : "false");
+}
+
+function renderSelectionState() {
+    const gallery = $("#gallery-list");
+    gallery?.classList.toggle("selection-mode", state.selectionMode);
+    const actions = $("#selection-actions");
+    if (actions) {
+        actions.hidden = !state.selectionMode;
+    }
+    const count = $("#selection-count");
+    if (count) {
+        count.textContent = String(state.selectedPhotoIds.size);
+    }
+    const actionsButton = $("#selection-actions-button");
+    if (actionsButton) {
+        actionsButton.disabled = state.selectedPhotoIds.size === 0;
+    }
+    $$("[data-gallery-photo-id]").forEach((item) => {
+        const photoId = Number(item.dataset.galleryPhotoId);
+        const selected = state.selectedPhotoIds.has(photoId);
+        item.classList.toggle("is-selected", selected);
+        const checkbox = item.querySelector("[data-select-photo-id]");
+        if (checkbox) {
+            checkbox.checked = selected;
+        }
+    });
+    if (!state.selectionMode) {
+        closeSelectionActionsMenu();
+    }
+}
+
+function enterSelectionMode(photoId) {
+    state.selectionMode = true;
+    state.selectedPhotoIds.add(photoId);
+    setSelectionStatus("");
+    renderSelectionState();
+}
+
+function exitSelectionMode() {
+    state.selectionMode = false;
+    state.selectedPhotoIds.clear();
+    setSelectionStatus("");
+    closeBatchTagModal();
+    renderSelectionState();
+}
+
+function togglePhotoSelection(photoId) {
+    if (!state.selectionMode) {
+        enterSelectionMode(photoId);
+        return;
+    }
+    if (state.selectedPhotoIds.has(photoId)) {
+        state.selectedPhotoIds.delete(photoId);
+        if (!state.selectedPhotoIds.size) {
+            exitSelectionMode();
+            return;
+        }
+    } else {
+        state.selectedPhotoIds.add(photoId);
+    }
+    renderSelectionState();
+}
+
+function clearLongPress() {
+    window.clearTimeout(state.longPressTimer);
+    state.longPressTimer = null;
+    state.longPressPointerId = null;
+    state.longPressPhotoId = null;
+}
+
+function handleGalleryPointerDown(event) {
+    const button = event.target.closest("[data-photo-id]");
+    if (!button || state.selectionMode || event.button !== 0 || !event.isPrimary) {
+        return;
+    }
+    clearLongPress();
+    state.longPressPointerId = event.pointerId;
+    state.longPressPhotoId = Number(button.dataset.photoId);
+    state.longPressStartX = event.clientX;
+    state.longPressStartY = event.clientY;
+    state.longPressTimer = window.setTimeout(() => {
+        const photoId = state.longPressPhotoId;
+        state.suppressPhotoClickId = photoId;
+        window.setTimeout(() => {
+            if (state.suppressPhotoClickId === photoId) {
+                state.suppressPhotoClickId = null;
+            }
+        }, 1000);
+        enterSelectionMode(photoId);
+        clearLongPress();
+    }, LONG_PRESS_DELAY);
+}
+
+function handleGalleryPointerMove(event) {
+    if (event.pointerId !== state.longPressPointerId || !state.longPressTimer) {
+        return;
+    }
+    const moved = Math.hypot(event.clientX - state.longPressStartX, event.clientY - state.longPressStartY);
+    if (moved > LONG_PRESS_MOVE_TOLERANCE) {
+        clearLongPress();
+    }
+}
+
+function handleGalleryPointerEnd(event) {
+    if (event.pointerId === state.longPressPointerId) {
+        clearLongPress();
+    }
 }
 
 async function fetchJson(url, options = {}) {
@@ -243,7 +398,7 @@ function syncPhotoInCurrentGallery(photo) {
 
 function renderGalleryItem(photo) {
     return `
-        <li>
+        <li class="gallery-item" data-gallery-photo-id="${photo.id}">
             <button class="thumbnail" type="button" data-photo-id="${photo.id}">
                 <img src="${photo.thumbnail_url}" alt="${escapeHtml(photo.filename)}" loading="lazy">
                 ${photo.favorite ? `
@@ -253,6 +408,8 @@ function renderGalleryItem(photo) {
                 ` : ""}
                 <span class="filename">${escapeHtml(photo.filename)}</span>
             </button>
+            <input class="selection-checkbox" type="checkbox" data-select-photo-id="${photo.id}"
+                   aria-label="Selectionner ${escapeHtml(photo.filename)}">
         </li>
     `;
 }
@@ -377,10 +534,28 @@ function openAlbumActionModal(mode) {
         return;
     }
     closePhotoActionsMenu();
+    state.albumActionBatch = false;
     state.albumActionMode = mode;
     state.albumActionSource = currentSourceMembership();
     $("#album-action-title").textContent = albumActionLabel(mode);
     $("#album-action-submit").textContent = mode === "move" ? "Deplacer" : "Copier";
+    $("#album-action-status").textContent = "";
+    $("#album-action-status").classList.remove("error");
+    renderAlbumActionOptions();
+    $("#album-action-modal").classList.add("open");
+    $("#album-action-modal").setAttribute("aria-hidden", "false");
+}
+
+function openBatchAlbumActionModal() {
+    if (!state.selectedPhotoIds.size || !state.selectedAlbum) {
+        return;
+    }
+    closeSelectionActionsMenu();
+    state.albumActionBatch = true;
+    state.albumActionMode = "copy";
+    state.albumActionSource = { album_name: state.selectedAlbum.name };
+    $("#album-action-title").textContent = `Ajouter ${state.selectedPhotoIds.size} photo(s) a l'album`;
+    $("#album-action-submit").textContent = "Ajouter";
     $("#album-action-status").textContent = "";
     $("#album-action-status").classList.remove("error");
     renderAlbumActionOptions();
@@ -393,6 +568,7 @@ function closeAlbumActionModal() {
     $("#album-action-modal").setAttribute("aria-hidden", "true");
     state.albumActionMode = null;
     state.albumActionSource = null;
+    state.albumActionBatch = false;
 }
 
 function renderAlbumActionOptions() {
@@ -402,6 +578,9 @@ function renderAlbumActionOptions() {
     const albums = state.albums.filter((album) => {
         if (album.scan_error) {
             return false;
+        }
+        if (state.albumActionBatch) {
+            return album.name !== sourceName;
         }
         if (state.albumActionMode === "move") {
             return album.name !== sourceName;
@@ -419,14 +598,63 @@ function renderAlbumActionOptions() {
     }
 }
 
+function applyBatchMembershipResults(results) {
+    results.forEach((result) => {
+        if (result.status === "failed") {
+            return;
+        }
+        const photo = state.photos.find((item) => item.id === result.photo_id);
+        if (!photo) {
+            return;
+        }
+        photo.favorite = Boolean(result.favorite);
+        photo.album_count = result.album_count;
+        photo.user_album_count = result.user_album_count;
+        const item = document.querySelector(`[data-gallery-photo-id="${result.photo_id}"]`);
+        if (item) {
+            item.outerHTML = renderGalleryItem(photo);
+        }
+    });
+    renderSelectionState();
+}
+
+function batchFailureSuffix(results) {
+    const failures = results.filter((result) => result.status === "failed");
+    if (!failures.length) {
+        return "";
+    }
+    const details = failures.slice(0, 3).map((result) => `#${result.photo_id}: ${result.error}`).join(" | ");
+    return ` ${details}${failures.length > 3 ? " | ..." : ""}`;
+}
+
 async function submitAlbumAction(event) {
     event.preventDefault();
-    if (!state.currentPhoto || !state.albumActionMode) {
+    if (!state.albumActionMode || (!state.albumActionBatch && !state.currentPhoto)) {
         return;
     }
-    const done = setBusy($("#album-action-submit"), state.albumActionMode === "move" ? "Deplacement..." : "Copie...");
+    const done = setBusy($("#album-action-submit"), state.albumActionBatch ? "Ajout..." : state.albumActionMode === "move" ? "Deplacement..." : "Copie...");
     $("#album-action-status").textContent = "";
+    $("#album-action-status").classList.remove("error");
     try {
+        if (state.albumActionBatch) {
+            const data = await fetchJson("/api/photos/batch/album-copy", {
+                method: "POST",
+                body: JSON.stringify({
+                    photo_ids: selectedPhotoIds(),
+                    destination_album_name: $("#album-action-destination").value,
+                    source_album_name: state.selectedAlbum?.name,
+                }),
+            });
+            state.albums = data.albums || state.albums;
+            applyBatchMembershipResults(data.results || []);
+            const summary = data.summary;
+            setSelectionStatus(
+                `${summary.copied} copiee(s), ${summary.skipped} deja presente(s), ${summary.failed} erreur(s).${batchFailureSuffix(data.results || [])}`,
+                summary.failed > 0,
+            );
+            closeAlbumActionModal();
+            return;
+        }
         const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/album-action`, {
             method: "POST",
             body: JSON.stringify({
@@ -723,6 +951,102 @@ async function savePhotoTags() {
     });
     state.currentPhoto = data.photo;
     renderPhotoDetail(data.photo);
+}
+
+async function scanSelectedMetadata() {
+    const photoIds = selectedPhotoIds();
+    if (!photoIds.length) {
+        return;
+    }
+    closeSelectionActionsMenu();
+    const done = setBusy($("#selection-actions-button"), "Scan...");
+    setSelectionStatus(`Scan JSON de ${photoIds.length} photo(s)...`);
+    try {
+        const data = await fetchJson("/api/photos/batch/metadata/rescan", {
+            method: "POST",
+            body: JSON.stringify({ photo_ids: photoIds }),
+        });
+        const summary = data.summary;
+        setSelectionStatus(
+            `${summary.scanned} photo(s) scannee(s), ${summary.failed} erreur(s).${batchFailureSuffix(data.results || [])}`,
+            summary.failed > 0,
+        );
+    } catch (error) {
+        setSelectionStatus(error.message, true);
+    } finally {
+        done();
+        renderSelectionState();
+    }
+}
+
+function openBatchTagModal() {
+    if (!state.selectedPhotoIds.size) {
+        return;
+    }
+    closeSelectionActionsMenu();
+    $("#batch-tag-title").textContent = `Edit tag - ${state.selectedPhotoIds.size} photo(s)`;
+    $("#batch-tag-operation").value = "add";
+    $("#batch-tag-input").value = "";
+    $("#batch-tag-status").textContent = "";
+    $("#batch-tag-status").classList.remove("error");
+    $("#batch-tag-modal").classList.add("open");
+    $("#batch-tag-modal").setAttribute("aria-hidden", "false");
+    $("#batch-tag-input").focus();
+}
+
+function closeBatchTagModal() {
+    const modal = $("#batch-tag-modal");
+    if (!modal) {
+        return;
+    }
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden", "true");
+}
+
+async function submitBatchTags(event) {
+    event.preventDefault();
+    const tags = tagsFromInput($("#batch-tag-input").value);
+    const status = $("#batch-tag-status");
+    status.classList.remove("error");
+    if (!tags.length) {
+        status.textContent = "Saisissez au moins un tag.";
+        status.classList.add("error");
+        return;
+    }
+    const done = setBusy($("#batch-tag-submit"), "Application...");
+    status.textContent = "";
+    try {
+        await fetchJson("/api/photos/batch/tags", {
+            method: "PATCH",
+            body: JSON.stringify({
+                photo_ids: selectedPhotoIds(),
+                operation: $("#batch-tag-operation").value,
+                tags,
+            }),
+        });
+        window.location.reload();
+    } catch (error) {
+        status.textContent = error.message;
+        status.classList.add("error");
+        done();
+    }
+}
+
+function handleBatchAction(action) {
+    if (action === "clear") {
+        exitSelectionMode();
+        return;
+    }
+    if (!state.selectedPhotoIds.size) {
+        return;
+    }
+    if (action === "album") {
+        openBatchAlbumActionModal();
+    } else if (action === "scan") {
+        scanSelectedMetadata();
+    } else if (action === "tags") {
+        openBatchTagModal();
+    }
 }
 
 async function searchLinkTargets() {
@@ -1168,6 +1492,10 @@ function bindEvents() {
         $("#scan-status").hidden = true;
     });
     $("#admin-button")?.addEventListener("click", openAdmin);
+    $("#selection-actions-button")?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleSelectionActionsMenu();
+    });
     $("#rescan-metadata-button")?.addEventListener("click", rescanCurrentMetadata);
     $("#comfy-generate-button")?.addEventListener("click", openComfyModal);
     $("#delete-photo-button")?.addEventListener("click", deleteCurrentPhoto);
@@ -1183,6 +1511,7 @@ function bindEvents() {
         }
     });
     $("#save-photo-tags-button")?.addEventListener("click", savePhotoTags);
+    $("#batch-tag-form")?.addEventListener("submit", submitBatchTags);
     $("#link-search-input")?.addEventListener("input", debounce(searchLinkTargets, 250));
     $("#prev-button")?.addEventListener("click", () => navigate(-1));
     $("#next-button")?.addEventListener("click", () => navigate(1));
@@ -1196,17 +1525,47 @@ function bindEvents() {
     $$("[data-close-admin]").forEach((button) => button.addEventListener("click", closeAdmin));
     $$("[data-close-comfy]").forEach((button) => button.addEventListener("click", closeComfyModal));
     $$("[data-close-album-action]").forEach((button) => button.addEventListener("click", closeAlbumActionModal));
+    $$("[data-close-batch-tags]").forEach((button) => button.addEventListener("click", closeBatchTagModal));
 
-    $("#gallery-list")?.addEventListener("click", (event) => {
+    const gallery = $("#gallery-list");
+    gallery?.addEventListener("pointerdown", handleGalleryPointerDown);
+    gallery?.addEventListener("pointermove", handleGalleryPointerMove);
+    gallery?.addEventListener("pointerup", handleGalleryPointerEnd);
+    gallery?.addEventListener("pointercancel", handleGalleryPointerEnd);
+    gallery?.addEventListener("pointerleave", handleGalleryPointerEnd);
+    gallery?.addEventListener("click", (event) => {
+        const checkbox = event.target.closest("[data-select-photo-id]");
+        if (checkbox) {
+            togglePhotoSelection(Number(checkbox.dataset.selectPhotoId));
+            return;
+        }
         const button = event.target.closest("[data-photo-id]");
         if (button) {
-            openPhoto(Number(button.dataset.photoId)).catch((error) => alert(error.message));
+            const photoId = Number(button.dataset.photoId);
+            if (state.suppressPhotoClickId === photoId) {
+                state.suppressPhotoClickId = null;
+                event.preventDefault();
+                return;
+            }
+            if (state.selectionMode) {
+                event.preventDefault();
+                togglePhotoSelection(photoId);
+                return;
+            }
+            openPhoto(photoId).catch((error) => alert(error.message));
         }
     });
 
     document.body.addEventListener("click", (event) => {
         if (!event.target.closest(".viewer-menu")) {
             closePhotoActionsMenu();
+        }
+        if (!event.target.closest(".selection-actions")) {
+            closeSelectionActionsMenu();
+        }
+        const batchAction = event.target.closest("[data-batch-action]");
+        if (batchAction) {
+            handleBatchAction(batchAction.dataset.batchAction);
         }
         const albumAction = event.target.closest("[data-album-action-open]");
         if (albumAction) {
@@ -1240,11 +1599,26 @@ function bindEvents() {
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
+            if (!$("#selection-actions-menu")?.hidden) {
+                closeSelectionActionsMenu();
+                return;
+            }
+            if ($("#batch-tag-modal")?.classList.contains("open")) {
+                closeBatchTagModal();
+                return;
+            }
+            if ($("#album-action-modal")?.classList.contains("open")) {
+                closeAlbumActionModal();
+                return;
+            }
+            if (state.selectionMode) {
+                exitSelectionMode();
+                return;
+            }
             closePhotoActionsMenu();
             closePhotoModal();
             closeAdmin();
             closeComfyModal();
-            closeAlbumActionModal();
             closeTagFilter();
         }
         if ($("#photo-modal").classList.contains("open") && event.key === "ArrowRight") {
@@ -1271,5 +1645,6 @@ function debounce(fn, delay) {
 }
 
 bindEvents();
+renderSelectionState();
 resumeScanStatusIfNeeded();
 refreshComfyStatus();
