@@ -8,7 +8,11 @@ const state = {
     detailsVisible: window.localStorage.getItem("gallery.detailsVisible") === "true",
     comfyAvailable: false,
     comfyOptions: null,
-    comfyReferences: {},
+    comfyReferences: [],
+    comfyReferenceTarget: null,
+    comfyReferenceDragIndex: null,
+    comfyReferencePointerId: null,
+    comfyLoraCatalog: [],
     comfyJobPollTimer: null,
     comfyPreviewVersion: null,
     comfyPollFailures: 0,
@@ -794,7 +798,8 @@ async function openComfyModal() {
     modal.setAttribute("aria-hidden", "false");
     setComfyStatus("Chargement des options...");
     state.comfyOptions = null;
-    state.comfyReferences = {};
+    state.comfyReferences = [];
+    state.comfyReferenceTarget = null;
     try {
         const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/comfy/edit-options`);
         state.comfyOptions = data.options;
@@ -826,73 +831,108 @@ function renderComfyOptions(options) {
         $("#comfy-preview").hidden = true;
     };
     state.comfyPreviewVersion = null;
-    renderComfyLoras(options.loras || [], options.lora_catalog || []);
-    renderComfyReferences(options.images || []);
+    state.comfyLoraCatalog = options.lora_catalog || [];
+    state.comfyReferences = (options.references || []).map((reference) => ({
+        ...reference,
+        input_name: reference.image_name,
+        photo_id: null,
+        is_new: false,
+    }));
+    renderComfyLoras(options.loras || [], state.comfyLoraCatalog);
+    renderComfyReferences();
 }
 
 function renderComfyLoras(loras, catalog) {
     const container = $("#comfy-loras");
-    if (!loras.length) {
-        container.innerHTML = '<span class="muted">Aucun LoRA editable</span>';
-        return;
-    }
-    container.innerHTML = loras.map((lora) => {
+    const rows = loras.map((lora) => {
         const names = catalog.map((item) => item.lora_name);
         if (!names.includes(lora.lora_name)) {
             names.unshift(lora.lora_name);
         }
         return `
-            <div class="comfy-row comfy-lora-row" data-node-id="${escapeHtml(lora.node_id)}">
+            <div class="comfy-row comfy-lora-row" data-node-id="${escapeHtml(lora.node_id || "")}" data-new-lora="${lora.new ? "true" : "false"}">
                 <label class="checkbox-field">
                     <input type="checkbox" data-comfy-lora-enabled ${lora.enabled ? "checked" : ""}>
-                    <span>${escapeHtml(lora.node_id)}</span>
+                    <span>${lora.new ? "Nouveau" : escapeHtml(lora.node_id)}</span>
                 </label>
                 <select data-comfy-lora-name>
                     ${names.map((name) => `<option value="${escapeHtml(name)}" ${name === lora.lora_name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}
                 </select>
                 <input type="number" data-comfy-lora-strength step="0.05" value="${escapeHtml(lora.strength_model ?? 1)}" aria-label="Force LoRA">
+                ${lora.new ? '<button type="button" class="comfy-row-remove" data-remove-comfy-lora title="Retirer">&times;</button>' : ""}
             </div>
         `;
     }).join("");
+    container.innerHTML = `
+        <div data-comfy-lora-rows>${rows || '<span class="muted">Aucun LoRA dans ce workflow</span>'}</div>
+        <button type="button" data-add-comfy-lora ${catalog.length ? "" : "disabled"}>Ajouter un LoRA</button>
+        ${catalog.length ? "" : '<small class="muted">Aucun LoRA disponible dans l’historique de la galerie.</small>'}
+    `;
 }
 
-function renderComfyReferences(images) {
-    const container = $("#comfy-references");
-    if (!images.length) {
-        container.innerHTML = '<span class="muted">Aucune image source editable</span>';
+function addComfyLora() {
+    const name = state.comfyLoraCatalog[0]?.lora_name;
+    if (!name) {
         return;
     }
-    container.innerHTML = images.map((image) => `
-        <div class="comfy-ref-row" data-node-id="${escapeHtml(image.node_id)}">
-            <div class="comfy-ref-current">
-                <strong>Node ${escapeHtml(image.node_id)}</strong>
-                <small>${escapeHtml(image.image_name)}</small>
-                <span data-comfy-ref-selected></span>
+    const existing = $$(".comfy-lora-row").map((row) => ({
+        node_id: row.dataset.nodeId || null,
+        new: row.dataset.newLora === "true",
+        enabled: row.querySelector("[data-comfy-lora-enabled]").checked,
+        lora_name: row.querySelector("[data-comfy-lora-name]").value,
+        strength_model: Number(row.querySelector("[data-comfy-lora-strength]").value || 0),
+    }));
+    existing.push({ node_id: null, new: true, enabled: true, lora_name: name, strength_model: 1.0 });
+    renderComfyLoras(existing, state.comfyLoraCatalog);
+}
+
+function renderComfyReferences() {
+    const container = $("#comfy-references");
+    const cards = state.comfyReferences.map((reference, index) => `
+        <article class="comfy-reference-thumb ${reference.enabled ? "" : "disabled"}" draggable="true" data-comfy-reference-index="${index}">
+            <button type="button" class="comfy-reference-drag" data-comfy-ref-drag title="Réordonner" aria-label="Réordonner">&#x2630;</button>
+            <img src="${escapeHtml(reference.thumbnail_url || `/api/comfy/input-preview?filename=${encodeURIComponent(reference.input_name || reference.image_name || "")}`)}" alt="${escapeHtml(reference.image_name || "Référence")}">
+            <span class="comfy-reference-main">${index === 0 ? "Main" : `Ref ${index + 1}`}</span>
+            <label class="comfy-reference-enabled">
+                <input type="checkbox" data-comfy-ref-enabled ${reference.enabled ? "checked" : ""}>
+                <span>Active</span>
+            </label>
+            <small title="${escapeHtml(reference.image_name || "")}">${escapeHtml(reference.image_name || reference.input_name || "Référence")}</small>
+            <button type="button" data-comfy-ref-change>Changer</button>
+            ${reference.is_new ? '<button type="button" class="danger" data-comfy-ref-remove>Retirer</button>' : ""}
+        </article>
+    `).join("");
+    container.innerHTML = `
+        <div class="comfy-reference-strip" data-comfy-reference-strip>${cards || '<span class="muted">Aucune référence Qwen détectée</span>'}</div>
+        <div class="comfy-reference-add">
+            <div class="comfy-reference-add-header">
+                <strong data-comfy-ref-add-title>Ajouter une référence</strong>
+                <button type="button" data-comfy-ref-add>Nouvelle</button>
             </div>
-            <input type="search" data-comfy-ref-search placeholder="Chercher une photo de reference">
+            <input type="search" data-comfy-ref-search placeholder="Nom d’une image dans les galeries">
+            <label class="comfy-reference-upload">
+                <span>Ou envoyer un fichier</span>
+                <input type="file" data-comfy-ref-upload accept="image/jpeg,image/png,image/webp">
+            </label>
             <div class="search-results" data-comfy-ref-results></div>
         </div>
-    `).join("");
+    `;
+    updateComfyReferenceAddTitle();
 }
 
 async function searchComfyReferences(event) {
     const input = event.target;
-    const row = input.closest(".comfy-ref-row");
-    if (!row) {
-        return;
-    }
-    const results = row.querySelector("[data-comfy-ref-results]");
+    const results = $("#comfy-references [data-comfy-ref-results]");
     const query = input.value.trim();
     if (query.length < 2) {
         results.innerHTML = "";
         return;
     }
     const data = await fetchJson(`/api/photos/search?q=${encodeURIComponent(query)}`);
-    const nodeId = row.dataset.nodeId;
     results.innerHTML = data.photos
         .filter((photo) => !state.currentPhoto || photo.id !== state.currentPhoto.id)
         .map((photo) => `
-            <button type="button" class="search-result" data-comfy-ref-result="${photo.id}" data-node-id="${escapeHtml(nodeId)}" data-filename="${escapeHtml(photo.filename)}">
+            <button type="button" class="search-result" data-comfy-ref-result="${photo.id}" data-filename="${escapeHtml(photo.filename)}" data-thumbnail-url="${escapeHtml(photo.thumbnail_url)}">
                 <img src="${photo.thumbnail_url}" alt="">
                 <span>${escapeHtml(photo.filename)}<small>${escapeHtml(photo.album_name)}</small></span>
             </button>
@@ -902,12 +942,72 @@ async function searchComfyReferences(event) {
 const debouncedComfyReferenceSearch = debounce(searchComfyReferences, 250);
 
 function selectComfyReference(button) {
-    const nodeId = button.dataset.nodeId;
-    const row = button.closest(".comfy-ref-row");
-    state.comfyReferences[nodeId] = Number(button.dataset.comfyRefResult);
-    row.querySelector("[data-comfy-ref-selected]").textContent = `Selection: ${button.dataset.filename}`;
-    row.querySelector("[data-comfy-ref-results]").innerHTML = "";
-    row.querySelector("[data-comfy-ref-search]").value = "";
+    const replacement = {
+        reference_id: null,
+        enabled: true,
+        image_name: button.dataset.filename,
+        input_name: null,
+        photo_id: Number(button.dataset.comfyRefResult),
+        thumbnail_url: button.dataset.thumbnailUrl,
+        is_new: true,
+    };
+    if (state.comfyReferenceTarget === null) {
+        state.comfyReferences.push(replacement);
+    } else {
+        const current = state.comfyReferences[state.comfyReferenceTarget];
+        state.comfyReferences[state.comfyReferenceTarget] = { ...current, ...replacement, reference_id: current.reference_id, is_new: current.is_new };
+    }
+    state.comfyReferenceTarget = null;
+    renderComfyReferences();
+}
+
+function updateComfyReferenceAddTitle() {
+    const title = $("#comfy-references [data-comfy-ref-add-title]");
+    if (title) {
+        title.textContent = state.comfyReferenceTarget === null ? "Ajouter une référence" : `Remplacer la référence ${state.comfyReferenceTarget + 1}`;
+    }
+}
+
+async function uploadComfyReference(input) {
+    const file = input.files?.[0];
+    if (!file) {
+        return;
+    }
+    const form = new FormData();
+    form.append("file", file);
+    setComfyStatus("Envoi de la référence vers ComfyUI...");
+    const response = await fetch("/api/comfy/references/upload", { method: "POST", body: form });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+        throw new Error(data.error || "Échec de l’upload");
+    }
+    const replacement = {
+        reference_id: null,
+        enabled: true,
+        image_name: data.input_name,
+        input_name: data.input_name,
+        photo_id: null,
+        thumbnail_url: data.thumbnail_url,
+        is_new: true,
+    };
+    if (state.comfyReferenceTarget === null) {
+        state.comfyReferences.push(replacement);
+    } else {
+        const current = state.comfyReferences[state.comfyReferenceTarget];
+        state.comfyReferences[state.comfyReferenceTarget] = { ...current, ...replacement, reference_id: current.reference_id, is_new: current.is_new };
+    }
+    state.comfyReferenceTarget = null;
+    setComfyStatus("");
+    renderComfyReferences();
+}
+
+function moveComfyReference(from, to) {
+    if (from === to || from < 0 || to < 0 || from >= state.comfyReferences.length || to >= state.comfyReferences.length) {
+        return;
+    }
+    const [reference] = state.comfyReferences.splice(from, 1);
+    state.comfyReferences.splice(to, 0, reference);
+    renderComfyReferences();
 }
 
 async function submitComfyGeneration(event) {
@@ -922,16 +1022,23 @@ async function submitComfyGeneration(event) {
         seed_mode: $("#comfy-seed-mode").value,
         steps: Number($("#comfy-steps").value || state.comfyOptions.steps || 1),
         loras: $$(".comfy-lora-row").map((row) => ({
-            node_id: row.dataset.nodeId,
+            node_id: row.dataset.nodeId || null,
+            new: row.dataset.newLora === "true",
             enabled: row.querySelector("[data-comfy-lora-enabled]").checked,
             lora_name: row.querySelector("[data-comfy-lora-name]").value,
             strength_model: Number(row.querySelector("[data-comfy-lora-strength]").value || 0),
         })),
-        references: Object.entries(state.comfyReferences).map(([nodeId, photoId]) => ({
-            node_id: nodeId,
-            photo_id: photoId,
+        references: state.comfyReferences.map((reference) => ({
+            reference_id: reference.reference_id || null,
+            enabled: Boolean(reference.enabled),
+            ...(reference.photo_id ? { photo_id: reference.photo_id } : { input_name: reference.input_name || reference.image_name }),
         })),
     };
+    if (!payload.references.some((reference) => reference.enabled)) {
+        setComfyStatus("Activez au moins une référence.", true);
+        done();
+        return;
+    }
     try {
         setComfyStatus("Lancement du job...");
         const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/comfy/generate`, {
@@ -1921,6 +2028,29 @@ async function resumeScanStatusIfNeeded() {
     }
 }
 
+function handleComfyReferencePointerMove(event) {
+    if (state.comfyReferencePointerId !== event.pointerId || state.comfyReferenceDragIndex === null) {
+        return;
+    }
+    const card = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-comfy-reference-index]");
+    if (!card) {
+        return;
+    }
+    const targetIndex = Number(card.dataset.comfyReferenceIndex);
+    if (targetIndex !== state.comfyReferenceDragIndex) {
+        const previous = state.comfyReferenceDragIndex;
+        state.comfyReferenceDragIndex = targetIndex;
+        moveComfyReference(previous, targetIndex);
+    }
+}
+
+function endComfyReferencePointer(event) {
+    if (state.comfyReferencePointerId === event.pointerId) {
+        state.comfyReferencePointerId = null;
+        state.comfyReferenceDragIndex = null;
+    }
+}
+
 function bindEvents() {
     $("#album-select")?.addEventListener("change", (event) => {
         window.location.href = `?album=${encodeURIComponent(event.target.value)}&page=1`;
@@ -1976,6 +2106,48 @@ function bindEvents() {
             debouncedComfyReferenceSearch(event);
         }
     });
+    $("#comfy-references")?.addEventListener("change", (event) => {
+        const card = event.target.closest("[data-comfy-reference-index]");
+        if (card && event.target.matches("[data-comfy-ref-enabled]")) {
+            state.comfyReferences[Number(card.dataset.comfyReferenceIndex)].enabled = event.target.checked;
+            card.classList.toggle("disabled", !event.target.checked);
+        }
+        if (event.target.matches("[data-comfy-ref-upload]")) {
+            uploadComfyReference(event.target).catch((error) => setComfyStatus(error.message, true));
+        }
+    });
+    $("#comfy-references")?.addEventListener("dragstart", (event) => {
+        const card = event.target.closest("[data-comfy-reference-index]");
+        if (card) {
+            state.comfyReferenceDragIndex = Number(card.dataset.comfyReferenceIndex);
+            event.dataTransfer.effectAllowed = "move";
+        }
+    });
+    $("#comfy-references")?.addEventListener("dragover", (event) => {
+        if (event.target.closest("[data-comfy-reference-index]")) {
+            event.preventDefault();
+        }
+    });
+    $("#comfy-references")?.addEventListener("drop", (event) => {
+        const card = event.target.closest("[data-comfy-reference-index]");
+        if (card && state.comfyReferenceDragIndex !== null) {
+            event.preventDefault();
+            moveComfyReference(state.comfyReferenceDragIndex, Number(card.dataset.comfyReferenceIndex));
+        }
+        state.comfyReferenceDragIndex = null;
+    });
+    $("#comfy-references")?.addEventListener("pointerdown", (event) => {
+        const handle = event.target.closest("[data-comfy-ref-drag]");
+        const card = handle?.closest("[data-comfy-reference-index]");
+        if (card) {
+            event.preventDefault();
+            state.comfyReferencePointerId = event.pointerId;
+            state.comfyReferenceDragIndex = Number(card.dataset.comfyReferenceIndex);
+        }
+    });
+    document.addEventListener("pointermove", handleComfyReferencePointerMove);
+    document.addEventListener("pointerup", endComfyReferencePointer);
+    document.addEventListener("pointercancel", endComfyReferencePointer);
     $("#save-photo-tags-button")?.addEventListener("click", savePhotoTags);
     $("#batch-tag-form")?.addEventListener("submit", submitBatchTags);
     $("#link-search-input")?.addEventListener("input", debounce(searchLinkTargets, 250));
@@ -2052,6 +2224,35 @@ function bindEvents() {
         const comfyReference = event.target.closest("[data-comfy-ref-result]");
         if (comfyReference) {
             selectComfyReference(comfyReference);
+        }
+        const addReference = event.target.closest("[data-comfy-ref-add]");
+        if (addReference) {
+            state.comfyReferenceTarget = null;
+            updateComfyReferenceAddTitle();
+            $("#comfy-references [data-comfy-ref-search]")?.focus();
+        }
+        const changeReference = event.target.closest("[data-comfy-ref-change]");
+        if (changeReference) {
+            const card = changeReference.closest("[data-comfy-reference-index]");
+            state.comfyReferenceTarget = Number(card.dataset.comfyReferenceIndex);
+            updateComfyReferenceAddTitle();
+            $("#comfy-references [data-comfy-ref-search]")?.focus();
+        }
+        const removeReference = event.target.closest("[data-comfy-ref-remove]");
+        if (removeReference) {
+            const card = removeReference.closest("[data-comfy-reference-index]");
+            state.comfyReferences.splice(Number(card.dataset.comfyReferenceIndex), 1);
+            renderComfyReferences();
+        }
+        if (event.target.closest("[data-add-comfy-lora]")) {
+            addComfyLora();
+        }
+        const removeLora = event.target.closest("[data-remove-comfy-lora]");
+        if (removeLora) {
+            removeLora.closest(".comfy-lora-row")?.remove();
+            if (!$(".comfy-lora-row")) {
+                $("#comfy-loras [data-comfy-lora-rows]").innerHTML = '<span class="muted">Aucun LoRA dans ce workflow</span>';
+            }
         }
         const faceDecision = event.target.closest("[data-face-decision]");
         if (faceDecision) {

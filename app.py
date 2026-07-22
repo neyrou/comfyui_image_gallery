@@ -4,6 +4,7 @@ import threading
 import time
 import traceback
 import shutil
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlencode
@@ -395,21 +396,26 @@ def run_comfy_job(job_id, photo_id, payload):
     client = get_comfy_client()
     try:
         uploaded_images = {}
+        patched_payload = deepcopy(payload)
         update_comfy_job(job_id, state="preparing", message="Upload des references")
         with connect_db(DB_PATH) as conn:
             detail = get_photo_detail(conn, photo_id)
             if not detail:
                 raise ValueError("Photo not found")
-            for reference in payload.get("references") or []:
-                node_id = str(reference.get("node_id"))
+            for reference in patched_payload.get("references") or []:
+                node_id = str(reference.get("node_id") or "")
                 target_photo_id = reference.get("photo_id")
-                if not node_id or not target_photo_id:
+                if not target_photo_id:
                     continue
                 image_path = find_photo_file(conn, int(target_photo_id))
                 if not image_path:
                     raise ValueError(f"Reference photo {target_photo_id} not found")
-                uploaded_images[node_id] = client.upload_image(image_path)
-            prompt, workflow, patch_info = patch_prompt_and_workflow(detail, payload, uploaded_images=uploaded_images)
+                input_name = client.upload_image(image_path)
+                if "reference_id" in reference or "enabled" in reference:
+                    reference["input_name"] = input_name
+                elif node_id:
+                    uploaded_images[node_id] = input_name
+            prompt, workflow, patch_info = patch_prompt_and_workflow(detail, patched_payload, uploaded_images=uploaded_images)
 
         update_comfy_job(job_id, state="queued", message="Envoi a ComfyUI", seed=patch_info.get("seed"))
 
@@ -763,11 +769,64 @@ def api_comfy_generate(photo_id):
     client = get_comfy_client()
     if not client.is_available():
         return jsonify({"ok": False, "error": "ComfyUI is not available"}), 503
+    references = payload.get("references") or []
+    if "references" in payload and not any(
+        bool(item.get("enabled", True)) for item in references if isinstance(item, dict)
+    ):
+        return jsonify({"ok": False, "error": "Au moins une reference active est requise"}), 400
     with connect_db(DB_PATH) as conn:
         if not get_photo_detail(conn, photo_id):
             return jsonify({"ok": False, "error": "Photo not found"}), 404
     job = create_comfy_job(photo_id, payload)
     return jsonify({"ok": True, "job": job}), 202
+
+
+@app.post("/api/comfy/references/upload")
+def api_comfy_reference_upload():
+    uploaded = request.files.get("file")
+    if not uploaded or not uploaded.filename:
+        return jsonify({"ok": False, "error": "Aucun fichier fourni"}), 400
+    filename = secure_filename(uploaded.filename)
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return jsonify({"ok": False, "error": "Format de reference non supporte"}), 400
+    data = uploaded.read()
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+    except Exception:
+        return jsonify({"ok": False, "error": "Image de reference invalide"}), 400
+    client = get_comfy_client()
+    if not client.is_available():
+        return jsonify({"ok": False, "error": "ComfyUI is not available"}), 503
+    try:
+        with tempfile.TemporaryDirectory(prefix="gallery-comfy-") as temp_dir:
+            temp_path = Path(temp_dir) / filename
+            temp_path.write_bytes(data)
+            input_name = client.upload_image(temp_path)
+        return jsonify(
+            {
+                "ok": True,
+                "input_name": input_name,
+                "thumbnail_url": f"/api/comfy/input-preview?filename={urlencode({'name': input_name})[5:]}",
+            }
+        ), 201
+    except (ComfyUnavailable, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503
+
+
+@app.get("/api/comfy/input-preview")
+def api_comfy_input_preview():
+    image_name = request.args.get("filename", "")
+    try:
+        data, content_type = get_comfy_client().get_input_image(image_name)
+        response = Response(data, mimetype=content_type or "application/octet-stream")
+        response.headers["Cache-Control"] = "private, max-age=60"
+        return response
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ComfyUnavailable as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503
 
 
 @app.get("/api/comfy/jobs/<job_id>")

@@ -1,3 +1,4 @@
+import io
 import json
 import tempfile
 import time
@@ -88,6 +89,69 @@ def sample_workflow():
     }
 
 
+def qwen_prompt():
+    return {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "main.png"}},
+        "2": {"class_type": "QwenEditAdaptiveLongestEdge", "inputs": {"image": ["1", 0], "max_size": 1536}},
+        "3": {
+            "class_type": "QwenEditConfigPreparer",
+            "inputs": {
+                "image": ["1", 0], "mask": ["1", 1], "ref_longest_edge": ["2", 0],
+                "to_ref": True, "ref_main_image": True, "ref_crop": "center", "ref_upscale": "lanczos",
+                "to_vl": True, "vl_resize": True, "vl_target_size": 384, "vl_crop": "center", "vl_upscale": "bicubic",
+            },
+        },
+        "4": {"class_type": "LoadImage", "inputs": {"image": "second.png"}},
+        "5": {"class_type": "QwenEditAdaptiveLongestEdge", "inputs": {"image": ["4", 0], "max_size": 1536}},
+        "7": {"class_type": "LoadImage", "inputs": {"image": "not-a-reference.png"}},
+        "8": {"class_type": "PreviewImage", "inputs": {"images": ["7", 0]}},
+        "9": {"class_type": "TextEncodeQwenImageEditPlusCustom_lrzjason", "inputs": {"configs": ["3", 0]}},
+    }
+
+
+def qwen_workflow():
+    def load_node(node_id, name, mode=0):
+        return {
+            "id": node_id, "type": "LoadImage", "mode": mode,
+            "inputs": [{"name": "image", "widget": {"name": "image"}}, {"name": "upload", "widget": {"name": "upload"}}],
+            "outputs": [{"name": "IMAGE", "links": []}, {"name": "MASK", "links": []}],
+            "widgets_values": [name, "image"],
+        }
+
+    def adaptive_node(node_id):
+        return {
+            "id": node_id, "type": "QwenEditAdaptiveLongestEdge", "mode": 0,
+            "inputs": [{"name": "image", "type": "IMAGE", "link": None}, {"name": "max_size", "widget": {"name": "max_size"}}],
+            "outputs": [{"name": "longest_edge", "links": []}], "widgets_values": [1536],
+        }
+
+    def config_node(node_id, main, mode):
+        return {
+            "id": node_id, "type": "QwenEditConfigPreparer", "mode": mode,
+            "inputs": [
+                {"name": "image", "type": "IMAGE", "link": None}, {"name": "configs", "type": "LIST", "link": None},
+                {"name": "mask", "type": "MASK", "link": None},
+                {"name": "to_ref", "widget": {"name": "to_ref"}},
+                {"name": "ref_main_image", "widget": {"name": "ref_main_image"}},
+                {"name": "ref_longest_edge", "widget": {"name": "ref_longest_edge"}, "link": None},
+                {"name": "ref_crop", "widget": {"name": "ref_crop"}}, {"name": "ref_upscale", "widget": {"name": "ref_upscale"}},
+                {"name": "to_vl", "widget": {"name": "to_vl"}}, {"name": "vl_resize", "widget": {"name": "vl_resize"}},
+                {"name": "vl_target_size", "widget": {"name": "vl_target_size"}}, {"name": "vl_crop", "widget": {"name": "vl_crop"}},
+                {"name": "vl_upscale", "widget": {"name": "vl_upscale"}},
+            ],
+            "outputs": [{"name": "configs", "links": []}],
+            "widgets_values": [True, main, 1536, "center", "lanczos", True, True, 384, "center", "bicubic"],
+        }
+
+    nodes = [load_node(1, "main.png"), adaptive_node(2), config_node(3, True, 0), load_node(4, "second.png"), adaptive_node(5), config_node(6, False, 4), load_node(7, "not-a-reference.png"), {"id": 8, "type": "PreviewImage", "mode": 0, "inputs": [{"name": "images", "link": None}], "outputs": []}, {"id": 9, "type": "TextEncodeQwenImageEditPlusCustom_lrzjason", "mode": 0, "inputs": [{"name": "configs", "type": "LIST", "link": None}], "outputs": []}]
+    links = [
+        [1, 1, 0, 2, 0, "IMAGE"], [2, 1, 0, 3, 0, "IMAGE"], [3, 1, 1, 3, 2, "MASK"], [4, 2, 0, 3, 5, "INT"],
+        [5, 4, 0, 5, 0, "IMAGE"], [6, 4, 0, 6, 0, "IMAGE"], [7, 4, 1, 6, 2, "MASK"], [8, 5, 0, 6, 5, "INT"],
+        [9, 3, 0, 6, 1, "LIST"], [10, 6, 0, 9, 0, "LIST"], [11, 7, 0, 8, 0, "IMAGE"],
+    ]
+    return {"last_node_id": 9, "last_link_id": 11, "nodes": nodes, "links": links, "groups": [], "version": 0.4}
+
+
 class FixedRng:
     def randint(self, _minimum, _maximum):
         return 99
@@ -116,6 +180,13 @@ class FakeComfyClient:
     def upload_image(self, image_path):
         self.uploaded_paths.append(Path(image_path).name)
         return f"uploaded/{Path(image_path).name}"
+
+    def get_input_image(self, image_name):
+        if image_name != "uploaded/reference.png":
+            raise ValueError("invalid image")
+        buffer = io.BytesIO()
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(buffer, format="PNG")
+        return buffer.getvalue(), "image/png"
 
     def run_prompt(self, prompt, workflow, client_id, progress_callback=None):
         type(self).queued_prompt = prompt
@@ -214,6 +285,152 @@ class ComfyGenerationTests(unittest.TestCase):
         self.assertEqual(client.payload["client_id"], "job-1")
         self.assertEqual(client.payload["extra_data"]["workflow"], workflow)
         self.assertEqual(client.payload["extra_data"]["extra_pnginfo"]["workflow"], workflow)
+
+    def test_qwen_reference_scan_reorder_bypass_and_add_subgraph(self):
+        prompt = qwen_prompt()
+        workflow = qwen_workflow()
+        detail = {
+            "metadata": {
+                "raw_prompt_json": json.dumps(prompt),
+                "raw_workflow_json": json.dumps(workflow),
+            }
+        }
+
+        options = build_edit_options(detail, [])
+
+        self.assertEqual([item["reference_id"] for item in options["references"]], ["3", "6"])
+        self.assertEqual([item["enabled"] for item in options["references"]], [True, False])
+        self.assertNotIn("not-a-reference.png", [item["image_name"] for item in options["references"]])
+
+        patched, patched_workflow, _ = patch_prompt_and_workflow(
+            detail,
+            {
+                "seed_mode": "keep",
+                "references": [
+                    {"reference_id": "6", "enabled": True, "input_name": "second.png"},
+                    {"reference_id": "3", "enabled": False, "input_name": "main.png"},
+                    {"reference_id": None, "enabled": True, "input_name": "third.png"},
+                ],
+            },
+        )
+
+        self.assertNotIn("3", patched)
+        self.assertTrue(patched["6"]["inputs"]["ref_main_image"])
+        new_qwen_id = next(node_id for node_id, node in patched.items() if ":" in node_id and node.get("class_type") == "QwenEditConfigPreparer")
+        self.assertEqual(patched[new_qwen_id]["inputs"]["configs"], ["6", 0])
+        self.assertEqual(patched["9"]["inputs"]["configs"], [new_qwen_id, 0])
+        self.assertEqual(len(patched_workflow["definitions"]["subgraphs"]), 1)
+        definition = patched_workflow["definitions"]["subgraphs"][0]
+        self.assertEqual([node["type"] for node in definition["nodes"]], ["LoadImage", "QwenEditAdaptiveLongestEdge", "QwenEditConfigPreparer"])
+        self.assertEqual(definition["nodes"][2]["mode"], 0)
+        self.assertEqual(next(node for node in patched_workflow["nodes"] if node["id"] == 3)["mode"], 4)
+        rescanned = build_edit_options(
+            {"metadata": {"raw_prompt_json": patched, "raw_workflow_json": patched_workflow}},
+            [],
+        )
+        self.assertEqual([item["reference_id"] for item in rescanned["references"]], ["6", "3", new_qwen_id])
+        self.assertTrue(rescanned["references"][-1]["in_subgraph"])
+
+    def test_new_lora_is_inserted_after_model_loader(self):
+        prompt = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+            "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "seed": 1, "steps": 4}},
+        }
+        workflow = {
+            "last_node_id": 2,
+            "last_link_id": 1,
+            "nodes": [
+                {"id": 1, "type": "UNETLoader", "mode": 0, "inputs": [], "outputs": [{"name": "MODEL", "links": [1]}], "pos": [0, 0]},
+                {"id": 2, "type": "KSampler", "mode": 0, "inputs": [{"name": "model", "link": 1}], "outputs": [], "pos": [600, 0]},
+            ],
+            "links": [[1, 1, 0, 2, 0, "MODEL"]],
+        }
+        detail = {"metadata": {"raw_prompt_json": json.dumps(prompt), "raw_workflow_json": json.dumps(workflow)}}
+
+        patched, patched_workflow, _ = patch_prompt_and_workflow(
+            detail,
+            {"seed_mode": "keep", "loras": [{"new": True, "enabled": True, "lora_name": "style.safetensors", "strength_model": 1.0}]},
+        )
+
+        self.assertEqual(patched["3"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(patched["2"]["inputs"]["model"], ["3", 0])
+        self.assertEqual(next(node for node in patched_workflow["nodes"] if node["id"] == 3)["widgets_values"], ["style.safetensors", 1.0])
+        self.assertEqual([(link[1], link[3]) for link in patched_workflow["links"]], [(1, 3), (3, 2)])
+
+    def test_new_lora_follows_bypassed_visual_lora(self):
+        prompt = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+            "3": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "seed": 1, "steps": 4}},
+        }
+        workflow = {
+            "last_node_id": 3, "last_link_id": 2,
+            "nodes": [
+                {"id": 1, "type": "UNETLoader", "mode": 0, "inputs": [], "outputs": [{"name": "MODEL", "links": [1]}]},
+                {"id": 2, "type": "LoraLoaderModelOnly", "mode": 4, "inputs": [{"name": "model", "link": 1}], "outputs": [{"name": "MODEL", "links": [2]}], "widgets_values": ["old.safetensors", 1]},
+                {"id": 3, "type": "KSampler", "mode": 0, "inputs": [{"name": "model", "link": 2}], "outputs": []},
+            ],
+            "links": [[1, 1, 0, 2, 0, "MODEL"], [2, 2, 0, 3, 0, "MODEL"]],
+        }
+        detail = {"metadata": {"raw_prompt_json": prompt, "raw_workflow_json": workflow}}
+        patched, patched_workflow, _ = patch_prompt_and_workflow(
+            detail,
+            {"seed_mode": "keep", "loras": [{"new": True, "enabled": True, "lora_name": "new.safetensors", "strength_model": 1}]},
+        )
+        self.assertEqual(patched["4"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(patched["3"]["inputs"]["model"], ["4", 0])
+        self.assertIn((2, 4), [(link[1], link[3]) for link in patched_workflow["links"]])
+        self.assertIn((4, 3), [(link[1], link[3]) for link in patched_workflow["links"]])
+
+    def test_generate_rejects_all_disabled_references(self):
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        create_png(self.images_root / "output" / "source.png", prompt=json.dumps(qwen_prompt()), workflow=json.dumps(qwen_workflow()))
+        previous_factory = app_module.COMFY_CLIENT_FACTORY
+        app_module.COMFY_CLIENT_FACTORY = FakeComfyClient
+        try:
+            client = app_module.app.test_client()
+            client.post("/api/scan", json={"metadata": True, "sync": True})
+            with connect_db(self.db_path) as conn:
+                source_id = conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+            response = client.post(
+                f"/api/photos/{source_id}/comfy/generate",
+                json={"references": [{"reference_id": "3", "enabled": False, "input_name": "main.png"}]},
+            )
+            self.assertEqual(response.status_code, 400)
+        finally:
+            app_module.COMFY_CLIENT_FACTORY = previous_factory
+
+    def test_reference_upload_and_input_preview(self):
+        previous_factory = app_module.COMFY_CLIENT_FACTORY
+        app_module.COMFY_CLIENT_FACTORY = FakeComfyClient
+        FakeComfyClient.uploaded_paths = []
+        try:
+            client = app_module.app.test_client()
+            image_data = tempfile.SpooledTemporaryFile()
+            Image.new("RGB", (8, 8), (10, 20, 30)).save(image_data, format="PNG")
+            image_data.seek(0)
+            uploaded = client.post(
+                "/api/comfy/references/upload",
+                data={"file": (image_data, "reference.png")},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(uploaded.status_code, 201)
+            self.assertEqual(uploaded.get_json()["input_name"], "uploaded/reference.png")
+            self.assertEqual(FakeComfyClient.uploaded_paths, ["reference.png"])
+
+            preview = client.get("/api/comfy/input-preview?filename=uploaded%2Freference.png")
+            self.assertEqual(preview.status_code, 200)
+            self.assertEqual(preview.data[:8], b"\x89PNG\r\n\x1a\n")
+
+            invalid = client.post(
+                "/api/comfy/references/upload",
+                data={"file": (io.BytesIO(b"not an image"), "reference.txt")},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(invalid.status_code, 400)
+        finally:
+            app_module.COMFY_CLIENT_FACTORY = previous_factory
 
     def test_comfy_status_and_generate_endpoint_with_fake_client(self):
         source_prompt = json.dumps(sample_prompt())

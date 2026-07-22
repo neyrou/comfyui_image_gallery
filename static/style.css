@@ -895,8 +895,19 @@ pre {
 }
 
 .comfy-row {
-    grid-template-columns: 92px minmax(0, 1fr) 100px;
+    grid-template-columns: 92px minmax(0, 1fr) 100px auto;
     align-items: center;
+}
+
+[data-comfy-lora-rows] {
+    display: grid;
+    gap: 8px;
+}
+
+.comfy-row-remove {
+    width: 34px;
+    min-height: 34px;
+    padding: 0;
 }
 
 .checkbox-field {
@@ -913,6 +924,110 @@ pre {
 .comfy-ref-current {
     display: grid;
     gap: 2px;
+}
+
+.comfy-reference-strip {
+    display: flex;
+    gap: 10px;
+    padding: 4px 2px 10px;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+}
+
+.comfy-reference-thumb {
+    position: relative;
+    display: grid;
+    flex: 0 0 150px;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: #292929;
+    transition: opacity 0.15s, border-color 0.15s;
+}
+
+.comfy-reference-thumb.disabled {
+    opacity: 0.45;
+}
+
+.comfy-reference-thumb img {
+    grid-column: 1 / -1;
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 7px;
+    object-fit: cover;
+    background: #171717;
+}
+
+.comfy-reference-thumb small {
+    grid-column: 1 / -1;
+    overflow: hidden;
+    color: var(--muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.comfy-reference-thumb button {
+    min-height: 30px;
+    padding: 4px 6px;
+}
+
+.comfy-reference-drag {
+    position: absolute;
+    z-index: 2;
+    top: 12px;
+    left: 12px;
+    width: 30px;
+    border-radius: 6px;
+    cursor: grab;
+    touch-action: none;
+}
+
+.comfy-reference-main {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    padding: 3px 7px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.78);
+    color: white;
+    font-size: 11px;
+}
+
+.comfy-reference-enabled {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+}
+
+.comfy-reference-enabled input {
+    width: auto;
+    min-height: auto;
+}
+
+.comfy-reference-add {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+}
+
+.comfy-reference-add-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.comfy-reference-upload {
+    display: grid;
+    gap: 5px;
+    color: var(--muted);
+    font-size: 12px;
 }
 
 .comfy-status {

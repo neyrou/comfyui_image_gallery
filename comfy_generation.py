@@ -5,12 +5,20 @@ import random
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib import error, request
 
 import websocket
 
 from metadata_extractor import _is_blacklisted_lora
+from comfy_graph import (
+    QWEN_CONFIG_TYPE,
+    WorkflowIndex,
+    discover_qwen_references,
+    input_slot,
+    parse_link,
+    workflow_widget_value,
+)
 
 
 COMFY_BASE_URL = "http://127.0.0.1:8188"
@@ -58,7 +66,7 @@ class ComfyClient:
         except (OSError, error.URLError, json.JSONDecodeError) as exc:
             raise ComfyUnavailable(str(exc)) from exc
 
-    def upload_image(self, image_path):
+    def upload_image(self, image_path, overwrite=False):
         boundary = f"----gallery-{uuid.uuid4().hex}"
         image_path = Path(image_path)
         content_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
@@ -70,7 +78,7 @@ class ComfyClient:
                 image_path.read_bytes(),
                 b"\r\n",
                 f"--{boundary}\r\n".encode("utf-8"),
-                b'Content-Disposition: form-data; name="overwrite"\r\n\r\ntrue\r\n',
+                f'Content-Disposition: form-data; name="overwrite"\r\n\r\n{str(bool(overwrite)).lower()}\r\n'.encode("utf-8"),
                 f"--{boundary}--\r\n".encode("utf-8"),
             ]
         )
@@ -88,6 +96,24 @@ class ComfyClient:
         name = data.get("name") or image_path.name
         subfolder = data.get("subfolder")
         return f"{subfolder}/{name}" if subfolder else name
+
+    def get_input_image(self, image_name):
+        normalized = str(image_name or "").replace("\\", "/").strip("/")
+        if not normalized or any(part in {"", ".", ".."} for part in normalized.split("/")):
+            raise ValueError("Invalid ComfyUI input image name")
+        parts = normalized.split("/")
+        query = urlencode(
+            {
+                "filename": parts[-1],
+                "subfolder": "/".join(parts[:-1]),
+                "type": "input",
+            }
+        )
+        try:
+            with request.urlopen(self.base_url + "/view?" + query, timeout=max(self.timeout, 10)) as response:
+                return response.read(), response.headers.get_content_type()
+        except (OSError, error.URLError) as exc:
+            raise ComfyUnavailable(str(exc)) from exc
 
     def queue_prompt(self, prompt, client_id=None, workflow=None):
         payload = {"prompt": prompt, "client_id": client_id or str(uuid.uuid4())}
@@ -231,15 +257,24 @@ def build_edit_options(detail, lora_catalog):
     prompt_node_ids = prompt_text_node_ids(active_nodes)
     seed = find_seed(active_nodes)
     steps = find_steps(active_nodes)
+    references = reference_options(prompt, workflow)
     return {
         "prompt": find_prompt_text(active_nodes, prompt_node_ids) or metadata.get("prompt") or "",
         "prompt_node_ids": prompt_node_ids,
         "seed": seed,
         "steps": steps,
         "loras": lora_options(nodes, workflow_nodes, bypassed_ids),
+        "references": references,
         "images": image_options(nodes, workflow_nodes, workflow_links, bypassed_ids),
         "lora_catalog": lora_catalog,
     }
+
+
+def reference_options(prompt, workflow):
+    references = discover_qwen_references(prompt, workflow)
+    for item in references:
+        item["thumbnail_url"] = f"/api/comfy/input-preview?filename={quote(item['image_name'], safe='')}"
+    return references
 
 
 def patch_prompt(detail, payload, uploaded_images=None, rng=None):
@@ -278,6 +313,8 @@ def patch_prompt_and_workflow(detail, payload, uploaded_images=None, rng=None):
     apply_workflow_seed(patched_workflow, active_nodes, seed)
 
     for lora in payload.get("loras") or []:
+        if lora.get("new") or not lora.get("node_id"):
+            continue
         node_id = str(lora.get("node_id"))
         node = nodes.get(node_id)
         if not node or node.get("class_type") != "LoraLoaderModelOnly":
@@ -309,7 +346,552 @@ def patch_prompt_and_workflow(detail, payload, uploaded_images=None, rng=None):
                 widgets[0] = image_name
             apply_workflow_image(patched_workflow, str(node_id), image_name)
 
+    reference_payload = payload.get("references") or []
+    if reference_payload and any(
+        "reference_id" in item or "input_name" in item or "enabled" in item
+        for item in reference_payload
+        if isinstance(item, dict)
+    ):
+        if not isinstance(patched_workflow, dict):
+            raise ValueError("Le workflow visuel ComfyUI est requis pour modifier les references")
+        apply_reference_configuration(patched, patched_workflow, reference_payload)
+
+    new_loras = [
+        item
+        for item in payload.get("loras") or []
+        if isinstance(item, dict) and (item.get("new") or not item.get("node_id"))
+    ]
+    if new_loras:
+        if not isinstance(patched_workflow, dict):
+            raise ValueError("Le workflow visuel ComfyUI est requis pour ajouter un LoRA")
+        insert_new_loras(patched, patched_workflow, new_loras)
+
     return patched, patched_workflow, {"seed": seed}
+
+
+def apply_reference_configuration(prompt, workflow, requested_references):
+    requested = [copy.deepcopy(item) for item in requested_references if isinstance(item, dict)]
+    if not requested:
+        raise ValueError("Au moins une reference est requise")
+    if not any(bool(item.get("enabled", True)) for item in requested):
+        raise ValueError("Au moins une reference active est requise")
+
+    target_id = find_qwen_config_target(workflow)
+    existing = {item["reference_id"]: item for item in discover_qwen_references(prompt, workflow)}
+    subgraph_template = reference_subgraph_template(workflow, next(iter(existing.values()), None))
+    seen = set()
+    for item in requested:
+        reference_id = item.get("reference_id")
+        if reference_id:
+            reference_id = str(reference_id)
+            if reference_id not in existing:
+                raise ValueError(f"Reference Qwen inconnue: {reference_id}")
+            if reference_id in seen:
+                raise ValueError(f"Reference Qwen dupliquee: {reference_id}")
+            seen.add(reference_id)
+            item["reference_id"] = reference_id
+        else:
+            image_name = str(item.get("input_name") or "").strip()
+            if not image_name:
+                raise ValueError("Une nouvelle reference doit fournir input_name")
+            item["reference_id"] = add_reference_subgraph(prompt, workflow, image_name, subgraph_template)
+
+    index = WorkflowIndex(workflow)
+    references = {item["reference_id"]: item for item in discover_qwen_references(prompt, workflow)}
+    active_ids = []
+    for position, item in enumerate(requested):
+        reference_id = item["reference_id"]
+        reference = references.get(reference_id)
+        if not reference:
+            raise ValueError(f"Impossible de relire la reference Qwen: {reference_id}")
+        enabled = bool(item.get("enabled", True))
+        image_name = str(item.get("input_name") or reference["image_name"]).strip()
+        set_reference_image(prompt, index, reference, image_name)
+        qwen_ref = index.nodes[reference_id]
+        qwen_ref.node["mode"] = 0 if enabled else 4
+        set_workflow_widget(qwen_ref.node, "to_ref", True)
+        set_workflow_widget(qwen_ref.node, "ref_main_image", position == 0)
+        if enabled:
+            materialize_reference_branch(prompt, index, reference_id)
+            qwen_prompt = prompt[reference_id]
+            qwen_prompt.setdefault("inputs", {})["to_ref"] = True
+            qwen_prompt["inputs"]["ref_main_image"] = position == 0
+            active_ids.append(reference_id)
+        else:
+            prompt.pop(reference_id, None)
+
+    for position, reference_id in enumerate(active_ids):
+        qwen_inputs = prompt[reference_id].setdefault("inputs", {})
+        if position == 0:
+            qwen_inputs.pop("configs", None)
+        else:
+            qwen_inputs["configs"] = [active_ids[position - 1], 0]
+    if not active_ids:
+        raise ValueError("Au moins une reference active est requise")
+    prompt_target = prompt.get(str(target_id))
+    if not prompt_target:
+        raise ValueError("Encodeur Qwen introuvable dans le prompt executable")
+    prompt_target.setdefault("inputs", {})["configs"] = [active_ids[-1], 0]
+
+    rebuild_reference_workflow_chain(workflow, requested, references, str(target_id))
+
+
+def find_qwen_config_target(workflow):
+    candidates = []
+    for node in workflow.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or "")
+        if "TextEncodeQwen" in node_type and input_slot(node, "configs") is not None:
+            candidates.append(str(node["id"]))
+    if len(candidates) != 1:
+        raise ValueError("Le workflow doit contenir un unique encodeur Qwen avec une entree configs")
+    return candidates[0]
+
+
+def set_reference_image(prompt, index, reference, image_name):
+    image_id = reference["image_node_id"]
+    image_ref = index.nodes.get(image_id)
+    if not image_ref:
+        raise ValueError(f"LoadImage de reference introuvable: {image_id}")
+    set_workflow_widget(image_ref.node, "image", image_name)
+    if "image" in image_ref.node:
+        image_ref.node["image"] = image_name
+    image_ref.node.setdefault("properties", {}).pop("image", None)
+    if image_id in prompt:
+        prompt[image_id].setdefault("inputs", {})["image"] = image_name
+
+
+def materialize_reference_branch(prompt, index, qwen_id):
+    incoming = {}
+    for edge in index.edges:
+        incoming.setdefault(edge.target, []).append(edge)
+    stack = [qwen_id]
+    ordered = []
+    seen = set()
+    while stack:
+        locator = stack.pop()
+        if locator in seen:
+            continue
+        seen.add(locator)
+        ordered.append(locator)
+        for edge in incoming.get(locator, []):
+            if locator == qwen_id and edge.input_name == "configs":
+                continue
+            stack.append(edge.origin)
+    for locator in reversed(ordered):
+        if locator not in prompt and locator in index.nodes:
+            prompt[locator] = workflow_node_to_prompt(index, locator)
+
+
+def workflow_node_to_prompt(index, locator):
+    ref = index.nodes[locator]
+    inputs = {}
+    for slot, item in enumerate(ref.node.get("inputs") or []):
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = item["name"]
+        incoming = [edge for edge in index.incoming(locator) if edge.target_slot == slot]
+        if incoming:
+            edge = incoming[0]
+            inputs[name] = [edge.origin, edge.origin_slot]
+            continue
+        if "widget" in item:
+            value = workflow_widget_value(ref.node, name)
+            if value is not None:
+                inputs[name] = value
+    result = {"inputs": inputs, "class_type": ref.node_type}
+    title = (ref.node.get("properties") or {}).get("Node name for S&R") or ref.node.get("title")
+    if title:
+        result["_meta"] = {"title": title}
+    return result
+
+
+def reference_subgraph_template(workflow, reference):
+    defaults = {
+        "max_size": 1536,
+        "settings": {
+            "ref_crop": "center", "ref_upscale": "lanczos", "to_vl": True,
+            "vl_resize": True, "vl_target_size": 384, "vl_crop": "center", "vl_upscale": "bicubic",
+        },
+        "loader_properties": {"Node name for S&R": "LoadImage"},
+        "adaptive_properties": {"Node name for S&R": "QwenEditAdaptiveLongestEdge"},
+        "qwen_properties": {"Node name for S&R": QWEN_CONFIG_TYPE},
+    }
+    if not reference:
+        return defaults
+    index = WorkflowIndex(workflow)
+    qwen_ref = index.nodes.get(reference["reference_id"])
+    loader_ref = index.nodes.get(reference["image_node_id"])
+    if not qwen_ref or not loader_ref:
+        return defaults
+    template = copy.deepcopy(defaults)
+    template["loader_properties"] = copy.deepcopy(loader_ref.node.get("properties") or defaults["loader_properties"])
+    template["qwen_properties"] = copy.deepcopy(qwen_ref.node.get("properties") or defaults["qwen_properties"])
+    for name in template["settings"]:
+        value = workflow_widget_value(qwen_ref.node, name)
+        if value is not None:
+            template["settings"][name] = value
+    longest_edge_sources = index.incoming(reference["reference_id"], "ref_longest_edge")
+    if longest_edge_sources:
+        adaptive_ref = index.nodes.get(longest_edge_sources[0].origin)
+        if adaptive_ref and adaptive_ref.node_type == "QwenEditAdaptiveLongestEdge":
+            template["adaptive_properties"] = copy.deepcopy(adaptive_ref.node.get("properties") or defaults["adaptive_properties"])
+            template["max_size"] = workflow_widget_value(adaptive_ref.node, "max_size") or defaults["max_size"]
+    return template
+
+
+def add_reference_subgraph(prompt, workflow, image_name, template=None):
+    template = copy.deepcopy(template or reference_subgraph_template(workflow, None))
+    settings = template["settings"]
+    outer_id = next_root_node_id(workflow)
+    subgraph_id = str(uuid.uuid4())
+    loader_id = f"{outer_id}:1"
+    adaptive_id = f"{outer_id}:2"
+    qwen_id = f"{outer_id}:3"
+    prompt[loader_id] = {
+        "inputs": {"image": image_name},
+        "class_type": "LoadImage",
+        "_meta": {"title": "Load Image"},
+    }
+    prompt[adaptive_id] = {
+        "inputs": {"max_size": template["max_size"], "image": [loader_id, 0]},
+        "class_type": "QwenEditAdaptiveLongestEdge",
+        "_meta": {"title": "Qwen Edit Adaptive Longest Edge"},
+    }
+    prompt[qwen_id] = {
+        "inputs": {
+            "to_ref": True,
+            "ref_main_image": False,
+            "ref_longest_edge": [adaptive_id, 0],
+            "ref_crop": settings["ref_crop"],
+            "ref_upscale": settings["ref_upscale"],
+            "to_vl": settings["to_vl"],
+            "vl_resize": settings["vl_resize"],
+            "vl_target_size": settings["vl_target_size"],
+            "vl_crop": settings["vl_crop"],
+            "vl_upscale": settings["vl_upscale"],
+            "image": [loader_id, 0],
+            "mask": [loader_id, 1],
+        },
+        "class_type": QWEN_CONFIG_TYPE,
+        "_meta": {"title": "Qwen Edit Config Preparer"},
+    }
+
+    root_nodes = workflow.setdefault("nodes", [])
+    target = next((node for node in root_nodes if "TextEncodeQwen" in str(node.get("type") or "")), {})
+    target_pos = target.get("pos") or [2200, 1200]
+    existing_count = len((workflow.get("definitions") or {}).get("subgraphs") or [])
+    root_nodes.append(
+        {
+            "id": outer_id,
+            "type": subgraph_id,
+            "pos": [float(target_pos[0]) - 480, float(target_pos[1]) + 420 + existing_count * 180],
+            "size": [330, 150],
+            "flags": {},
+            "order": max((int(node.get("order", 0)) for node in root_nodes), default=0) + 1,
+            "mode": 0,
+            "inputs": [
+                {"name": "configs", "type": "LIST", "link": None},
+                {"name": "image", "type": "COMBO", "widget": {"name": "image"}, "link": None},
+            ],
+            "outputs": [{"name": "configs", "type": "LIST", "links": []}],
+            "properties": {"proxyWidgets": [["1", "image"]]},
+            "widgets_values": [image_name],
+            "title": f"Reference Qwen {outer_id}",
+        }
+    )
+    definition = build_reference_subgraph_definition(subgraph_id, image_name, template)
+    workflow.setdefault("definitions", {}).setdefault("subgraphs", []).append(definition)
+    workflow["last_node_id"] = max(int(workflow.get("last_node_id") or 0), outer_id)
+    return qwen_id
+
+
+def build_reference_subgraph_definition(subgraph_id, image_name, template):
+    settings = template["settings"]
+    links = [
+        {"id": 1, "origin_id": -10, "origin_slot": 1, "target_id": 1, "target_slot": 0, "type": "COMBO"},
+        {"id": 2, "origin_id": 1, "origin_slot": 0, "target_id": 2, "target_slot": 0, "type": "IMAGE"},
+        {"id": 3, "origin_id": 1, "origin_slot": 0, "target_id": 3, "target_slot": 0, "type": "IMAGE"},
+        {"id": 4, "origin_id": 1, "origin_slot": 1, "target_id": 3, "target_slot": 2, "type": "MASK"},
+        {"id": 5, "origin_id": 2, "origin_slot": 0, "target_id": 3, "target_slot": 5, "type": "INT"},
+        {"id": 6, "origin_id": -10, "origin_slot": 0, "target_id": 3, "target_slot": 1, "type": "LIST"},
+        {"id": 7, "origin_id": 3, "origin_slot": 0, "target_id": -20, "target_slot": 0, "type": "LIST"},
+    ]
+    loader_inputs = [
+        {"name": "image", "type": "COMBO", "widget": {"name": "image"}, "link": 1},
+        {"name": "upload", "type": "IMAGEUPLOAD", "widget": {"name": "upload"}},
+    ]
+    qwen_inputs = [
+        {"name": "image", "type": "IMAGE", "link": 3},
+        {"name": "configs", "type": "LIST", "link": 6},
+        {"name": "mask", "type": "MASK", "link": 4},
+    ]
+    for name, value_type in (
+        ("to_ref", "BOOLEAN"), ("ref_main_image", "BOOLEAN"), ("ref_longest_edge", "INT"),
+        ("ref_crop", "COMBO"), ("ref_upscale", "COMBO"), ("to_vl", "BOOLEAN"),
+        ("vl_resize", "BOOLEAN"), ("vl_target_size", "INT"), ("vl_crop", "COMBO"), ("vl_upscale", "COMBO"),
+    ):
+        item = {"name": name, "type": value_type, "widget": {"name": name}}
+        if name == "ref_longest_edge":
+            item["link"] = 5
+        qwen_inputs.append(item)
+    return {
+        "id": subgraph_id,
+        "version": 1,
+        "state": {"lastGroupId": 0, "lastNodeId": 3, "lastLinkId": 7, "lastRerouteId": 0},
+        "revision": 0,
+        "config": {},
+        "name": "Qwen Reference",
+        "inputNode": {"id": -10, "bounding": [-180, 80, 120, 100]},
+        "outputNode": {"id": -20, "bounding": [760, 80, 120, 60]},
+        "inputs": [
+            {"id": str(uuid.uuid4()), "name": "configs", "type": "LIST", "linkIds": [6], "pos": [-80, 100]},
+            {"id": str(uuid.uuid4()), "name": "image", "type": "COMBO", "linkIds": [1], "pos": [-80, 120]},
+        ],
+        "outputs": [
+            {"id": str(uuid.uuid4()), "name": "configs", "type": "LIST", "linkIds": [7], "pos": [780, 100]}
+        ],
+        "widgets": [],
+        "nodes": [
+            {
+                "id": 1, "type": "LoadImage", "pos": [0, 180], "size": [320, 300], "flags": {}, "order": 0, "mode": 0,
+                "inputs": loader_inputs,
+                "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [2, 3]}, {"name": "MASK", "type": "MASK", "links": [4]}],
+                "properties": copy.deepcopy(template["loader_properties"]), "widgets_values": [image_name, "image"],
+            },
+            {
+                "id": 2, "type": "QwenEditAdaptiveLongestEdge", "pos": [350, 330], "size": [280, 90], "flags": {}, "order": 1, "mode": 0,
+                "inputs": [{"name": "image", "type": "IMAGE", "link": 2}, {"name": "max_size", "type": "INT", "widget": {"name": "max_size"}}],
+                "outputs": [{"name": "longest_edge", "type": "INT", "links": [5]}],
+                "properties": copy.deepcopy(template["adaptive_properties"]), "widgets_values": [template["max_size"]],
+            },
+            {
+                "id": 3, "type": QWEN_CONFIG_TYPE, "pos": [350, 40], "size": [360, 250], "flags": {}, "order": 2, "mode": 0,
+                "inputs": qwen_inputs,
+                "outputs": [{"name": "configs", "type": "LIST", "links": [7]}, {"name": "config", "type": "ANY", "links": []}],
+                "properties": copy.deepcopy(template["qwen_properties"]),
+                "widgets_values": [
+                    True, False, template["max_size"], settings["ref_crop"], settings["ref_upscale"],
+                    settings["to_vl"], settings["vl_resize"], settings["vl_target_size"], settings["vl_crop"], settings["vl_upscale"],
+                ],
+            },
+        ],
+        "groups": [],
+        "links": links,
+        "extra": {"workflowRendererVersion": "LG"},
+    }
+
+
+def rebuild_reference_workflow_chain(workflow, requested, references, target_id):
+    endpoints = []
+    for item in requested:
+        reference = references[item["reference_id"]]
+        endpoint = reference.get("endpoint")
+        if not endpoint or endpoint.get("input_slot") is None:
+            raise ValueError(f"Reference Qwen non chainable: {item['reference_id']}")
+        endpoints.append(endpoint)
+    target = root_node_map(workflow).get(str(target_id))
+    target_slot = input_slot(target or {}, "configs")
+    if target_slot is None:
+        raise ValueError("Entree configs Qwen introuvable")
+    endpoint_nodes = {endpoint["node_id"] for endpoint in endpoints}
+    retained = []
+    for raw in workflow.get("links", []):
+        parsed = parse_link(raw)
+        if not parsed:
+            retained.append(raw)
+            continue
+        _link_id, origin, origin_slot_value, target_node, target_slot_value, _ = parsed
+        remove = (
+            (str(origin) in endpoint_nodes and int(origin_slot_value) == 0)
+            or (str(target_node) in endpoint_nodes and int(target_slot_value) in {endpoint["input_slot"] for endpoint in endpoints if endpoint["node_id"] == str(target_node)})
+            or (str(target_node) == str(target_id) and int(target_slot_value) == target_slot)
+        )
+        if not remove:
+            retained.append(raw)
+    workflow["links"] = retained
+    for position in range(1, len(endpoints)):
+        add_root_link(workflow, endpoints[position - 1]["node_id"], endpoints[position - 1]["output_slot"], endpoints[position]["node_id"], endpoints[position]["input_slot"], "LIST")
+    add_root_link(workflow, endpoints[-1]["node_id"], endpoints[-1]["output_slot"], target_id, target_slot, "LIST")
+    rebuild_root_link_slots(workflow)
+
+
+def insert_new_loras(prompt, workflow, loras):
+    active = []
+    for item in loras:
+        name = str(item.get("lora_name") or "").strip()
+        if not item.get("enabled", True) or not name or _is_blacklisted_lora(name):
+            continue
+        active.append((name, float(item.get("strength_model", 1.0))))
+    if not active:
+        return
+    predecessor, consumers = prompt_model_insertion_point(prompt)
+    workflow_predecessor, workflow_targets = workflow_model_insertion_point(workflow)
+    new_ids = []
+    previous = str(predecessor)
+    for name, strength in active:
+        node_id = next_available_node_id(prompt, workflow)
+        prompt[node_id] = {
+            "inputs": {"lora_name": name, "strength_model": strength, "model": [previous, 0]},
+            "class_type": "LoraLoaderModelOnly",
+            "_meta": {"title": "Load LoRA"},
+        }
+        add_workflow_lora_node(workflow, int(node_id), name, strength)
+        new_ids.append(node_id)
+        previous = node_id
+    for node, input_name in consumers:
+        node.setdefault("inputs", {})[input_name] = [previous, 0]
+
+    target_link_ids = {item[0] for item in workflow_targets}
+    workflow["links"] = [
+        raw for raw in workflow.get("links", [])
+        if not (parse_link(raw) and parse_link(raw)[0] in target_link_ids)
+    ]
+    previous_workflow = str(workflow_predecessor)
+    for node_id in new_ids:
+        add_root_link(workflow, previous_workflow, 0, node_id, 0, "MODEL")
+        previous_workflow = node_id
+    for _link_id, target_id, target_slot_value in workflow_targets:
+        add_root_link(workflow, previous_workflow, 0, target_id, target_slot_value, "MODEL")
+    rebuild_root_link_slots(workflow)
+
+
+def prompt_model_insertion_point(prompt):
+    nodes = normalize_prompt_nodes(prompt)
+    samplers = [node for node in nodes.values() if "Sampler" in str(node.get("class_type") or "") and isinstance((node.get("inputs") or {}).get("model"), list)]
+    sources = {str(node["inputs"]["model"][0]) for node in samplers}
+    if len(sources) != 1:
+        raise ValueError("Le workflow doit avoir une unique chaine MODEL vers les samplers")
+    predecessor = sources.pop()
+    current = predecessor
+    seen = set()
+    while current not in seen:
+        seen.add(current)
+        node = nodes.get(current)
+        if not node:
+            break
+        if node.get("class_type") == "UNETLoader":
+            break
+        model_input = (node.get("inputs") or {}).get("model")
+        if not isinstance(model_input, list):
+            break
+        current = str(model_input[0])
+    if nodes.get(current, {}).get("class_type") != "UNETLoader":
+        raise ValueError("Load Diffusion Model introuvable dans la chaine MODEL")
+    consumers = []
+    for node in nodes.values():
+        for name, value in (node.get("inputs") or {}).items():
+            if name == "model" and isinstance(value, list) and str(value[0]) == predecessor:
+                consumers.append((node, name))
+    if not consumers:
+        raise ValueError("Aucun consommateur MODEL a reconnecter")
+    return predecessor, consumers
+
+
+def workflow_model_insertion_point(workflow):
+    nodes = root_node_map(workflow)
+    sampler_targets = []
+    for node_id, node in nodes.items():
+        if "Sampler" not in str(node.get("type") or ""):
+            continue
+        slot = input_slot(node, "model")
+        if slot is not None:
+            sampler_targets.append((node_id, slot))
+    links = []
+    for raw in workflow.get("links", []):
+        parsed = parse_link(raw)
+        if parsed and (str(parsed[3]), int(parsed[4])) in sampler_targets:
+            links.append(parsed)
+    origins = {str(item[1]) for item in links}
+    if len(origins) != 1:
+        raise ValueError("La chaine MODEL visuelle est ambigue")
+    predecessor = origins.pop()
+    targets = []
+    for raw in workflow.get("links", []):
+        parsed = parse_link(raw)
+        if parsed and str(parsed[1]) == predecessor and str(parsed[5]) == "MODEL":
+            targets.append((parsed[0], str(parsed[3]), int(parsed[4])))
+    if not targets:
+        raise ValueError("Aucun lien MODEL visuel a reconnecter")
+    return predecessor, targets
+
+
+def add_workflow_lora_node(workflow, node_id, name, strength):
+    nodes = workflow.setdefault("nodes", [])
+    max_x = max((float((node.get("pos") or [0])[0]) for node in nodes), default=0)
+    nodes.append(
+        {
+            "id": node_id,
+            "type": "LoraLoaderModelOnly",
+            "pos": [max_x + 320, 1000 + len(nodes) * 4],
+            "size": [270, 82],
+            "flags": {},
+            "order": max((int(node.get("order", 0)) for node in nodes), default=0) + 1,
+            "mode": 0,
+            "inputs": [
+                {"name": "model", "type": "MODEL", "link": None},
+                {"name": "lora_name", "type": "COMBO", "widget": {"name": "lora_name"}},
+                {"name": "strength_model", "type": "FLOAT", "widget": {"name": "strength_model"}},
+            ],
+            "outputs": [{"name": "MODEL", "type": "MODEL", "links": []}],
+            "properties": {"Node name for S&R": "LoraLoaderModelOnly"},
+            "widgets_values": [name, strength],
+        }
+    )
+    workflow["last_node_id"] = max(int(workflow.get("last_node_id") or 0), node_id)
+
+
+def root_node_map(workflow):
+    return {str(node["id"]): node for node in workflow.get("nodes", []) if isinstance(node, dict) and "id" in node}
+
+
+def next_root_node_id(workflow):
+    values = [int(node["id"]) for node in workflow.get("nodes", []) if str(node.get("id", "")).isdigit()]
+    values.append(int(workflow.get("last_node_id") or 0))
+    return max(values, default=0) + 1
+
+
+def next_available_node_id(prompt, workflow):
+    prompt_values = [int(node_id) for node_id in prompt if str(node_id).isdigit()]
+    workflow_values = [int(node["id"]) for node in workflow.get("nodes", []) if str(node.get("id", "")).isdigit()]
+    workflow_values.append(int(workflow.get("last_node_id") or 0))
+    return str(max(prompt_values + workflow_values, default=0) + 1)
+
+
+def add_root_link(workflow, origin_id, origin_slot_value, target_id, target_slot_value, link_type):
+    next_link_id = max(
+        [int(parse_link(raw)[0]) for raw in workflow.get("links", []) if parse_link(raw) and str(parse_link(raw)[0]).isdigit()]
+        + [int(workflow.get("last_link_id") or 0)],
+        default=0,
+    ) + 1
+    workflow.setdefault("links", []).append(
+        [next_link_id, int(origin_id) if str(origin_id).isdigit() else origin_id, int(origin_slot_value), int(target_id) if str(target_id).isdigit() else target_id, int(target_slot_value), link_type]
+    )
+    workflow["last_link_id"] = next_link_id
+    return next_link_id
+
+
+def rebuild_root_link_slots(workflow):
+    nodes = root_node_map(workflow)
+    for node in nodes.values():
+        for item in node.get("inputs") or []:
+            if isinstance(item, dict) and "link" in item:
+                item["link"] = None
+        for item in node.get("outputs") or []:
+            if isinstance(item, dict):
+                item["links"] = []
+    for raw in workflow.get("links", []):
+        parsed = parse_link(raw)
+        if not parsed:
+            continue
+        link_id, origin_id, origin_slot_value, target_id, target_slot_value, _ = parsed
+        origin = nodes.get(str(origin_id))
+        target = nodes.get(str(target_id))
+        if origin and int(origin_slot_value) < len(origin.get("outputs") or []):
+            origin["outputs"][int(origin_slot_value)].setdefault("links", []).append(link_id)
+        if target and int(target_slot_value) < len(target.get("inputs") or []):
+            target["inputs"][int(target_slot_value)]["link"] = link_id
 
 
 def normalize_prompt_nodes(prompt):
