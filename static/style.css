@@ -182,6 +182,22 @@ button:disabled {
     cursor: progress;
 }
 
+.button-spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-right: 7px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    vertical-align: -3px;
+    animation: button-spin 0.7s linear infinite;
+}
+
+@keyframes button-spin {
+    to { transform: rotate(360deg); }
+}
+
 .notice,
 .empty-state {
     max-width: 980px;
@@ -1134,6 +1150,58 @@ pre {
 .face-reference-action {
     display: flex;
     gap: 6px;
+}
+
+.face-action-button {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.face-action-confirm {
+    color: #71d891;
+    border-color: #477f56;
+}
+
+.face-action-confirm:hover {
+    background: #243429;
+}
+
+.face-action-reject {
+    color: var(--danger);
+    border-color: #8b4b4b;
+}
+
+.face-action-reject:hover {
+    background: #3a2626;
+}
+
+.face-reference-toggle {
+    color: var(--muted);
+}
+
+.face-reference-chevron {
+    display: block;
+    transition: transform 0.18s ease;
+}
+
+.face-reference-toggle[aria-expanded="true"] .face-reference-chevron {
+    transform: rotate(180deg);
+}
+
+.face-reference-panel[hidden] {
+    display: none;
+}
+
+.face-reference-panel {
+    padding-top: 7px;
+    border-top: 1px solid var(--line);
 }
 
 .face-reference-action select {

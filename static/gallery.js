@@ -45,6 +45,7 @@ const state = {
     faceIdentities: [],
     faceStatus: null,
     faceJobPollTimer: null,
+    faceJobPollDone: null,
     faceJobStatusClosed: false,
     faceImport: null,
 };
@@ -229,14 +230,21 @@ async function fetchJson(url, options = {}) {
     return data;
 }
 
-function setBusy(button, busyText) {
+function setBusy(button, busyText, options = {}) {
     if (!button) {
         return () => {};
     }
     const previous = button.innerHTML;
     button.disabled = true;
     button.setAttribute("aria-busy", "true");
-    button.textContent = busyText;
+    button.textContent = "";
+    if (options.spinner) {
+        const spinner = document.createElement("span");
+        spinner.className = "button-spinner";
+        spinner.setAttribute("aria-hidden", "true");
+        button.append(spinner);
+    }
+    button.append(document.createTextNode(busyText));
     return () => {
         button.disabled = false;
         button.removeAttribute("aria-busy");
@@ -370,6 +378,7 @@ function renderPhotoFaces(analysis) {
     container.innerHTML = analysis.faces.map((face) => {
         const match = face.match;
         const score = match ? Number(match.score).toFixed(3) : null;
+        const referencePanelId = `face-reference-panel-${face.id}`;
         const stateLabel = match?.state === "automatic" ? "Tag automatique"
             : match?.state === "pending" ? "A confirmer"
             : match?.state === "confirmed" ? "Confirme"
@@ -383,15 +392,32 @@ function renderPhotoFaces(analysis) {
                     <small class="face-match-state is-${escapeHtml(match?.state || "unknown")}">
                         ${stateLabel}${score ? ` · ${score}` : ""}
                     </small>
-                    ${match && match.state !== "rejected" ? `
-                        <div class="face-card-actions">
-                            ${match.state !== "confirmed" ? `<button type="button" data-face-decision="confirmed" data-identity-id="${match.identity_id}">Confirmer</button>` : ""}
-                            <button type="button" data-face-decision="rejected" data-identity-id="${match.identity_id}">Rejeter</button>
+                    <div class="face-card-actions">
+                        ${match && match.state !== "rejected" && match.state !== "confirmed" ? `
+                            <button class="face-action-button face-action-confirm" type="button"
+                                    data-face-decision="confirmed" data-identity-id="${match.identity_id}"
+                                    title="Confirmer" aria-label="Confirmer ${escapeHtml(match.tag_name)}">
+                                <span aria-hidden="true">&#10003;</span>
+                            </button>
+                        ` : ""}
+                        ${match && match.state !== "rejected" ? `
+                            <button class="face-action-button face-action-reject" type="button"
+                                    data-face-decision="rejected" data-identity-id="${match.identity_id}"
+                                    title="Rejeter" aria-label="Rejeter ${escapeHtml(match.tag_name)}">
+                                <span aria-hidden="true">&#10005;</span>
+                            </button>
+                        ` : ""}
+                        <button class="face-action-button face-reference-toggle" type="button"
+                                data-toggle-face-references aria-expanded="false" aria-controls="${referencePanelId}"
+                                title="Afficher les references" aria-label="Afficher les references">
+                            <span class="face-reference-chevron" aria-hidden="true">&#9662;</span>
+                        </button>
+                    </div>
+                    <div id="${referencePanelId}" class="face-reference-panel" hidden>
+                        <div class="face-reference-action">
+                            <select data-face-reference-identity aria-label="Identite de reference" ${identityOptions ? "" : "disabled"}>${identityOptions || '<option>Aucune identite</option>'}</select>
+                            <button type="button" data-add-gallery-reference ${identityOptions ? "" : "disabled"}>Reference</button>
                         </div>
-                    ` : ""}
-                    <div class="face-reference-action">
-                        <select data-face-reference-identity ${identityOptions ? "" : "disabled"}>${identityOptions || '<option>Aucune identite</option>'}</select>
-                        <button type="button" data-add-gallery-reference ${identityOptions ? "" : "disabled"}>Reference</button>
                     </div>
                 </div>
             </article>
@@ -1625,19 +1651,23 @@ function renderFaceJobStatus(job, options = {}) {
     }
 }
 
-async function startFaceJob(scope, extra = {}) {
+async function startFaceJob(scope, extra = {}, pollOptions = {}) {
     state.faceJobStatusClosed = false;
     const data = await fetchJson("/api/face/jobs", {
         method: "POST",
         body: JSON.stringify({ scope, mode: "detect", ...extra }),
     });
     renderFaceJobStatus(data.job, { force: true });
-    pollFaceJob(data.job.id);
+    pollFaceJob(data.job.id, pollOptions);
     return data.job;
 }
 
-function pollFaceJob(jobId) {
+function pollFaceJob(jobId, options = {}) {
     window.clearInterval(state.faceJobPollTimer);
+    if (state.faceJobPollDone) {
+        state.faceJobPollDone();
+    }
+    state.faceJobPollDone = options.onFinished || null;
     state.faceJobPollTimer = window.setInterval(async () => {
         try {
             const data = await fetchJson(`/api/face/jobs/${jobId}`);
@@ -1645,9 +1675,16 @@ function pollFaceJob(jobId) {
             if (!data.job.active) {
                 window.clearInterval(state.faceJobPollTimer);
                 await refreshCurrentPhotoDetail();
+                const onFinished = state.faceJobPollDone;
+                state.faceJobPollDone = null;
+                onFinished?.();
             }
-        } catch (_error) {
+        } catch (error) {
             window.clearInterval(state.faceJobPollTimer);
+            const onFinished = state.faceJobPollDone;
+            state.faceJobPollDone = null;
+            onFinished?.();
+            options.onError?.(error);
         }
     }, 1000);
 }
@@ -1666,13 +1703,16 @@ async function scanCurrentPhotoFaces() {
     if (!state.currentPhoto) {
         return;
     }
-    const done = setBusy($("#scan-photo-faces-button"), "Analyse...");
+    const done = setBusy($("#scan-photo-faces-button"), "Analyse...", { spinner: true });
     try {
-        await startFaceJob("photo", { photo_ids: [state.currentPhoto.id] });
+        await startFaceJob(
+            "photo",
+            { photo_ids: [state.currentPhoto.id] },
+            { onFinished: done, onError: (error) => alert(error.message) },
+        );
     } catch (error) {
-        alert(error.message);
-    } finally {
         done();
+        alert(error.message);
     }
 }
 
@@ -2262,6 +2302,18 @@ function bindEvents() {
                 Number(faceDecision.dataset.identityId),
                 faceDecision.dataset.faceDecision,
             ).catch((error) => alert(error.message));
+        }
+        const faceReferenceToggle = event.target.closest("[data-toggle-face-references]");
+        if (faceReferenceToggle) {
+            const card = faceReferenceToggle.closest("[data-face-id]");
+            const panel = card?.querySelector(".face-reference-panel");
+            if (panel) {
+                const expanded = faceReferenceToggle.getAttribute("aria-expanded") !== "true";
+                faceReferenceToggle.setAttribute("aria-expanded", String(expanded));
+                faceReferenceToggle.setAttribute("title", expanded ? "Masquer les references" : "Afficher les references");
+                faceReferenceToggle.setAttribute("aria-label", expanded ? "Masquer les references" : "Afficher les references");
+                panel.hidden = !expanded;
+            }
         }
         const galleryReference = event.target.closest("[data-add-gallery-reference]");
         if (galleryReference) {
