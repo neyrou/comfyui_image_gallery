@@ -296,13 +296,27 @@ def discover_albums(conn, images_root):
         )
 
 
-def scan_albums(db_path, images_root, thumbnail_root, scan_metadata=False, progress_callback=None, commit_interval=25):
+def scan_albums(
+    db_path,
+    images_root,
+    thumbnail_root,
+    scan_metadata=False,
+    progress_callback=None,
+    commit_interval=25,
+    album_name=None,
+):
     init_db(db_path)
     summary = {"albums": 0, "photos": 0, "errors": []}
     with connect_db(db_path) as conn:
         discover_albums(conn, images_root)
         conn.commit()
-        albums = conn.execute("SELECT * FROM albums ORDER BY name COLLATE NOCASE").fetchall()
+        if album_name is None:
+            albums = conn.execute("SELECT * FROM albums ORDER BY name COLLATE NOCASE").fetchall()
+        else:
+            album = get_album_by_name(conn, album_name)
+            if not album:
+                raise ValueError(f"Album introuvable: {album_name}")
+            albums = [album]
         for album in albums:
             _report_scan_progress(
                 progress_callback,

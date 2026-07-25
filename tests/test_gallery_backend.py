@@ -70,6 +70,34 @@ class GalleryBackendTests(unittest.TestCase):
             self.assertEqual(photos[0]["album_count"], 2)
             self.assertEqual(photos[0]["user_album_count"], 1)
 
+    def test_scan_can_target_only_one_album(self):
+        create_png(self.images_root / "output" / "output.png")
+        create_png(self.images_root / "Celine" / "celine.png", color=(60, 40, 20))
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+
+        response = app_module.app.test_client().post(
+            "/api/scan",
+            json={"album": "output", "metadata": False, "sync": True},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["summary"]["albums"], 1)
+        with connect_db(self.db_path) as conn:
+            scanned_albums = {
+                row["name"]
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT a.name
+                    FROM albums a
+                    JOIN album_photos ap ON ap.album_id=a.id
+                    WHERE ap.is_missing=0
+                    """
+                ).fetchall()
+            }
+        self.assertEqual(scanned_albums, {"output"})
+
     def test_thumbnail_applies_exif_orientation_and_can_be_refreshed(self):
         image_path = self.images_root / "output" / "oriented.jpg"
         create_oriented_jpeg(image_path)
@@ -546,6 +574,9 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertIn('class="danger-menu-item" data-batch-action="delete"', html)
         self.assertIn('id="face-admin-modal"', html)
         self.assertIn('id="detail-faces"', html)
+        self.assertIn('id="scan-actions-menu"', html)
+        self.assertIn('data-scan-scope="all"', html)
+        self.assertIn('data-scan-scope="current"', html)
 
     def test_album_tag_stats_and_gallery_filters(self):
         output_files = {

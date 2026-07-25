@@ -2164,11 +2164,37 @@ async function saveAlbum(event) {
     renderAlbumAdmin();
 }
 
-async function scanAlbums() {
+function closeScanActionsMenu() {
+    const menu = $("#scan-actions-menu");
+    const button = $("#scan-button");
+    if (menu) {
+        menu.hidden = true;
+    }
+    if (button) {
+        button.setAttribute("aria-expanded", "false");
+    }
+}
+
+function toggleScanActionsMenu() {
+    const menu = $("#scan-actions-menu");
+    const button = $("#scan-button");
+    if (!menu || !button || button.disabled) {
+        return;
+    }
+    const willOpen = menu.hidden;
+    menu.hidden = !willOpen;
+    button.setAttribute("aria-expanded", willOpen ? "true" : "false");
+}
+
+async function scanAlbums(albumName = null) {
+    closeScanActionsMenu();
     const done = setBusy($("#scan-button"), "…");
     try {
         state.scanStatusClosed = false;
-        const data = await fetchJson("/api/scan", { method: "POST", body: JSON.stringify({ metadata: false }) });
+        const data = await fetchJson("/api/scan", {
+            method: "POST",
+            body: JSON.stringify({ metadata: false, album: albumName }),
+        });
         renderScanStatus(data.job, { force: true });
         startScanPolling(done);
     } catch (error) {
@@ -2271,7 +2297,7 @@ function bindEvents() {
         window.location.href = `?album=${encodeURIComponent(event.target.value)}&page=1`;
     });
     $("#filter-button")?.addEventListener("click", openTagFilter);
-    $("#scan-button")?.addEventListener("click", scanAlbums);
+    $("#scan-button")?.addEventListener("click", toggleScanActionsMenu);
     $("#scan-status-close")?.addEventListener("click", () => {
         state.scanStatusClosed = true;
         $("#scan-status").hidden = true;
@@ -2420,6 +2446,14 @@ function bindEvents() {
         if (!event.target.closest(".selection-actions")) {
             closeSelectionActionsMenu();
         }
+        if (!event.target.closest(".scan-actions")) {
+            closeScanActionsMenu();
+        }
+        const scanAction = event.target.closest("[data-scan-scope]");
+        if (scanAction && !scanAction.disabled) {
+            const albumName = scanAction.dataset.scanScope === "current" ? state.selectedAlbum?.name : null;
+            scanAlbums(albumName);
+        }
         const batchAction = event.target.closest("[data-batch-action]");
         if (batchAction) {
             handleBatchAction(batchAction.dataset.batchAction);
@@ -2528,6 +2562,10 @@ function bindEvents() {
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
+            if (!$("#scan-actions-menu")?.hidden) {
+                closeScanActionsMenu();
+                return;
+            }
             if (!$("#selection-actions-menu")?.hidden) {
                 closeSelectionActionsMenu();
                 return;

@@ -36,12 +36,21 @@
                     <path d="M4 5h16l-6 7v5l-4 2v-7z"></path>
                 </svg>
             </button>
-            <button id="scan-button" class="toolbar-icon-button" type="button" title="Rescan albums" aria-label="Rescan albums">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M20 11a8 8 0 1 0-2.34 5.66"></path>
-                    <path d="M20 4v7h-7"></path>
-                </svg>
-            </button>
+            <div class="scan-actions">
+                <button id="scan-button" class="toolbar-icon-button" type="button" title="Rescanner" aria-label="Choisir la portée du scan"
+                        aria-haspopup="true" aria-expanded="false">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M20 11a8 8 0 1 0-2.34 5.66"></path>
+                        <path d="M20 4v7h-7"></path>
+                    </svg>
+                </button>
+                <div class="selection-actions-dropdown" id="scan-actions-menu" hidden>
+                    <button type="button" data-scan-scope="all">Scanner tous les albums</button>
+                    <button type="button" data-scan-scope="current" {% if not selected_album %}disabled{% endif %}>
+                        Scanner l'album courant
+                    </button>
+                </div>
+            </div>
             <button id="face-admin-button" class="toolbar-icon-button" type="button" title="Reconnaissance faciale" aria-label="Reconnaissance faciale">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"></path>

@@ -79,7 +79,8 @@ small {
     gap: 10px;
 }
 
-.selection-actions {
+.selection-actions,
+.scan-actions {
     position: relative;
 }
 
@@ -113,6 +114,11 @@ small {
 
 .selection-actions-dropdown button + button {
     border-top: 1px solid var(--line);
+}
+
+.selection-actions-dropdown button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
 }
 
 .selection-status {
@@ -1418,7 +1424,8 @@ pre {
         white-space: nowrap;
     }
 
-    .toolbar > .toolbar-icon-button {
+    .toolbar > .toolbar-icon-button,
+    .toolbar > .scan-actions > .toolbar-icon-button {
         width: 48px;
         min-width: 48px;
         padding: 0;

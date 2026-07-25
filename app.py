@@ -681,7 +681,7 @@ def apply_scan_progress(progress):
     update_scan_status(**updates)
 
 
-def run_scan_job(job_id, scan_metadata):
+def run_scan_job(job_id, scan_metadata, album_name=None):
     try:
         summary = scan_albums(
             DB_PATH,
@@ -690,6 +690,7 @@ def run_scan_job(job_id, scan_metadata):
             scan_metadata=scan_metadata,
             progress_callback=apply_scan_progress,
             commit_interval=25,
+            album_name=album_name,
         )
         update_scan_status(
             active=False,
@@ -792,8 +793,20 @@ def api_update_album(album_id):
 @app.post("/api/scan")
 def api_scan():
     payload = request.get_json(silent=True) or {}
+    album_name = payload.get("album")
+    if album_name is not None and (not isinstance(album_name, str) or not album_name):
+        return jsonify({"ok": False, "error": "album must be a non-empty string"}), 400
     if payload.get("sync"):
-        summary = scan_albums(DB_PATH, IMAGES_ROOT, THUMBNAIL_ROOT, scan_metadata=bool(payload.get("metadata")))
+        try:
+            summary = scan_albums(
+                DB_PATH,
+                IMAGES_ROOT,
+                THUMBNAIL_ROOT,
+                scan_metadata=bool(payload.get("metadata")),
+                album_name=album_name,
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
         enqueue_automatic_face_scan()
         return jsonify({"ok": True, "summary": summary})
 
@@ -806,8 +819,8 @@ def api_scan():
                 "active": True,
                 "job_id": job_id,
                 "state": "running",
-                "message": "Scan demarre",
-                "album": None,
+                "message": f"Scan de l'album {album_name} demarre" if album_name else "Scan de tous les albums demarre",
+                "album": album_name,
                 "file": None,
                 "photos": 0,
                 "album_photos": 0,
@@ -819,7 +832,11 @@ def api_scan():
             }
         )
         job = deepcopy(SCAN_STATUS)
-    thread = threading.Thread(target=run_scan_job, args=(job_id, bool(payload.get("metadata"))), daemon=True)
+    thread = threading.Thread(
+        target=run_scan_job,
+        args=(job_id, bool(payload.get("metadata")), album_name),
+        daemon=True,
+    )
     thread.start()
     return jsonify({"ok": True, "job": job}), 202
 
