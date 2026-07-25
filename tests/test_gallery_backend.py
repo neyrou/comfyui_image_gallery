@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import unittest
@@ -421,6 +422,50 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["summary"]["copied"], 1)
         self.assertTrue((self.images_root / "Celine" / "source.png").is_file())
+
+    def test_available_album_hides_stale_path_unavailable_error(self):
+        stale_error = f"Album path is unavailable: {self.images_root / 'Celine'}"
+        with connect_db(self.db_path) as conn:
+            scan_albums(self.db_path, self.images_root, self.thumbnails)
+            conn.execute(
+                "UPDATE albums SET scan_error=? WHERE name='Celine'",
+                (stale_error,),
+            )
+            albums = {album["name"]: album for album in list_albums(conn)}
+
+        self.assertTrue(albums["Celine"]["available"])
+        self.assertIsNone(albums["Celine"]["scan_error"])
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        response = app_module.app.test_client().get("/?album=Celine")
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Album illisible", html)
+        self.assertNotIn(stale_error, html)
+
+    def test_scan_retries_album_path_while_network_share_wakes_up(self):
+        image_path = self.images_root / "Celine" / "network.png"
+        create_png(image_path)
+        real_scandir = os.scandir
+        attempts = 0
+
+        def flaky_scandir(path):
+            nonlocal attempts
+            if Path(path) == self.images_root / "Celine" and attempts < 2:
+                attempts += 1
+                raise OSError("network share is waking up")
+            return real_scandir(path)
+
+        with patch("gallery_db.os.scandir", side_effect=flaky_scandir), patch("gallery_db.time.sleep"):
+            summary = scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            album = get_album_by_name(conn, "Celine")
+        self.assertEqual(attempts, 2)
+        self.assertIsNone(album["scan_error"])
+        self.assertFalse(summary["errors"])
 
     def test_batch_delete_removes_selected_photos_and_validates_before_deleting(self):
         one = self.images_root / "output" / "one.png"

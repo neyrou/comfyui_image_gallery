@@ -722,7 +722,7 @@ def image_gallery():
     with connect_db(DB_PATH) as conn:
         albums = list_albums(conn)
         album_name = selected_album_name(albums, requested_album)
-        album, photos, total = (
+        _, photos, total = (
             list_gallery_photos(
                 conn,
                 album_name,
@@ -734,6 +734,7 @@ def image_gallery():
             if album_name
             else (None, [], 0)
         )
+        album = next((item for item in albums if item["name"] == album_name), None)
         album_tag_stats = list_album_tag_stats(conn, album_name) if album_name else []
         tags = list_tags(conn)
     total_pages = max((total + PER_PAGE - 1) // PER_PAGE, 1)

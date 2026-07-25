@@ -15,6 +15,8 @@ from metadata_extractor import extract_from_image
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 ALLOWED_ALBUM_TYPES = {"input", "output", "user"}
 ALLOWED_LINK_TYPES = {"variant", "original"}
+ALBUM_PATH_RETRY_DELAYS = (0.15, 0.35)
+ALBUM_PATH_UNAVAILABLE_PREFIX = "Album path is unavailable:"
 
 
 class GalleryConnection(sqlite3.Connection):
@@ -441,11 +443,19 @@ def _report_scan_progress(progress_callback, **payload):
 
 
 def _iter_image_files(root):
-    try:
-        with os.scandir(root):
-            pass
-    except OSError as exc:
-        raise OSError(f"Album path is unavailable: {root}: {exc}") from exc
+    last_error = None
+    for retry_delay in (0, *ALBUM_PATH_RETRY_DELAYS):
+        if retry_delay:
+            time.sleep(retry_delay)
+        try:
+            with os.scandir(root):
+                pass
+            last_error = None
+            break
+        except OSError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise OSError(f"{ALBUM_PATH_UNAVAILABLE_PREFIX} {root}: {last_error}") from last_error
 
     def raise_walk_error(exc):
         raise exc
@@ -611,14 +621,21 @@ def list_albums(conn):
         ORDER BY a.name COLLATE NOCASE
         """
     ).fetchall()
-    return [
-        dict(row)
-        | {
-            "tags": _split_tags(row["tags"]),
-            "available": is_album_path_available(row["path"]),
-        }
-        for row in rows
-    ]
+    albums = []
+    for row in rows:
+        available = is_album_path_available(row["path"])
+        scan_error = row["scan_error"]
+        if available and scan_error and scan_error.startswith(ALBUM_PATH_UNAVAILABLE_PREFIX):
+            scan_error = None
+        albums.append(
+            dict(row)
+            | {
+                "tags": _split_tags(row["tags"]),
+                "available": available,
+                "scan_error": scan_error,
+            }
+        )
+    return albums
 
 
 def is_album_path_available(path):
