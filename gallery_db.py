@@ -343,21 +343,13 @@ def scan_albums(db_path, images_root, thumbnail_root, scan_metadata=False, progr
 def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callback=None, commit_interval=25):
     album_path = Path(album["path"])
     seen_keys = set()
+    protected_keys = set()
     count = 0
     error = None
-    try:
-        files = _iter_image_files(album_path)
-        conn.execute("UPDATE albums SET scan_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?", (album["id"],))
-    except OSError as exc:
-        conn.execute(
-            "UPDATE albums SET scan_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (str(exc), album["id"]),
-        )
-        conn.commit()
-        return {"photos": 0, "error": str(exc)}
 
     try:
-        for image_path in files:
+        for image_path in _iter_image_files(album_path):
+            relative_path = None
             try:
                 relative_path = image_path.relative_to(album_path).as_posix()
                 stat = image_path.stat()
@@ -395,6 +387,12 @@ def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callba
                     )
             except (OSError, ValueError) as exc:
                 error = str(exc)
+                if relative_path is not None:
+                    rows = conn.execute(
+                        "SELECT photo_id FROM album_photos WHERE album_id=? AND relative_path=?",
+                        (album["id"], relative_path),
+                    ).fetchall()
+                    protected_keys.update((row["photo_id"], relative_path) for row in rows)
                 print(f"[scan] {album['name']} error on {image_path}: {error}", flush=True)
                 _report_scan_progress(
                     progress_callback,
@@ -417,7 +415,8 @@ def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callba
     rows = conn.execute("SELECT photo_id, relative_path FROM album_photos WHERE album_id=?", (album["id"],)).fetchall()
     missing_count = 0
     for row in rows:
-        if (row["photo_id"], row["relative_path"]) not in seen_keys:
+        key = (row["photo_id"], row["relative_path"])
+        if key not in seen_keys and key not in protected_keys:
             conn.execute(
                 "UPDATE album_photos SET is_missing=1, updated_at=CURRENT_TIMESTAMP WHERE album_id=? AND photo_id=? AND relative_path=?",
                 (album["id"], row["photo_id"], row["relative_path"]),
@@ -425,6 +424,10 @@ def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callba
             missing_count += 1
             if missing_count % commit_interval == 0:
                 conn.commit()
+    conn.execute(
+        "UPDATE albums SET scan_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (error, album["id"]),
+    )
     conn.commit()
     return {"photos": count, "error": error}
 
@@ -438,9 +441,16 @@ def _report_scan_progress(progress_callback, **payload):
 
 
 def _iter_image_files(root):
-    if not root.exists():
-        return
-    for dirpath, _, filenames in os.walk(root):
+    try:
+        with os.scandir(root):
+            pass
+    except OSError as exc:
+        raise OSError(f"Album path is unavailable: {root}: {exc}") from exc
+
+    def raise_walk_error(exc):
+        raise exc
+
+    for dirpath, _, filenames in os.walk(root, onerror=raise_walk_error):
         for filename in filenames:
             path = Path(dirpath) / filename
             if path.suffix.lower() in IMAGE_EXTENSIONS:
@@ -601,7 +611,22 @@ def list_albums(conn):
         ORDER BY a.name COLLATE NOCASE
         """
     ).fetchall()
-    return [dict(row) | {"tags": _split_tags(row["tags"])} for row in rows]
+    return [
+        dict(row)
+        | {
+            "tags": _split_tags(row["tags"]),
+            "available": is_album_path_available(row["path"]),
+        }
+        for row in rows
+    ]
+
+
+def is_album_path_available(path):
+    try:
+        with os.scandir(path):
+            return True
+    except OSError:
+        return False
 
 
 def get_album_by_name(conn, name):

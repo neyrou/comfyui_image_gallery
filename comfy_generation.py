@@ -33,6 +33,14 @@ class ComfyGenerationError(RuntimeError):
     pass
 
 
+class ComfyGenerationCancelled(ComfyGenerationError):
+    pass
+
+
+class ComfyPromptUnavailable(ValueError):
+    pass
+
+
 class ComfyClient:
     def __init__(self, base_url=COMFY_BASE_URL, timeout=2):
         self.base_url = base_url.rstrip("/")
@@ -62,9 +70,57 @@ class ComfyClient:
         )
         try:
             with request.urlopen(req, timeout=timeout or self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                body = response.read()
+                return json.loads(body.decode("utf-8")) if body else {}
         except (OSError, error.URLError, json.JSONDecodeError) as exc:
             raise ComfyUnavailable(str(exc)) from exc
+
+    def cancel_prompt(self, prompt_id):
+        prompt_id = str(prompt_id or "").strip()
+        if not prompt_id:
+            return False
+
+        req = request.Request(
+            f"{self.base_url}/api/jobs/{quote(prompt_id, safe='')}/cancel",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=max(self.timeout, 10)) as response:
+                body = response.read()
+                data = json.loads(body.decode("utf-8")) if body else {}
+                return bool(data.get("cancelled", True))
+        except error.HTTPError as exc:
+            if exc.code not in {404, 405}:
+                raise ComfyUnavailable(str(exc)) from exc
+        except (OSError, error.URLError, json.JSONDecodeError) as exc:
+            raise ComfyUnavailable(str(exc)) from exc
+
+        queue = self.get_json("/queue", timeout=max(self.timeout, 10))
+        running = self._queue_prompt_ids(queue.get("queue_running") or [])
+        pending = self._queue_prompt_ids(queue.get("queue_pending") or [])
+        if prompt_id in pending:
+            self.post_json("/queue", {"delete": [prompt_id]}, timeout=max(self.timeout, 10))
+            return True
+        if prompt_id in running:
+            self.post_json("/interrupt", {}, timeout=max(self.timeout, 10))
+            return True
+        return False
+
+    @staticmethod
+    def _queue_prompt_ids(items):
+        prompt_ids = set()
+        for item in items:
+            if isinstance(item, dict):
+                prompt_id = item.get("prompt_id") or item.get("id")
+            elif isinstance(item, (list, tuple)) and len(item) > 1:
+                prompt_id = item[1]
+            else:
+                prompt_id = None
+            if prompt_id is not None:
+                prompt_ids.add(str(prompt_id))
+        return prompt_ids
 
     def upload_image(self, image_path, overwrite=False):
         boundary = f"----gallery-{uuid.uuid4().hex}"
@@ -124,29 +180,38 @@ class ComfyClient:
             }
         return self.post_json("/prompt", payload, timeout=max(self.timeout, 10))
 
-    def run_prompt(self, prompt, workflow, client_id, progress_callback=None):
+    def run_prompt(self, prompt, workflow, client_id, progress_callback=None, cancel_callback=None):
+        self._raise_if_cancelled(cancel_callback)
         ws = None
         try:
             ws = websocket.create_connection(self.websocket_url(client_id), timeout=max(self.timeout, 10))
+            ws.settimeout(1)
         except Exception:
             ws = None
 
+        self._raise_if_cancelled(cancel_callback)
         queued = self.queue_prompt(prompt, client_id=client_id, workflow=workflow)
         prompt_id = queued.get("prompt_id")
         if not prompt_id:
             raise ComfyGenerationError("ComfyUI did not return a prompt_id")
         self._progress(progress_callback, state="queued", prompt_id=prompt_id)
+        self._raise_if_cancelled(cancel_callback, prompt_id)
 
         if ws is None:
-            history = self.wait_for_history(prompt_id)
+            history = self.wait_for_history(prompt_id, cancel_callback=cancel_callback)
             self._progress(progress_callback, state="done", prompt_id=prompt_id)
             return prompt_id, history
 
         try:
-            history = self.listen_for_completion(ws, prompt_id, progress_callback=progress_callback)
+            history = self.listen_for_completion(
+                ws,
+                prompt_id,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
             return prompt_id, history
         except websocket.WebSocketException:
-            history = self.wait_for_history(prompt_id)
+            history = self.wait_for_history(prompt_id, cancel_callback=cancel_callback)
             self._progress(progress_callback, state="done", prompt_id=prompt_id)
             return prompt_id, history
         finally:
@@ -160,9 +225,10 @@ class ComfyClient:
         scheme = "wss" if parsed.scheme == "https" else "ws"
         return f"{scheme}://{parsed.netloc}/ws?clientId={client_id}"
 
-    def listen_for_completion(self, ws, prompt_id, progress_callback=None, timeout=3600):
+    def listen_for_completion(self, ws, prompt_id, progress_callback=None, timeout=3600, cancel_callback=None):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self._raise_if_cancelled(cancel_callback, prompt_id)
             try:
                 message = ws.recv()
             except websocket.WebSocketTimeoutException:
@@ -178,11 +244,13 @@ class ComfyClient:
                 continue
             event_type = data.get("type")
             payload = data.get("data") or {}
+            if event_type == "execution_interrupted" and payload.get("prompt_id") == prompt_id:
+                raise ComfyGenerationCancelled("Generation annulee")
             if event_type == "executing":
                 node = payload.get("node")
                 self._progress(progress_callback, state="running", prompt_id=prompt_id, node=node)
                 if payload.get("prompt_id") == prompt_id and node is None:
-                    history = self.wait_for_history(prompt_id, timeout=30)
+                    history = self.wait_for_history(prompt_id, timeout=30, cancel_callback=cancel_callback)
                     self._progress(progress_callback, state="done", prompt_id=prompt_id, node=None)
                     return history
             elif event_type == "progress":
@@ -201,9 +269,16 @@ class ComfyClient:
         if progress_callback:
             progress_callback(payload)
 
-    def wait_for_history(self, prompt_id, timeout=180, interval=1):
+    def _raise_if_cancelled(self, cancel_callback, prompt_id=None):
+        if cancel_callback and cancel_callback():
+            if prompt_id:
+                self.cancel_prompt(prompt_id)
+            raise ComfyGenerationCancelled("Generation annulee")
+
+    def wait_for_history(self, prompt_id, timeout=180, interval=1, cancel_callback=None):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self._raise_if_cancelled(cancel_callback, prompt_id)
             history = self.get_json(f"/history/{prompt_id}", timeout=max(self.timeout, 10))
             if prompt_id in history:
                 return history[prompt_id]
@@ -220,6 +295,25 @@ def loads_json(value):
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return None
+
+
+def comfy_node_title(prompt, workflow, node_id):
+    if node_id is None:
+        return None
+    node_id = str(node_id)
+    prompt_node = prompt.get(node_id, {}) if isinstance(prompt, dict) else {}
+    workflow_node = normalize_workflow_nodes(workflow).get(node_id, {})
+    candidates = (
+        workflow_node.get("title"),
+        (prompt_node.get("_meta") or {}).get("title"),
+        (workflow_node.get("properties") or {}).get("Node name for S&R"),
+        workflow_node.get("type"),
+        prompt_node.get("class_type"),
+    )
+    for candidate in candidates:
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return f"node {node_id}"
 
 
 def list_lora_catalog(conn):
@@ -247,7 +341,7 @@ def build_edit_options(detail, lora_catalog):
     prompt = loads_json(metadata.get("raw_prompt_json"))
     workflow = loads_json(metadata.get("raw_workflow_json"))
     if not isinstance(prompt, dict):
-        raise ValueError("Cette image ne contient pas de prompt ComfyUI exploitable")
+        raise ComfyPromptUnavailable("Cette image ne contient pas de prompt ComfyUI exploitable")
 
     workflow_nodes = normalize_workflow_nodes(workflow)
     workflow_links = normalize_workflow_links(workflow)
@@ -287,7 +381,7 @@ def patch_prompt_and_workflow(detail, payload, uploaded_images=None, rng=None):
     prompt = loads_json(metadata.get("raw_prompt_json"))
     workflow = loads_json(metadata.get("raw_workflow_json"))
     if not isinstance(prompt, dict):
-        raise ValueError("Cette image ne contient pas de prompt ComfyUI exploitable")
+        raise ComfyPromptUnavailable("Cette image ne contient pas de prompt ComfyUI exploitable")
 
     patched = copy.deepcopy(prompt)
     patched_workflow = copy.deepcopy(workflow) if isinstance(workflow, dict) else None

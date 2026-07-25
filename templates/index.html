@@ -63,6 +63,7 @@
                     <button type="button" data-batch-action="faces">Reconnaissance faciale</button>
                     <button type="button" data-batch-action="tags">Edit tag</button>
                     <button type="button" data-batch-action="clear">Unselect all</button>
+                    <button type="button" class="danger-menu-item" data-batch-action="delete">Supprimer</button>
                 </div>
             </div>
         </div>
@@ -89,6 +90,14 @@
             <small id="face-job-status-detail"></small>
         </div>
         <button type="button" id="face-job-status-close" title="Fermer" hidden>&times;</button>
+    </div>
+    <div class="scan-status comfy-job-status" id="comfy-job-status" role="status" aria-live="polite" hidden>
+        <div>
+            <strong id="comfy-job-status-title">G&eacute;n&eacute;ration en cours</strong>
+            <span id="comfy-job-status-message">En attente...</span>
+            <small id="comfy-job-status-detail"></small>
+        </div>
+        <button type="button" id="comfy-job-reopen-button">Rouvrir</button>
     </div>
 
     <main>
@@ -306,6 +315,7 @@
                 </div>
                 <div class="comfy-status" id="comfy-status"></div>
                 <div class="panel-footer">
+                    <button type="button" id="comfy-cancel-button" class="danger-button" hidden>Annuler la g&eacute;n&eacute;ration</button>
                     <button type="submit" id="comfy-submit-button">Lancer</button>
                 </div>
             </form>

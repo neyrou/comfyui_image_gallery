@@ -2,6 +2,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, PngImagePlugin
 
@@ -9,10 +10,12 @@ import app as app_module
 from gallery_db import (
     connect_db,
     find_photo_file,
+    get_album_by_name,
     get_photo_detail,
     list_album_tag_stats,
     list_albums,
     list_gallery_photos,
+    scan_album,
     scan_albums,
     set_photo_tags,
 )
@@ -108,6 +111,112 @@ class GalleryBackendTests(unittest.TestCase):
             self.assertTrue(memberships["output"]["available"])
             self.assertIn("/output/same.png", detail["original_url"])
             self.assertEqual(find_photo_file(conn, photo_id), available_image)
+
+    def test_scan_preserves_album_when_its_path_is_unavailable(self):
+        image_path = self.images_root / "Celine" / "offline.png"
+        create_png(image_path, prompt="preserved metadata")
+        scan_albums(self.db_path, self.images_root, self.thumbnails, scan_metadata=True)
+
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute(
+                "SELECT photo_id FROM album_photos WHERE album_id=(SELECT id FROM albums WHERE name='Celine')"
+            ).fetchone()["photo_id"]
+            set_photo_tags(conn, photo_id, ["preserved-tag"])
+            conn.execute(
+                "UPDATE photo_metadata SET prompt='preserved metadata' WHERE photo_id=?",
+                (photo_id,),
+            )
+
+        shutil.rmtree(self.images_root / "Celine")
+        summary = scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            album, photos, total = list_gallery_photos(conn, "Celine")
+            detail = get_photo_detail(conn, photo_id)
+            membership = conn.execute(
+                "SELECT is_missing FROM album_photos WHERE album_id=? AND photo_id=?",
+                (album["id"], photo_id),
+            ).fetchone()
+
+        self.assertEqual(total, 1)
+        self.assertEqual(photos[0]["id"], photo_id)
+        self.assertEqual(membership["is_missing"], 0)
+        self.assertIn("Album path is unavailable", album["scan_error"])
+        self.assertEqual([tag["name"] for tag in detail["tags"]], ["preserved-tag"])
+        self.assertEqual(detail["metadata"]["prompt"], "preserved metadata")
+        self.assertFalse(detail["memberships"][0]["available"])
+        self.assertTrue(any(error["album"] == "Celine" for error in summary["errors"]))
+
+    def test_scan_marks_deleted_file_missing_after_complete_traversal(self):
+        kept_path = self.images_root / "Celine" / "kept.png"
+        deleted_path = self.images_root / "Celine" / "deleted.png"
+        create_png(kept_path)
+        create_png(deleted_path, color=(30, 50, 70))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        deleted_path.unlink()
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            states = {
+                row["filename"]: row["is_missing"]
+                for row in conn.execute(
+                    "SELECT filename, is_missing FROM album_photos WHERE album_id=(SELECT id FROM albums WHERE name='Celine')"
+                ).fetchall()
+            }
+        self.assertEqual(states, {"deleted.png": 1, "kept.png": 0})
+
+    def test_scan_preserves_unreadable_file_but_reconciles_other_files(self):
+        unreadable_path = self.images_root / "Celine" / "unreadable.png"
+        deleted_path = self.images_root / "Celine" / "deleted.png"
+        create_png(unreadable_path)
+        create_png(deleted_path, color=(30, 50, 70))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        deleted_path.unlink()
+        with patch("gallery_db.checksum_file", side_effect=OSError("temporarily unreadable")):
+            scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            states = {
+                row["filename"]: row["is_missing"]
+                for row in conn.execute(
+                    "SELECT filename, is_missing FROM album_photos WHERE album_id=(SELECT id FROM albums WHERE name='Celine')"
+                ).fetchall()
+            }
+            album = get_album_by_name(conn, "Celine")
+        self.assertEqual(states, {"deleted.png": 1, "unreadable.png": 0})
+        self.assertEqual(album["scan_error"], "temporarily unreadable")
+
+    def test_scan_preserves_unseen_files_after_partial_traversal_failure(self):
+        first_path = self.images_root / "Celine" / "first.png"
+        second_path = self.images_root / "Celine" / "second.png"
+        create_png(first_path)
+        create_png(second_path, color=(30, 50, 70))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            album = get_album_by_name(conn, "Celine")
+
+            def partial_walk(_root):
+                yield first_path
+                raise OSError("subdirectory unavailable")
+
+            with patch("gallery_db._iter_image_files", side_effect=partial_walk):
+                result = scan_album(conn, album, self.thumbnails)
+
+            states = {
+                row["filename"]: row["is_missing"]
+                for row in conn.execute(
+                    "SELECT filename, is_missing FROM album_photos WHERE album_id=?",
+                    (album["id"],),
+                ).fetchall()
+            }
+            refreshed_album = get_album_by_name(conn, "Celine")
+
+        self.assertEqual(states, {"first.png": 0, "second.png": 0})
+        self.assertEqual(result["error"], "subdirectory unavailable")
+        self.assertEqual(refreshed_album["scan_error"], "subdirectory unavailable")
 
     def test_api_rescan_metadata_and_photo_links(self):
         prompt = {
@@ -285,6 +394,69 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertEqual(repeated.get_json()["summary"]["skipped"], 1)
         self.assertFalse((self.images_root / "Celine" / "two-2.png").exists())
 
+    def test_scan_error_does_not_make_an_accessible_album_unavailable(self):
+        source = self.images_root / "output" / "source.png"
+        create_png(source)
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute(
+                "SELECT photo_id FROM album_photos WHERE filename='source.png'"
+            ).fetchone()["photo_id"]
+            conn.execute("UPDATE albums SET scan_error='One file could not be read' WHERE name='Celine'")
+            albums = {album["name"]: album for album in list_albums(conn)}
+        self.assertTrue(albums["Celine"]["available"])
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        response = app_module.app.test_client().post(
+            "/api/photos/batch/album-copy",
+            json={
+                "photo_ids": [photo_id],
+                "source_album_name": "output",
+                "destination_album_name": "Celine",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["summary"]["copied"], 1)
+        self.assertTrue((self.images_root / "Celine" / "source.png").is_file())
+
+    def test_batch_delete_removes_selected_photos_and_validates_before_deleting(self):
+        one = self.images_root / "output" / "one.png"
+        two = self.images_root / "output" / "two.png"
+        create_png(one)
+        create_png(two, color=(30, 50, 70))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute("SELECT filename, photo_id FROM album_photos").fetchall()
+            }
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+
+        missing = client.delete(
+            "/api/photos/batch",
+            json={"photo_ids": [photo_ids["one.png"], 999999]},
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertTrue(one.is_file())
+
+        response = client.delete(
+            "/api/photos/batch",
+            json={"photo_ids": [photo_ids["one.png"], photo_ids["two.png"]]},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["summary"], {"requested": 2, "deleted": 2, "failed": 0})
+        self.assertFalse(one.exists())
+        self.assertFalse(two.exists())
+        with connect_db(self.db_path) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0], 0)
+
     def test_batch_metadata_scan_continues_after_unreadable_file(self):
         prompt = {"1": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "batch prompt"}}}
         valid = self.images_root / "output" / "valid.png"
@@ -326,6 +498,7 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertIn('id="batch-tag-modal"', html)
         self.assertIn('id="face-admin-button"', html)
         self.assertIn('data-batch-action="faces"', html)
+        self.assertIn('class="danger-menu-item" data-batch-action="delete"', html)
         self.assertIn('id="face-admin-modal"', html)
         self.assertIn('id="detail-faces"', html)
 

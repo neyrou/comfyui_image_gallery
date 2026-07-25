@@ -16,9 +16,12 @@ from werkzeug.utils import secure_filename
 
 from comfy_generation import (
     ComfyClient,
+    ComfyGenerationCancelled,
     ComfyGenerationError,
+    ComfyPromptUnavailable,
     ComfyUnavailable,
     build_edit_options,
+    comfy_node_title,
     extract_history_filenames,
     list_lora_catalog,
     patch_prompt_and_workflow,
@@ -38,6 +41,7 @@ from gallery_db import (
     import_photo_into_album,
     import_output_photo,
     init_db,
+    is_album_path_available,
     list_album_tag_stats,
     list_albums,
     list_gallery_photos,
@@ -334,6 +338,18 @@ def enqueue_automatic_face_scan():
     return enqueue_face_job("automatic", photo_ids, mode="detect") if photo_ids else None
 
 
+class ComfyJobAlreadyActive(RuntimeError):
+    def __init__(self, job):
+        super().__init__("Une generation est deja en cours")
+        self.job = job
+
+
+def _comfy_job_snapshot(job):
+    snapshot = {key: value for key, value in job.items() if key != "preview"}
+    snapshot["preview_available"] = bool(job.get("preview"))
+    return deepcopy(snapshot)
+
+
 def create_comfy_job(photo_id, payload):
     job_id = str(uuid4())
     job = {
@@ -344,12 +360,14 @@ def create_comfy_job(photo_id, payload):
         "message": "Preparation",
         "prompt_id": None,
         "node": None,
+        "node_title": None,
         "progress": None,
         "progress_max": None,
         "seed": None,
         "output_filenames": [],
         "photo": None,
         "error": None,
+        "cancel_requested": False,
         "preview": None,
         "preview_updated_at": None,
         "started_at": time.time(),
@@ -357,6 +375,9 @@ def create_comfy_job(photo_id, payload):
         "finished_at": None,
     }
     with COMFY_JOB_LOCK:
+        active_job = next((item for item in COMFY_JOBS.values() if item.get("active")), None)
+        if active_job:
+            raise ComfyJobAlreadyActive(_comfy_job_snapshot(active_job))
         COMFY_JOBS[job_id] = job
     thread = threading.Thread(target=run_comfy_job, args=(job_id, photo_id, payload), daemon=True)
     thread.start()
@@ -377,9 +398,53 @@ def comfy_job_snapshot(job_id):
         job = COMFY_JOBS.get(job_id)
         if not job:
             return None
-        snapshot = {key: value for key, value in job.items() if key != "preview"}
-        snapshot["preview_available"] = bool(job.get("preview"))
-        return deepcopy(snapshot)
+        return _comfy_job_snapshot(job)
+
+
+def current_comfy_job_snapshot():
+    with COMFY_JOB_LOCK:
+        active_jobs = [job for job in COMFY_JOBS.values() if job.get("active")]
+        if not active_jobs:
+            return None
+        job = max(active_jobs, key=lambda item: item.get("started_at") or 0)
+        return _comfy_job_snapshot(job)
+
+
+def comfy_job_cancel_requested(job_id):
+    with COMFY_JOB_LOCK:
+        job = COMFY_JOBS.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def request_comfy_job_cancel(job_id):
+    with COMFY_JOB_LOCK:
+        job = COMFY_JOBS.get(job_id)
+        if not job:
+            return None
+        if job.get("active") and not job.get("cancel_requested"):
+            job.update(
+                cancel_requested=True,
+                state="cancel_requested",
+                message="Annulation demandee",
+                updated_at=time.time(),
+            )
+        return _comfy_job_snapshot(job)
+
+
+def raise_if_comfy_job_cancelled(job_id):
+    if comfy_job_cancel_requested(job_id):
+        raise ComfyGenerationCancelled("Generation annulee")
+
+
+def complete_comfy_job(job_id, **updates):
+    with COMFY_JOB_LOCK:
+        job = COMFY_JOBS.get(job_id)
+        if not job:
+            return
+        if job.get("cancel_requested"):
+            raise ComfyGenerationCancelled("Generation annulee")
+        job.update(active=False, state="done", finished_at=time.time(), **updates)
+        job["updated_at"] = time.time()
 
 
 def comfy_job_preview(job_id):
@@ -397,12 +462,14 @@ def run_comfy_job(job_id, photo_id, payload):
     try:
         uploaded_images = {}
         patched_payload = deepcopy(payload)
+        raise_if_comfy_job_cancelled(job_id)
         update_comfy_job(job_id, state="preparing", message="Upload des references")
         with connect_db(DB_PATH) as conn:
             detail = get_photo_detail(conn, photo_id)
             if not detail:
                 raise ValueError("Photo not found")
             for reference in patched_payload.get("references") or []:
+                raise_if_comfy_job_cancelled(job_id)
                 node_id = str(reference.get("node_id") or "")
                 target_photo_id = reference.get("photo_id")
                 if not target_photo_id:
@@ -411,15 +478,21 @@ def run_comfy_job(job_id, photo_id, payload):
                 if not image_path:
                     raise ValueError(f"Reference photo {target_photo_id} not found")
                 input_name = client.upload_image(image_path)
+                raise_if_comfy_job_cancelled(job_id)
                 if "reference_id" in reference or "enabled" in reference:
                     reference["input_name"] = input_name
                 elif node_id:
                     uploaded_images[node_id] = input_name
             prompt, workflow, patch_info = patch_prompt_and_workflow(detail, patched_payload, uploaded_images=uploaded_images)
 
+        raise_if_comfy_job_cancelled(job_id)
         update_comfy_job(job_id, state="queued", message="Envoi a ComfyUI", seed=patch_info.get("seed"))
 
         def on_progress(progress):
+            if comfy_job_cancel_requested(job_id):
+                if "prompt_id" in progress:
+                    update_comfy_job(job_id, prompt_id=progress.get("prompt_id"))
+                return
             if progress.get("preview"):
                 update_comfy_job(job_id, preview=progress["preview"], preview_updated_at=time.time())
                 return
@@ -429,7 +502,9 @@ def run_comfy_job(job_id, photo_id, payload):
             if "prompt_id" in progress:
                 updates["prompt_id"] = progress.get("prompt_id")
             if "node" in progress:
-                updates["node"] = progress.get("node")
+                node_id = progress.get("node")
+                updates["node"] = node_id
+                updates["node_title"] = comfy_node_title(prompt, workflow, node_id)
             if "value" in progress or "max" in progress:
                 updates["progress"] = progress.get("value")
                 updates["progress_max"] = progress.get("max")
@@ -439,34 +514,55 @@ def run_comfy_job(job_id, photo_id, payload):
                     updates["message"] = message
                 update_comfy_job(job_id, **updates)
 
-        prompt_id, history = client.run_prompt(prompt, workflow, job_id, progress_callback=on_progress)
+        prompt_id, history = client.run_prompt(
+            prompt,
+            workflow,
+            job_id,
+            progress_callback=on_progress,
+            cancel_callback=lambda: comfy_job_cancel_requested(job_id),
+        )
+        raise_if_comfy_job_cancelled(job_id)
         output_filenames = extract_history_filenames(history)
         update_comfy_job(
             job_id,
             state="importing",
             message="Import de l'image generee",
             prompt_id=prompt_id,
+            node=None,
+            node_title=None,
+            progress=None,
+            progress_max=None,
             output_filenames=output_filenames,
         )
 
         generated_photo = None
+        raise_if_comfy_job_cancelled(job_id)
         with connect_db(DB_PATH) as conn:
             output_paths = output_paths_from_history(conn, output_filenames)
             if not output_paths:
                 raise ComfyGenerationError("Generated output file was not found in the output album")
             generated_photo_id = None
             for output_path in output_paths:
+                raise_if_comfy_job_cancelled(job_id)
                 generated_photo_id = import_output_photo(conn, output_path, THUMBNAIL_ROOT)
+            raise_if_comfy_job_cancelled(job_id)
             if generated_photo_id and generated_photo_id != photo_id:
                 create_photo_link(conn, photo_id, generated_photo_id, "variant")
                 generated_photo = get_photo_detail(conn, generated_photo_id)
+            raise_if_comfy_job_cancelled(job_id)
+            complete_comfy_job(
+                job_id,
+                message="Image generee",
+                prompt_id=prompt_id,
+                photo=generated_photo,
+            )
+    except ComfyGenerationCancelled:
         update_comfy_job(
             job_id,
             active=False,
-            state="done",
-            message="Image generee",
-            prompt_id=prompt_id,
-            photo=generated_photo,
+            state="cancelled",
+            message="Generation annulee",
+            error=None,
             finished_at=time.time(),
         )
     except Exception as exc:
@@ -756,7 +852,19 @@ def api_comfy_edit_options(photo_id):
             detail = get_photo_detail(conn, photo_id)
             if not detail:
                 return jsonify({"ok": False, "error": "Photo not found"}), 404
-            options = build_edit_options(detail, list_lora_catalog(conn))
+            lora_catalog = list_lora_catalog(conn)
+            try:
+                options = build_edit_options(detail, lora_catalog)
+            except ComfyPromptUnavailable:
+                image_path = find_photo_file(conn, photo_id)
+                if not image_path:
+                    return jsonify({"ok": False, "error": "No file found for this photo"}), 404
+                try:
+                    rescan_metadata(conn, photo_id, image_path)
+                except OSError as exc:
+                    return jsonify({"ok": False, "error": str(exc)}), 400
+                detail = get_photo_detail(conn, photo_id)
+                options = build_edit_options(detail, lora_catalog)
         return jsonify({"ok": True, "options": options})
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -777,7 +885,10 @@ def api_comfy_generate(photo_id):
     with connect_db(DB_PATH) as conn:
         if not get_photo_detail(conn, photo_id):
             return jsonify({"ok": False, "error": "Photo not found"}), 404
-    job = create_comfy_job(photo_id, payload)
+    try:
+        job = create_comfy_job(photo_id, payload)
+    except ComfyJobAlreadyActive as exc:
+        return jsonify({"ok": False, "error": str(exc), "job": exc.job}), 409
     return jsonify({"ok": True, "job": job}), 202
 
 
@@ -829,12 +940,25 @@ def api_comfy_input_preview():
         return jsonify({"ok": False, "error": str(exc)}), 503
 
 
+@app.get("/api/comfy/jobs/current")
+def api_current_comfy_job():
+    return jsonify({"ok": True, "job": current_comfy_job_snapshot()})
+
+
 @app.get("/api/comfy/jobs/<job_id>")
 def api_comfy_job(job_id):
     job = comfy_job_snapshot(job_id)
     if not job:
         return jsonify({"ok": False, "error": "Job not found"}), 404
     return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/comfy/jobs/<job_id>/cancel")
+def api_cancel_comfy_job(job_id):
+    job = request_comfy_job_cancel(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Job not found"}), 404
+    return jsonify({"ok": True, "job": job}), 202 if job["active"] else 200
 
 
 @app.get("/api/comfy/jobs/<job_id>/preview")
@@ -1008,7 +1132,7 @@ def api_batch_album_copy():
         destination_album = get_album_by_name(conn, destination_album_name)
         if not destination_album:
             return jsonify({"ok": False, "error": "Destination album not found"}), 404
-        if destination_album["scan_error"]:
+        if not is_album_path_available(destination_album["path"]):
             return jsonify({"ok": False, "error": "Destination album is unavailable"}), 400
 
         for photo_id in photo_ids:
@@ -1054,6 +1178,39 @@ def api_delete_photo(photo_id):
             return jsonify({"ok": False, "error": "Photo not found"}), 404
         albums = list_albums(conn)
     return jsonify({"ok": True, "deleted": result, "albums": albums})
+
+
+@app.delete("/api/photos/batch")
+def api_delete_photos_batch():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    try:
+        photo_ids = normalized_batch_photo_ids(payload)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    results = []
+    with connect_db(DB_PATH) as conn:
+        missing = missing_photo_ids(conn, photo_ids)
+        if missing:
+            return jsonify({"ok": False, "error": f"Photos not found: {', '.join(map(str, missing))}"}), 404
+        for photo_id in photo_ids:
+            try:
+                deleted = delete_photo(conn, photo_id, THUMBNAIL_ROOT)
+                results.append({"photo_id": photo_id, "status": "deleted", "deleted_files": deleted["deleted_files"]})
+            except OSError as exc:
+                results.append({"photo_id": photo_id, "status": "failed", "error": str(exc)})
+        albums = list_albums(conn)
+
+    deleted = sum(result["status"] == "deleted" for result in results)
+    return jsonify(
+        {
+            "ok": True,
+            "summary": {"requested": len(photo_ids), "deleted": deleted, "failed": len(results) - deleted},
+            "results": results,
+            "albums": albums,
+        }
+    )
 
 
 @app.put("/api/photos/<int:photo_id>/tags")

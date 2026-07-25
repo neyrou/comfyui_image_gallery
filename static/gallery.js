@@ -13,6 +13,8 @@ const state = {
     comfyReferenceDragIndex: null,
     comfyReferencePointerId: null,
     comfyLoraCatalog: [],
+    comfyJob: null,
+    comfySourcePhotoId: null,
     comfyJobPollTimer: null,
     comfyPreviewVersion: null,
     comfyPollFailures: 0,
@@ -225,7 +227,10 @@ async function fetchJson(url, options = {}) {
     });
     const data = await response.json();
     if (!response.ok || data.ok === false) {
-        throw new Error(data.error || "Erreur serveur");
+        const requestError = new Error(data.error || "Erreur serveur");
+        requestError.status = response.status;
+        requestError.data = data;
+        throw requestError;
     }
     return data;
 }
@@ -591,8 +596,11 @@ function updateComfyButton() {
     if (!button) {
         return;
     }
-    button.disabled = !state.comfyAvailable || !state.currentPhoto;
-    button.title = state.comfyAvailable ? "Regenerer avec ComfyUI" : "ComfyUI indisponible";
+    const jobActive = Boolean(state.comfyJob?.active);
+    button.disabled = !state.comfyAvailable || !state.currentPhoto || jobActive;
+    button.title = jobActive
+        ? "Une generation est deja en cours"
+        : state.comfyAvailable ? "Regenerer avec ComfyUI" : "ComfyUI indisponible";
 }
 
 async function refreshComfyStatus() {
@@ -685,7 +693,7 @@ function renderAlbumActionOptions() {
     const membershipNames = new Set((state.currentPhoto?.memberships || []).map((item) => item.album_name));
     const sourceName = state.albumActionSource?.album_name;
     const albums = state.albums.filter((album) => {
-        if (album.scan_error) {
+        if (album.available === false) {
             return false;
         }
         if (state.albumActionBatch) {
@@ -815,24 +823,64 @@ async function deleteCurrentPhoto() {
 }
 
 async function openComfyModal() {
+    if (state.comfyJob?.active) {
+        await reopenComfyJob();
+        return;
+    }
     if (!state.currentPhoto) {
         return;
     }
-    closePhotoActionsMenu();
-    const modal = $("#comfy-modal");
-    modal.classList.add("open");
-    modal.setAttribute("aria-hidden", "false");
-    setComfyStatus("Chargement des options...");
-    state.comfyOptions = null;
-    state.comfyReferences = [];
-    state.comfyReferenceTarget = null;
+    const done = setBusy($("#comfy-generate-button"), "Chargement JSON...", { spinner: true });
     try {
-        const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/comfy/edit-options`);
+        state.comfySourcePhotoId = state.currentPhoto.id;
+        await openComfyModalForPhoto(state.currentPhoto.id, { reset: true });
+    } finally {
+        done();
+        updateComfyButton();
+        closePhotoActionsMenu();
+    }
+}
+
+async function openComfyModalForPhoto(photoId, options = {}) {
+    const modal = $("#comfy-modal");
+    setComfyStatus("Chargement des options...");
+    if (options.reset) {
+        state.comfyOptions = null;
+        state.comfyReferences = [];
+        state.comfyReferenceTarget = null;
+        updateComfyFormJobControls(state.comfyJob);
+    }
+    try {
+        const data = await fetchJson(`/api/photos/${photoId}/comfy/edit-options`);
+        state.comfySourcePhotoId = photoId;
         state.comfyOptions = data.options;
         renderComfyOptions(data.options);
         setComfyStatus("");
     } catch (error) {
         setComfyStatus(error.message, true);
+    }
+    updateComfyFormJobControls(state.comfyJob);
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+}
+
+async function reopenComfyJob() {
+    const job = state.comfyJob;
+    if (!job?.active) {
+        return;
+    }
+    closePhotoActionsMenu();
+    const needsOptions = state.comfySourcePhotoId !== job.photo_id || !state.comfyOptions;
+    if (needsOptions) {
+        await openComfyModalForPhoto(job.photo_id, { reset: true });
+    } else {
+        const modal = $("#comfy-modal");
+        modal.classList.add("open");
+        modal.setAttribute("aria-hidden", "false");
+    }
+    renderComfyJob(job);
+    if (!state.comfyJobPollTimer) {
+        startComfyJobPolling(job.id);
     }
 }
 
@@ -845,6 +893,28 @@ function setComfyStatus(message, isError = false) {
     const status = $("#comfy-status");
     status.textContent = message || "";
     status.classList.toggle("error", Boolean(isError));
+}
+
+function updateComfyFormJobControls(job) {
+    const active = Boolean(job?.active);
+    const cancelRequested = job?.state === "cancel_requested";
+    $$("#comfy-form input, #comfy-form textarea, #comfy-form select, #comfy-form button").forEach((control) => {
+        if (control.id !== "comfy-submit-button" && control.id !== "comfy-cancel-button") {
+            control.disabled = active;
+        }
+    });
+    const submit = $("#comfy-submit-button");
+    if (submit) {
+        submit.disabled = active || !state.comfyOptions;
+        submit.textContent = active ? "Generation..." : "Lancer";
+        submit.toggleAttribute("aria-busy", active);
+    }
+    const cancel = $("#comfy-cancel-button");
+    if (cancel) {
+        cancel.hidden = !active;
+        cancel.disabled = !active || cancelRequested;
+        cancel.textContent = cancelRequested ? "Annulation..." : "Annuler la generation";
+    }
 }
 
 function renderComfyOptions(options) {
@@ -1038,10 +1108,9 @@ function moveComfyReference(from, to) {
 
 async function submitComfyGeneration(event) {
     event.preventDefault();
-    if (!state.currentPhoto || !state.comfyOptions) {
+    if (!state.comfySourcePhotoId || !state.comfyOptions || state.comfyJob?.active) {
         return;
     }
-    const done = setBusy($("#comfy-submit-button"), "Generation...");
     setComfyStatus("Envoi a ComfyUI...");
     const payload = {
         prompt: $("#comfy-prompt").value,
@@ -1062,28 +1131,34 @@ async function submitComfyGeneration(event) {
     };
     if (!payload.references.some((reference) => reference.enabled)) {
         setComfyStatus("Activez au moins une référence.", true);
-        done();
         return;
     }
     try {
         setComfyStatus("Lancement du job...");
-        const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/comfy/generate`, {
+        const data = await fetchJson(`/api/photos/${state.comfySourcePhotoId}/comfy/generate`, {
             method: "POST",
             body: JSON.stringify(payload),
         });
-        startComfyJobPolling(data.job.id, done);
+        state.comfyJob = data.job;
         renderComfyJob(data.job);
+        startComfyJobPolling(data.job.id);
     } catch (error) {
+        if (error.status === 409 && error.data?.job) {
+            state.comfyJob = error.data.job;
+            renderComfyJob(error.data.job);
+            startComfyJobPolling(error.data.job.id);
+            return;
+        }
         setComfyStatus(error.message, true);
-        done();
+        updateComfyFormJobControls(null);
         refreshComfyStatus();
     }
 }
 
-function startComfyJobPolling(jobId, done) {
+function startComfyJobPolling(jobId) {
     stopComfyJobPolling();
     state.comfyPollFailures = 0;
-    pollComfyJob(jobId, done, 1000);
+    pollComfyJob(jobId, 1000);
 }
 
 function stopComfyJobPolling() {
@@ -1091,15 +1166,15 @@ function stopComfyJobPolling() {
     state.comfyJobPollTimer = null;
 }
 
-function pollComfyJob(jobId, done, delay) {
+function pollComfyJob(jobId, delay) {
     state.comfyJobPollTimer = window.setTimeout(async () => {
         try {
             const data = await fetchJson(`/api/comfy/jobs/${jobId}`);
             state.comfyPollFailures = 0;
+            state.comfyJob = data.job;
             renderComfyJob(data.job);
             if (!data.job.active) {
                 stopComfyJobPolling();
-                done();
                 refreshComfyStatus();
                 if (data.job.state === "done" && data.job.photo) {
                     addPhotoToCurrentGallery(data.job.photo);
@@ -1108,35 +1183,35 @@ function pollComfyJob(jobId, done, delay) {
                 }
                 return;
             }
-            pollComfyJob(jobId, done, 1000);
+            pollComfyJob(jobId, 1000);
         } catch (error) {
             state.comfyPollFailures += 1;
             if (state.comfyPollFailures >= 8) {
                 stopComfyJobPolling();
                 setComfyStatus(`Suivi interrompu: ${error.message}`, true);
-                done();
                 refreshComfyStatus();
                 return;
             }
             const retryDelay = Math.min(1000 * Math.pow(1.7, state.comfyPollFailures), 10000);
             setComfyStatus(`Connexion temporairement perdue, nouvelle tentative ${state.comfyPollFailures}/8...`);
-            pollComfyJob(jobId, done, retryDelay);
+            pollComfyJob(jobId, retryDelay);
         }
     }, delay);
 }
 
 function renderComfyJob(job) {
+    state.comfyJob = job;
     const pieces = [job.message || job.state || "Generation"];
-    if (job.node) {
-        pieces.push(`node ${job.node}`);
+    if (job.node_title || job.node) {
+        pieces.push(job.node_title || `node ${job.node}`);
     }
     if (job.progress && job.progress_max) {
         pieces.push(`${job.progress}/${job.progress_max}`);
     }
-    if (job.prompt_id) {
-        pieces.push(job.prompt_id);
-    }
     setComfyStatus(pieces.join(" | "), job.state === "error");
+    renderComfyJobBanner(job);
+    updateComfyFormJobControls(job);
+    updateComfyButton();
     if (job.preview_available) {
         const version = job.preview_updated_at || Date.now();
         if (state.comfyPreviewVersion !== version) {
@@ -1150,6 +1225,62 @@ function renderComfyJob(job) {
     }
     if (job.state === "error") {
         setComfyStatus(job.error || job.message || "Generation en erreur", true);
+    }
+    if (job.state === "cancelled") {
+        setComfyStatus("Generation annulee");
+    }
+}
+
+function renderComfyJobBanner(job) {
+    const box = $("#comfy-job-status");
+    if (!box) {
+        return;
+    }
+    if (!job?.active) {
+        box.hidden = true;
+        return;
+    }
+    box.hidden = false;
+    box.dataset.state = job.state || "running";
+    $("#comfy-job-status-title").textContent = job.state === "cancel_requested"
+        ? "Annulation en cours"
+        : "Generation en cours";
+    $("#comfy-job-status-message").textContent = job.message || job.state || "Generation...";
+    const details = [];
+    if (job.node_title || job.node) {
+        details.push(job.node_title || `node ${job.node}`);
+    }
+    if (job.progress !== null && job.progress_max !== null) {
+        details.push(`${job.progress}/${job.progress_max}`);
+    }
+    $("#comfy-job-status-detail").textContent = details.join(" | ");
+}
+
+async function cancelComfyGeneration() {
+    const job = state.comfyJob;
+    if (!job?.active || job.state === "cancel_requested") {
+        return;
+    }
+    try {
+        const data = await fetchJson(`/api/comfy/jobs/${job.id}/cancel`, { method: "POST", body: "{}" });
+        renderComfyJob(data.job);
+        startComfyJobPolling(data.job.id);
+    } catch (error) {
+        setComfyStatus(error.message, true);
+    }
+}
+
+async function resumeComfyGenerationState() {
+    try {
+        const data = await fetchJson("/api/comfy/jobs/current");
+        if (data.job?.active) {
+            state.comfyJob = data.job;
+            state.comfySourcePhotoId = data.job.photo_id;
+            renderComfyJob(data.job);
+            startComfyJobPolling(data.job.id);
+        }
+    } catch (_error) {
+        // ComfyUI generation tracking is non-critical during initial page load.
     }
 }
 
@@ -1205,6 +1336,48 @@ async function scanSelectedFaces() {
         }
     } catch (error) {
         setSelectionStatus(error.message, true);
+    }
+}
+
+async function deleteSelectedPhotos() {
+    const photoIds = selectedPhotoIds();
+    if (!photoIds.length) {
+        return;
+    }
+    closeSelectionActionsMenu();
+    if (!window.confirm(`Supprimer definitivement ${photoIds.length} photo(s) de la base et du disque ?`)) {
+        return;
+    }
+    const done = setBusy($("#selection-actions-button"), "Suppression...");
+    setSelectionStatus(`Suppression de ${photoIds.length} photo(s)...`);
+    try {
+        const data = await fetchJson("/api/photos/batch", {
+            method: "DELETE",
+            body: JSON.stringify({ photo_ids: photoIds }),
+        });
+        state.albums = data.albums || state.albums;
+        const deletedIds = (data.results || [])
+            .filter((result) => result.status === "deleted")
+            .map((result) => result.photo_id);
+        deletedIds.forEach((photoId) => {
+            state.selectedPhotoIds.delete(photoId);
+            removePhotoFromCurrentGallery(photoId);
+        });
+        const failed = data.summary?.failed || 0;
+        if (state.selectedPhotoIds.size) {
+            setSelectionStatus(
+                `${deletedIds.length} photo(s) supprimee(s), ${failed} erreur(s).${batchFailureSuffix(data.results || [])}`,
+                true,
+            );
+            renderSelectionState();
+        } else {
+            exitSelectionMode();
+        }
+    } catch (error) {
+        setSelectionStatus(error.message, true);
+    } finally {
+        done();
+        renderSelectionState();
     }
 }
 
@@ -1277,6 +1450,8 @@ function handleBatchAction(action) {
         scanSelectedFaces();
     } else if (action === "tags") {
         openBatchTagModal();
+    } else if (action === "delete") {
+        deleteSelectedPhotos();
     }
 }
 
@@ -2134,6 +2309,10 @@ function bindEvents() {
     });
     $("#face-reference-import-form")?.addEventListener("submit", importFaceReference);
     $("#comfy-generate-button")?.addEventListener("click", openComfyModal);
+    $("#comfy-job-reopen-button")?.addEventListener("click", () => {
+        reopenComfyJob().catch((error) => setComfyStatus(error.message, true));
+    });
+    $("#comfy-cancel-button")?.addEventListener("click", cancelComfyGeneration);
     $("#delete-photo-button")?.addEventListener("click", deleteCurrentPhoto);
     $("#photo-actions-button")?.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -2412,4 +2591,5 @@ bindEvents();
 renderSelectionState();
 resumeScanStatusIfNeeded();
 refreshComfyStatus();
+resumeComfyGenerationState();
 resumeFaceRecognitionState();
