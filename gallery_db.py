@@ -257,12 +257,66 @@ def init_db(db_path):
             """
         )
         _ensure_column(conn, "photo_tags", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        _init_lora_tag_mapping_schema(conn)
 
 
 def _ensure_column(conn, table_name, column_name, definition):
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
     if column_name not in columns:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def _init_lora_tag_mapping_schema(conn):
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(lora_tag_mappings)").fetchall()
+    }
+    if "tag_id" in columns:
+        conn.execute(
+            "ALTER TABLE lora_tag_mappings RENAME TO lora_tag_mappings_legacy"
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lora_tag_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lora_name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lora_tag_mapping_tags (
+            mapping_id INTEGER NOT NULL REFERENCES lora_tag_mappings(id) ON DELETE CASCADE,
+            tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+            PRIMARY KEY(mapping_id, tag_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lora_tag_mapping_tags_tag
+        ON lora_tag_mapping_tags(tag_id)
+        """
+    )
+
+    if "tag_id" in columns:
+        conn.execute(
+            """
+            INSERT INTO lora_tag_mappings(id, lora_name, created_at)
+            SELECT id, lora_name, created_at
+            FROM lora_tag_mappings_legacy
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO lora_tag_mapping_tags(mapping_id, tag_id)
+            SELECT id, tag_id
+            FROM lora_tag_mappings_legacy
+            """
+        )
+        conn.execute("DROP TABLE lora_tag_mappings_legacy")
 
 
 def album_type_from_name(name):
@@ -561,6 +615,7 @@ def rescan_metadata(conn, photo_id, image_path):
             """,
             (photo_id, lora.get("node_id"), lora["lora_name"], lora.get("strength_model")),
         )
+    sync_lora_tags(conn, photo_id, extracted.loras)
     for image_name in extracted.used_images:
         conn.execute(
             "INSERT OR IGNORE INTO photo_used_images(photo_id, image_name) VALUES (?, ?)",
@@ -575,6 +630,47 @@ def rescan_metadata(conn, photo_id, image_path):
                 (photo_id, source_photo_id),
             )
     return extracted
+
+
+def sync_lora_tags(conn, photo_id, loras):
+    conn.execute(
+        "DELETE FROM photo_tags WHERE photo_id=? AND source='lora_auto'",
+        (photo_id,),
+    )
+    active_lora_names = []
+    for lora in loras:
+        try:
+            is_active = float(lora.get("strength_model")) > 0
+        except (TypeError, ValueError):
+            is_active = False
+        if is_active and lora.get("lora_name"):
+            active_lora_names.append(lora["lora_name"])
+
+    if not active_lora_names:
+        return
+
+    placeholders = ",".join("?" for _ in active_lora_names)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT lmtt.tag_id
+        FROM lora_tag_mappings ltm
+        JOIN lora_tag_mapping_tags lmtt ON lmtt.mapping_id=ltm.id
+        WHERE ltm.lora_name IN ({placeholders})
+        """,
+        tuple(active_lora_names),
+    ).fetchall()
+    conn.executemany(
+        """
+        INSERT INTO photo_tags(photo_id, tag_id, source)
+        VALUES (?, ?, 'lora_auto')
+        ON CONFLICT(photo_id, tag_id) DO UPDATE SET
+            source=CASE
+                WHEN photo_tags.source='lora_auto' THEN excluded.source
+                ELSE photo_tags.source
+            END
+        """,
+        ((photo_id, row["tag_id"]) for row in rows),
+    )
 
 
 def find_source_photo_ids_for_used_image(conn, current_photo_id, image_name):
@@ -1146,6 +1242,114 @@ def set_album_tags(conn, album_id, tag_names):
 
 def list_tags(conn):
     return [dict(row) for row in conn.execute("SELECT * FROM tags ORDER BY name COLLATE NOCASE").fetchall()]
+
+
+def list_lora_tag_mappings(conn):
+    rows = conn.execute(
+        """
+        SELECT
+            ltm.id,
+            ltm.lora_name,
+            ltm.created_at,
+            t.id AS tag_id,
+            t.name AS tag_name
+        FROM lora_tag_mappings ltm
+        JOIN lora_tag_mapping_tags lmtt ON lmtt.mapping_id=ltm.id
+        JOIN tags t ON t.id=lmtt.tag_id
+        ORDER BY ltm.lora_name COLLATE NOCASE, t.name COLLATE NOCASE
+        """
+    ).fetchall()
+    mappings = []
+    by_id = {}
+    for row in rows:
+        mapping = by_id.get(row["id"])
+        if mapping is None:
+            mapping = {
+                "id": row["id"],
+                "lora_name": row["lora_name"],
+                "created_at": row["created_at"],
+                "tags": [],
+            }
+            by_id[row["id"]] = mapping
+            mappings.append(mapping)
+        mapping["tags"].append({"id": row["tag_id"], "name": row["tag_name"]})
+    return mappings
+
+
+def _clean_lora_tag_names(tag_names):
+    if isinstance(tag_names, str):
+        tag_names = tag_names.split(",")
+    cleaned_tag_names = []
+    seen_tag_names = set()
+    for tag_name in tag_names or []:
+        if not isinstance(tag_name, str):
+            raise ValueError("Tag names must be strings")
+        cleaned_tag_name = tag_name.strip()
+        if cleaned_tag_name and cleaned_tag_name not in seen_tag_names:
+            seen_tag_names.add(cleaned_tag_name)
+            cleaned_tag_names.append(cleaned_tag_name)
+    if not cleaned_tag_names:
+        raise ValueError("At least one tag name is required")
+    return cleaned_tag_names
+
+
+def _replace_lora_mapping_tags(conn, mapping_id, tag_names):
+    conn.execute(
+        "DELETE FROM lora_tag_mapping_tags WHERE mapping_id=?",
+        (mapping_id,),
+    )
+    for tag_name in tag_names:
+        tag = upsert_tag(conn, tag_name)
+        conn.execute(
+            """
+            INSERT INTO lora_tag_mapping_tags(mapping_id, tag_id)
+            VALUES (?, ?)
+            """,
+            (mapping_id, tag["id"]),
+        )
+
+
+def create_lora_tag_mapping(conn, lora_name, tag_names):
+    cleaned_lora_name = lora_name.strip()
+    cleaned_tag_names = _clean_lora_tag_names(tag_names)
+    if not cleaned_lora_name:
+        raise ValueError("LoRA name is required")
+    if conn.execute(
+        "SELECT 1 FROM lora_tag_mappings WHERE lora_name=?",
+        (cleaned_lora_name,),
+    ).fetchone():
+        raise KeyError("This LoRA already has a tag mapping")
+    cursor = conn.execute(
+        "INSERT INTO lora_tag_mappings(lora_name) VALUES (?)",
+        (cleaned_lora_name,),
+    )
+    mapping_id = cursor.lastrowid
+    _replace_lora_mapping_tags(conn, mapping_id, cleaned_tag_names)
+    return next(
+        mapping
+        for mapping in list_lora_tag_mappings(conn)
+        if mapping["id"] == mapping_id
+    )
+
+
+def update_lora_tag_mapping(conn, mapping_id, tag_names):
+    cleaned_tag_names = _clean_lora_tag_names(tag_names)
+    if not conn.execute(
+        "SELECT 1 FROM lora_tag_mappings WHERE id=?",
+        (mapping_id,),
+    ).fetchone():
+        raise KeyError("LoRA tag mapping not found")
+    _replace_lora_mapping_tags(conn, mapping_id, cleaned_tag_names)
+    return next(
+        mapping
+        for mapping in list_lora_tag_mappings(conn)
+        if mapping["id"] == mapping_id
+    )
+
+
+def delete_lora_tag_mapping(conn, mapping_id):
+    cursor = conn.execute("DELETE FROM lora_tag_mappings WHERE id=?", (mapping_id,))
+    return cursor.rowcount > 0
 
 
 def embedding_to_blob(embedding):

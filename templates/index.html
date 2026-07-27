@@ -51,13 +51,7 @@
                     </button>
                 </div>
             </div>
-            <button id="face-admin-button" class="toolbar-icon-button" type="button" title="Reconnaissance faciale" aria-label="Reconnaissance faciale">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"></path>
-                    <circle cx="12" cy="11" r="3"></circle><path d="M7.5 18c.7-2.4 2.2-3.5 4.5-3.5s3.8 1.1 4.5 3.5"></path>
-                </svg>
-            </button>
-            <button id="admin-button" class="toolbar-icon-button" type="button" title="Gérer les albums" aria-label="Gérer les albums">
+            <button id="admin-button" class="toolbar-icon-button" type="button" title="Configuration" aria-label="Ouvrir la configuration">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"></path>
                 </svg>
@@ -333,62 +327,95 @@
 
     <div class="modal" id="admin-modal" aria-hidden="true">
         <div class="modal-backdrop" data-close-admin></div>
-        <section class="admin-panel" role="dialog" aria-modal="true" aria-label="Gestion">
-            <div class="panel-header">
-                <h2>Gestion des albums</h2>
-                <button type="button" data-close-admin>×</button>
-            </div>
-            <div class="album-admin-list" id="album-admin-list"></div>
-        </section>
-    </div>
-
-    <div class="modal" id="face-admin-modal" aria-hidden="true">
-        <div class="modal-backdrop" data-close-face-admin></div>
-        <section class="face-admin-panel" role="dialog" aria-modal="true" aria-label="Reconnaissance faciale">
-            <div class="panel-header">
+        <section class="config-panel" role="dialog" aria-modal="true" aria-labelledby="config-panel-title">
+            <div class="panel-header config-panel-header">
                 <div>
-                    <h2>Reconnaissance faciale</h2>
-                    <small id="face-engine-status">Verification du moteur...</small>
+                    <h2 id="config-panel-title">Configuration</h2>
+                    <small id="config-section-description">Gérer les albums de la galerie.</small>
                 </div>
-                <button type="button" data-close-face-admin>&times;</button>
+                <button type="button" data-close-admin title="Fermer" aria-label="Fermer">&times;</button>
             </div>
-            <div class="face-admin-toolbar">
-                <label class="checkbox-field">
-                    <input id="face-automatic-scan" type="checkbox">
-                    <span>Analyser automatiquement les nouvelles photos</span>
-                </label>
-                <div class="face-scan-actions">
-                    <button id="scan-album-faces-button" type="button">Analyser cet album</button>
-                    <button id="scan-all-faces-button" type="button">Analyser toute la galerie</button>
-                    <button id="cancel-face-job-button" type="button" hidden>Annuler le travail</button>
-                    <button id="resume-face-job-button" type="button" hidden>Reprendre</button>
+            <div class="config-layout">
+                <nav class="config-sidebar" role="tablist" aria-label="Sections de configuration">
+                    <button class="config-nav-button is-active" type="button" role="tab" aria-selected="true"
+                            aria-controls="config-section-albums" data-config-section="albums">Albums</button>
+                    <button class="config-nav-button" type="button" role="tab" aria-selected="false"
+                            aria-controls="config-section-tags" data-config-section="tags">Tags</button>
+                    <button class="config-nav-button" type="button" role="tab" aria-selected="false"
+                            aria-controls="config-section-faces" data-config-section="faces">Reconnaissance faciale</button>
+                </nav>
+                <div class="config-content">
+                    <section class="config-section is-active" id="config-section-albums" role="tabpanel" data-config-panel="albums">
+                        <h3>Albums</h3>
+                        <p class="config-section-intro">Personnalisez le nom, le type et les tags de chaque album.</p>
+                        <div class="album-admin-list" id="album-admin-list"></div>
+                    </section>
+
+                    <section class="config-section" id="config-section-tags" role="tabpanel" data-config-panel="tags" hidden>
+                        <h3>Affectations automatiques</h3>
+                        <p class="config-section-intro">Associez un LoRA actif à un ou plusieurs tags ajoutés lors du prochain Scan JSON.</p>
+                        <form id="lora-tag-mapping-form" class="lora-tag-mapping-form">
+                            <label class="form-field">
+                                <span>LoRA</span>
+                                <select id="lora-tag-lora" required></select>
+                            </label>
+                            <label class="form-field">
+                                <span>Tags (séparés par des virgules)</span>
+                                <input id="lora-tag-name" type="text" placeholder="portrait, style..." required autocomplete="off">
+                            </label>
+                            <button id="lora-tag-add-button" type="submit">Ajouter</button>
+                        </form>
+                        <div class="comfy-status" id="lora-tag-mapping-status" role="status" aria-live="polite"></div>
+                        <div class="lora-tag-mapping-list" id="lora-tag-mapping-list"></div>
+                    </section>
+
+                    <section class="config-section" id="config-section-faces" role="tabpanel" data-config-panel="faces" hidden>
+                        <div class="config-section-heading">
+                            <div>
+                                <h3>Reconnaissance faciale</h3>
+                                <small id="face-engine-status">Vérification du moteur...</small>
+                            </div>
+                        </div>
+                        <div class="face-admin-toolbar">
+                            <label class="checkbox-field">
+                                <input id="face-automatic-scan" type="checkbox">
+                                <span>Analyser automatiquement les nouvelles photos</span>
+                            </label>
+                            <div class="face-scan-actions">
+                                <button id="scan-album-faces-button" type="button">Analyser cet album</button>
+                                <button id="scan-all-faces-button" type="button">Analyser toute la galerie</button>
+                                <button id="cancel-face-job-button" type="button" hidden>Annuler le travail</button>
+                                <button id="resume-face-job-button" type="button" hidden>Reprendre</button>
+                            </div>
+                        </div>
+                        <div class="face-admin-grid">
+                            <section>
+                                <h3>Identités et tags</h3>
+                                <form id="face-identity-create-form" class="face-identity-create-form">
+                                    <input id="face-identity-tag" type="text" placeholder="Nom du tag" required>
+                                    <button type="submit">Ajouter</button>
+                                </form>
+                                <div id="face-identity-list" class="face-identity-list"></div>
+                            </section>
+                            <section>
+                                <h3>Importer une référence</h3>
+                                <form id="face-reference-import-form" class="face-reference-import-form">
+                                    <label class="form-field">
+                                        <span>Identité cible</span>
+                                        <select id="face-reference-identity" required></select>
+                                    </label>
+                                    <label class="form-field">
+                                        <span>Portrait de référence</span>
+                                        <input id="face-reference-file" type="file" accept="image/jpeg,image/png,image/webp" required>
+                                    </label>
+                                    <button type="submit">Détecter les visages</button>
+                                </form>
+                                <div id="face-import-status" class="comfy-status"></div>
+                                <div id="face-import-candidates" class="face-reference-grid"></div>
+                            </section>
+                        </div>
+                    </section>
                 </div>
-            </div>
-            <div class="face-admin-grid">
-                <section>
-                    <h3>Identites et tags</h3>
-                    <form id="face-identity-create-form" class="face-identity-create-form">
-                        <input id="face-identity-tag" type="text" placeholder="Nom du tag" required>
-                        <button type="submit">Ajouter</button>
-                    </form>
-                    <div id="face-identity-list" class="face-identity-list"></div>
-                </section>
-                <section>
-                    <h3>Importer une reference</h3>
-                    <form id="face-reference-import-form" class="face-reference-import-form">
-                        <label class="form-field">
-                            <span>Identite cible</span>
-                            <select id="face-reference-identity" required></select>
-                        </label>
-                        <label class="form-field">
-                            <span>Portrait de reference</span>
-                            <input id="face-reference-file" type="file" accept="image/jpeg,image/png,image/webp" required>
-                        </label>
-                        <button type="submit">Detecter les visages</button>
-                    </form>
-                    <div id="face-import-status" class="comfy-status"></div>
-                    <div id="face-import-candidates" class="face-reference-grid"></div>
-                </section>
             </div>
         </section>
     </div>

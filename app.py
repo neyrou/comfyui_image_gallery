@@ -30,8 +30,10 @@ from gallery_db import (
     ALLOWED_ALBUM_TYPES,
     ALLOWED_LINK_TYPES,
     connect_db,
+    create_lora_tag_mapping,
     create_photo_link,
     delete_photo,
+    delete_lora_tag_mapping,
     discover_albums,
     ensure_thumbnail,
     find_photo_file,
@@ -45,12 +47,14 @@ from gallery_db import (
     list_album_tag_stats,
     list_albums,
     list_gallery_photos,
+    list_lora_tag_mappings,
     list_tags,
     output_paths_from_history,
     rescan_metadata,
     scan_albums,
     search_photos,
     set_photo_tags,
+    update_lora_tag_mapping,
     update_photo_tags,
     update_album,
     add_gallery_face_reference,
@@ -1306,6 +1310,66 @@ def api_tags():
     ensure_ready()
     with connect_db(DB_PATH) as conn:
         return jsonify({"ok": True, "tags": list_tags(conn)})
+
+
+@app.get("/api/lora-tag-mappings")
+def api_lora_tag_mappings():
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        mappings = list_lora_tag_mappings(conn)
+        loras = list_lora_catalog(conn)
+    return jsonify({"ok": True, "mappings": mappings, "loras": loras})
+
+
+@app.post("/api/lora-tag-mappings")
+def api_create_lora_tag_mapping():
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    lora_name = payload.get("lora_name")
+    tag_names = payload.get("tag_names")
+    if not isinstance(lora_name, str) or not lora_name.strip():
+        return jsonify({"ok": False, "error": "lora_name is required"}), 400
+    if not isinstance(tag_names, list):
+        return jsonify({"ok": False, "error": "tag_names must be a list"}), 400
+
+    with connect_db(DB_PATH) as conn:
+        catalog_names = {item["lora_name"] for item in list_lora_catalog(conn)}
+        if lora_name.strip() not in catalog_names:
+            return jsonify({"ok": False, "error": "Unknown LoRA"}), 400
+        try:
+            mapping = create_lora_tag_mapping(conn, lora_name, tag_names)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except KeyError as exc:
+            return jsonify({"ok": False, "error": exc.args[0]}), 409
+    return jsonify({"ok": True, "mapping": mapping}), 201
+
+
+@app.delete("/api/lora-tag-mappings/<int:mapping_id>")
+def api_delete_lora_tag_mapping(mapping_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        if not delete_lora_tag_mapping(conn, mapping_id):
+            return jsonify({"ok": False, "error": "LoRA tag mapping not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.patch("/api/lora-tag-mappings/<int:mapping_id>")
+def api_update_lora_tag_mapping(mapping_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    tag_names = payload.get("tag_names")
+    if not isinstance(tag_names, list):
+        return jsonify({"ok": False, "error": "tag_names must be a list"}), 400
+
+    with connect_db(DB_PATH) as conn:
+        try:
+            mapping = update_lora_tag_mapping(conn, mapping_id, tag_names)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except KeyError as exc:
+            return jsonify({"ok": False, "error": exc.args[0]}), 404
+    return jsonify({"ok": True, "mapping": mapping})
 
 
 @app.get("/api/face/status")

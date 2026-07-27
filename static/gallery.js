@@ -50,6 +50,10 @@ const state = {
     faceJobPollDone: null,
     faceJobStatusClosed: false,
     faceImport: null,
+    configSection: "albums",
+    loraTagMappings: [],
+    loraTagCatalog: [],
+    loraTagEditingId: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -1904,20 +1908,13 @@ async function setAutomaticFaceScan(event) {
     }
 }
 
-async function openFaceAdmin() {
-    $("#face-admin-modal").classList.add("open");
-    $("#face-admin-modal").setAttribute("aria-hidden", "false");
+async function loadFaceAdmin() {
     try {
         await Promise.all([refreshFaceStatus(), loadFaceIdentities()]);
     } catch (error) {
         $("#face-engine-status").textContent = error.message;
         $("#face-engine-status").classList.add("error");
     }
-}
-
-function closeFaceAdmin() {
-    $("#face-admin-modal")?.classList.remove("open");
-    $("#face-admin-modal")?.setAttribute("aria-hidden", "true");
 }
 
 function renderFaceIdentities() {
@@ -2118,15 +2115,202 @@ async function resumeFaceJob(jobId) {
     pollFaceJob(data.job.id);
 }
 
-function openAdmin() {
+function openAdmin(section = "albums") {
     renderAlbumAdmin();
     $("#admin-modal").classList.add("open");
     $("#admin-modal").setAttribute("aria-hidden", "false");
+    switchConfigSection(section).catch((error) => alert(error.message));
 }
 
 function closeAdmin() {
     $("#admin-modal").classList.remove("open");
     $("#admin-modal").setAttribute("aria-hidden", "true");
+}
+
+async function switchConfigSection(section) {
+    const descriptions = {
+        albums: "Gérer les albums de la galerie.",
+        tags: "Configurer les tags ajoutés automatiquement depuis les LoRA.",
+        faces: "Configurer l’analyse et l’identification des visages.",
+    };
+    if (!descriptions[section]) {
+        section = "albums";
+    }
+    state.configSection = section;
+    $$(".config-nav-button").forEach((button) => {
+        const isActive = button.dataset.configSection === section;
+        button.classList.toggle("is-active", isActive);
+        button.setAttribute("aria-selected", isActive ? "true" : "false");
+        button.tabIndex = isActive ? 0 : -1;
+    });
+    $$("[data-config-panel]").forEach((panel) => {
+        const isActive = panel.dataset.configPanel === section;
+        panel.hidden = !isActive;
+        panel.classList.toggle("is-active", isActive);
+    });
+    $("#config-section-description").textContent = descriptions[section];
+    if (section === "tags") {
+        await loadLoraTagMappings();
+    } else if (section === "faces") {
+        await loadFaceAdmin();
+    }
+}
+
+async function loadLoraTagMappings() {
+    const data = await fetchJson("/api/lora-tag-mappings");
+    state.loraTagMappings = data.mappings || [];
+    state.loraTagCatalog = data.loras || [];
+    renderLoraTagMappings();
+}
+
+function renderLoraTagMappings() {
+    const select = $("#lora-tag-lora");
+    const addButton = $("#lora-tag-add-button");
+    const list = $("#lora-tag-mapping-list");
+    const mappedNames = new Set(state.loraTagMappings.map((mapping) => mapping.lora_name));
+    const availableLoras = state.loraTagCatalog.filter((lora) => !mappedNames.has(lora.lora_name));
+
+    select.innerHTML = availableLoras.length
+        ? availableLoras.map((lora) => `
+            <option value="${escapeHtml(lora.lora_name)}">${escapeHtml(lora.lora_name)}</option>
+        `).join("")
+        : '<option value="">Aucun LoRA disponible</option>';
+    select.disabled = !availableLoras.length;
+    addButton.disabled = !availableLoras.length;
+
+    if (!state.loraTagMappings.length) {
+        list.innerHTML = '<p class="muted lora-tag-empty">Aucune affectation automatique configurée.</p>';
+        return;
+    }
+    list.innerHTML = state.loraTagMappings.map((mapping) => {
+        if (state.loraTagEditingId === mapping.id) {
+            const tagNames = (mapping.tags || []).map((tag) => tag.name).join(", ");
+            return `
+                <article class="lora-tag-mapping-card is-editing">
+                    <form class="lora-tag-edit-form" data-edit-lora-tag-mapping="${mapping.id}">
+                        <strong>${escapeHtml(mapping.lora_name)}</strong>
+                        <label class="form-field">
+                            <span>Tags (séparés par des virgules)</span>
+                            <input name="tag_names" type="text" value="${escapeHtml(tagNames)}" required autocomplete="off">
+                        </label>
+                        <div class="lora-tag-edit-actions">
+                            <button type="submit">Enregistrer</button>
+                            <button type="button" data-cancel-lora-tag-edit>Annuler</button>
+                        </div>
+                    </form>
+                </article>
+            `;
+        }
+        return `
+        <article class="lora-tag-mapping-card">
+            <div class="lora-tag-summary">
+                <strong>${escapeHtml(mapping.lora_name)}</strong>
+                <span class="lora-tag-arrow" aria-hidden="true">→</span>
+                <span class="lora-tag-values">${renderTags(mapping.tags)}</span>
+            </div>
+            <div class="lora-tag-card-actions">
+                <button class="lora-tag-edit-button" type="button" data-start-lora-tag-edit="${mapping.id}"
+                        title="Éditer l'affectation"
+                        aria-label="Éditer l'affectation de ${escapeHtml(mapping.lora_name)}">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 20h9"></path>
+                        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path>
+                    </svg>
+                </button>
+                <button class="lora-tag-delete-button" type="button" data-delete-lora-tag-mapping="${mapping.id}"
+                        title="Supprimer l'affectation" aria-label="Supprimer l'affectation de ${escapeHtml(mapping.lora_name)}">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"></path>
+                    </svg>
+                </button>
+            </div>
+        </article>
+    `;
+    }).join("");
+}
+
+function setLoraTagMappingStatus(message, isError = false) {
+    const status = $("#lora-tag-mapping-status");
+    status.textContent = message;
+    status.classList.toggle("error", isError);
+}
+
+async function createLoraTagMapping(event) {
+    event.preventDefault();
+    const loraName = $("#lora-tag-lora").value;
+    const tagNames = Array.from(new Set(tagsFromInput($("#lora-tag-name").value)));
+    if (!loraName || !tagNames.length) {
+        setLoraTagMappingStatus("Sélectionnez un LoRA et saisissez au moins un tag.", true);
+        return;
+    }
+    const done = setBusy($("#lora-tag-add-button"), "Ajout...");
+    try {
+        await fetchJson("/api/lora-tag-mappings", {
+            method: "POST",
+            body: JSON.stringify({ lora_name: loraName, tag_names: tagNames }),
+        });
+        $("#lora-tag-name").value = "";
+        await loadLoraTagMappings();
+        setLoraTagMappingStatus("Affectation ajoutée. Elle sera appliquée au prochain Scan JSON.");
+    } catch (error) {
+        setLoraTagMappingStatus(error.message, true);
+    } finally {
+        done();
+        renderLoraTagMappings();
+    }
+}
+
+async function deleteLoraTagMapping(mappingId) {
+    const button = $(`[data-delete-lora-tag-mapping="${mappingId}"]`);
+    const done = setBusy(button, "…");
+    try {
+        await fetchJson(`/api/lora-tag-mappings/${mappingId}`, { method: "DELETE" });
+        await loadLoraTagMappings();
+        setLoraTagMappingStatus("Affectation supprimée. Les photos seront mises à jour au prochain Scan JSON.");
+    } catch (error) {
+        setLoraTagMappingStatus(error.message, true);
+    } finally {
+        done();
+    }
+}
+
+function startLoraTagMappingEdit(mappingId) {
+    state.loraTagEditingId = mappingId;
+    renderLoraTagMappings();
+    const input = $(`[data-edit-lora-tag-mapping="${mappingId}"] input[name="tag_names"]`);
+    input?.focus();
+    input?.select();
+}
+
+function cancelLoraTagMappingEdit() {
+    state.loraTagEditingId = null;
+    renderLoraTagMappings();
+}
+
+async function updateLoraTagMapping(event) {
+    event.preventDefault();
+    const form = event.target;
+    const mappingId = Number(form.dataset.editLoraTagMapping);
+    const tagNames = Array.from(new Set(tagsFromInput(form.elements.tag_names.value)));
+    if (!tagNames.length) {
+        setLoraTagMappingStatus("Saisissez au moins un tag.", true);
+        return;
+    }
+    const submitButton = form.querySelector('button[type="submit"]');
+    const done = setBusy(submitButton, "Enregistrement...");
+    try {
+        await fetchJson(`/api/lora-tag-mappings/${mappingId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ tag_names: tagNames }),
+        });
+        state.loraTagEditingId = null;
+        await loadLoraTagMappings();
+        setLoraTagMappingStatus("Affectation modifiée. Elle sera appliquée au prochain Scan JSON.");
+    } catch (error) {
+        setLoraTagMappingStatus(error.message, true);
+    } finally {
+        done();
+    }
 }
 
 function renderAlbumAdmin() {
@@ -2302,8 +2486,7 @@ function bindEvents() {
         state.scanStatusClosed = true;
         $("#scan-status").hidden = true;
     });
-    $("#admin-button")?.addEventListener("click", openAdmin);
-    $("#face-admin-button")?.addEventListener("click", openFaceAdmin);
+    $("#admin-button")?.addEventListener("click", () => openAdmin());
     $("#selection-actions-button")?.addEventListener("click", (event) => {
         event.stopPropagation();
         toggleSelectionActionsMenu();
@@ -2551,9 +2734,35 @@ function bindEvents() {
             saveAlbum(event).catch((error) => alert(error.message));
         }
     });
+    $(".config-sidebar")?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-config-section]");
+        if (button) {
+            switchConfigSection(button.dataset.configSection).catch((error) => alert(error.message));
+        }
+    });
+    $("#lora-tag-mapping-form")?.addEventListener("submit", createLoraTagMapping);
+    $("#lora-tag-mapping-list")?.addEventListener("click", (event) => {
+        const editButton = event.target.closest("[data-start-lora-tag-edit]");
+        if (editButton) {
+            startLoraTagMappingEdit(Number(editButton.dataset.startLoraTagEdit));
+            return;
+        }
+        if (event.target.closest("[data-cancel-lora-tag-edit]")) {
+            cancelLoraTagMappingEdit();
+            return;
+        }
+        const deleteButton = event.target.closest("[data-delete-lora-tag-mapping]");
+        if (deleteButton) {
+            deleteLoraTagMapping(Number(deleteButton.dataset.deleteLoraTagMapping));
+        }
+    });
+    $("#lora-tag-mapping-list")?.addEventListener("submit", (event) => {
+        if (event.target.matches("[data-edit-lora-tag-mapping]")) {
+            updateLoraTagMapping(event);
+        }
+    });
     $("#tag-filter-list")?.addEventListener("click", chooseTagFilter);
     $$('[data-close-tag-filter]').forEach((button) => button.addEventListener("click", closeTagFilter));
-    $$('[data-close-face-admin]').forEach((button) => button.addEventListener("click", closeFaceAdmin));
     $("#face-identity-list")?.addEventListener("submit", (event) => {
         if (event.target.matches(".face-identity-card")) {
             saveFaceIdentity(event).catch((error) => alert(error.message));
@@ -2587,7 +2796,6 @@ function bindEvents() {
             closeAdmin();
             closeComfyModal();
             closeTagFilter();
-            closeFaceAdmin();
         }
         if ($("#photo-modal").classList.contains("open") && event.key === "ArrowRight") {
             navigate(1);
