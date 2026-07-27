@@ -54,6 +54,7 @@ const state = {
     loraTagMappings: [],
     loraTagCatalog: [],
     loraTagEditingId: null,
+    linkedStripIdleTimer: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -80,6 +81,7 @@ function escapeHtml(value) {
 
 const LONG_PRESS_DELAY = 500;
 const LONG_PRESS_MOVE_TOLERANCE = 10;
+const LINKED_STRIP_IDLE_DELAY = 3000;
 
 function selectedPhotoIds() {
     return Array.from(state.selectedPhotoIds);
@@ -334,6 +336,8 @@ function closePhotoModal(options = {}) {
     closePhotoActionsMenu();
     closeComfyModal();
     closeAlbumActionModal();
+    clearLinkedStripIdleTimer();
+    $("#linked-strip")?.classList.remove("is-hidden");
     modal.classList.remove("open");
     modal.setAttribute("aria-hidden", "true");
     state.photoModalHistoryActive = false;
@@ -544,14 +548,40 @@ function renderLinks(links) {
 function renderLinkedStrip(links) {
     const strip = $("#linked-strip");
     if (!links.length) {
+        clearLinkedStripIdleTimer();
+        strip.classList.remove("is-hidden");
         strip.innerHTML = "";
         return;
     }
     strip.innerHTML = links.map((link) => `
-        <button type="button" data-open-linked="${link.linked_photo_id}" title="${escapeHtml(link.type)}">
+        <button type="button"
+                class="linked-image--${link.type === "original" ? "origin" : "variant"}"
+                data-open-linked="${link.linked_photo_id}"
+                title="${escapeHtml(link.type)}">
             <img src="${link.thumbnail_url}" alt="${escapeHtml(link.filename)}">
         </button>
     `).join("");
+    showLinkedStripTemporarily();
+}
+
+function clearLinkedStripIdleTimer() {
+    if (state.linkedStripIdleTimer !== null) {
+        window.clearTimeout(state.linkedStripIdleTimer);
+        state.linkedStripIdleTimer = null;
+    }
+}
+
+function showLinkedStripTemporarily() {
+    const strip = $("#linked-strip");
+    clearLinkedStripIdleTimer();
+    if (!strip || !strip.children.length) {
+        return;
+    }
+    strip.classList.remove("is-hidden");
+    state.linkedStripIdleTimer = window.setTimeout(() => {
+        strip.classList.add("is-hidden");
+        state.linkedStripIdleTimer = null;
+    }, LINKED_STRIP_IDLE_DELAY);
 }
 
 async function rescanCurrentMetadata() {
@@ -2583,10 +2613,14 @@ function bindEvents() {
     $("#next-button")?.addEventListener("click", () => navigate(1));
     $("#play-button")?.addEventListener("click", toggleSlideshow);
     $("#details-toggle-button")?.addEventListener("click", toggleDetailsPanel);
-    $(".viewer-stage")?.addEventListener("touchstart", handleViewerTouchStart, { passive: true });
-    $(".viewer-stage")?.addEventListener("touchmove", handleViewerTouchMove, { passive: false });
-    $(".viewer-stage")?.addEventListener("touchend", handleViewerTouchEnd, { passive: true });
-    $(".viewer-stage")?.addEventListener("touchcancel", handleViewerTouchCancel, { passive: true });
+    const viewerStage = $(".viewer-stage");
+    viewerStage?.addEventListener("pointerenter", showLinkedStripTemporarily);
+    viewerStage?.addEventListener("pointermove", showLinkedStripTemporarily);
+    viewerStage?.addEventListener("pointerdown", showLinkedStripTemporarily);
+    viewerStage?.addEventListener("touchstart", handleViewerTouchStart, { passive: true });
+    viewerStage?.addEventListener("touchmove", handleViewerTouchMove, { passive: false });
+    viewerStage?.addEventListener("touchend", handleViewerTouchEnd, { passive: true });
+    viewerStage?.addEventListener("touchcancel", handleViewerTouchCancel, { passive: true });
     $$("[data-close-modal]").forEach((button) => button.addEventListener("click", closePhotoModal));
     $$("[data-close-admin]").forEach((button) => button.addEventListener("click", closeAdmin));
     $$("[data-close-comfy]").forEach((button) => button.addEventListener("click", closeComfyModal));

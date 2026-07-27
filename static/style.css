@@ -567,6 +567,19 @@ button:disabled {
     background: rgba(0, 0, 0, 0.42);
     box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
     pointer-events: none;
+    opacity: 1;
+    visibility: visible;
+    transition:
+        opacity 220ms ease,
+        visibility 0s linear;
+}
+
+.linked-strip.is-hidden {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+        opacity 220ms ease,
+        visibility 0s linear 220ms;
 }
 
 .linked-strip button {
@@ -578,6 +591,11 @@ button:disabled {
     border-color: rgba(255, 255, 255, 0.35);
     background: rgba(0, 0, 0, 0.35);
     pointer-events: auto;
+}
+
+.linked-strip button.linked-image--origin {
+    border-color: white;
+    border-style: dashed;
 }
 
 .linked-strip img,
