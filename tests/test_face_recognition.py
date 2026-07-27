@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -13,6 +14,7 @@ from gallery_db import (
     add_gallery_face_reference,
     connect_db,
     create_face_identity,
+    create_face_scan_job,
     decide_face_match,
     get_photo_detail,
     init_db,
@@ -20,6 +22,7 @@ from gallery_db import (
     rematch_photo_faces,
     replace_photo_faces,
     scan_albums,
+    set_face_setting,
     update_photo_tags,
 )
 
@@ -28,6 +31,9 @@ class FakeFaceEngine:
     model_name = "buffalo_l"
     model_version = "buffalo_l-v1"
     provider = "CPUExecutionProvider"
+
+    def __init__(self):
+        self.analyze_calls = 0
 
     def _load(self):
         return self
@@ -44,6 +50,7 @@ class FakeFaceEngine:
         }
 
     def analyze_path(self, _image_path):
+        self.analyze_calls += 1
         return [FaceDetection((2, 2, 22, 22), 0.99, (1.0, 0.0, 0.0))]
 
 
@@ -72,8 +79,9 @@ class FaceRecognitionTests(unittest.TestCase):
         app_module.IMAGES_ROOT = self.images_root
         app_module.THUMBNAIL_ROOT = self.thumbnails
         app_module.FACE_REFERENCE_ROOT = self.references
+        self.engine = FakeFaceEngine()
         app_module.FACE_ENGINE_FACTORY = FakeFaceEngine
-        app_module.FACE_ENGINE_INSTANCE = FakeFaceEngine()
+        app_module.FACE_ENGINE_INSTANCE = self.engine
         app_module.FACE_RECOVERED_DATABASES.clear()
 
     def tearDown(self):
@@ -235,6 +243,118 @@ class FaceRecognitionTests(unittest.TestCase):
         self.assertEqual(detail["tags"][0]["name"], "Alice")
         self.assertEqual(detail["tags"][0]["source"], "face_auto")
         self.assertEqual(detail["face_analysis"]["faces"][0]["match"]["state"], "automatic")
+
+    def test_face_job_force_option_bypasses_valid_cache(self):
+        create_png(self.images_root / "output" / "cached.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        client = app_module.app.test_client()
+
+        first = client.post("/api/face/jobs", json={"scope": "all", "sync": True})
+        cached = client.post("/api/face/jobs", json={"scope": "all", "sync": True})
+        forced = client.post("/api/face/jobs", json={"scope": "all", "sync": True, "force": True})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(cached.status_code, 200)
+        self.assertEqual(forced.status_code, 200)
+        self.assertEqual(self.engine.analyze_calls, 2)
+
+    def test_cancelling_queued_face_job_finishes_it_immediately(self):
+        create_png(self.images_root / "output" / "queued.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            create_face_scan_job(conn, "queued-job", "selection", [photo_id])
+
+        cancelled = app_module.request_face_job_cancel("queued-job")
+
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertFalse(cancelled["active"])
+        with connect_db(self.db_path) as conn:
+            create_face_scan_job(conn, "running-job", "selection", [photo_id])
+            conn.execute("UPDATE face_scan_jobs SET state='running' WHERE id='running-job'")
+        running = app_module.request_face_job_cancel("running-job")
+        self.assertEqual(running["state"], "cancel_requested")
+        self.assertTrue(running["active"])
+
+    def test_scan_cancel_propagates_to_queued_face_child(self):
+        create_png(self.images_root / "output" / "child.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            create_face_scan_job(
+                conn,
+                "child-job",
+                "selection",
+                [photo_id],
+                params={"parent_scan_job_id": "parent-job"},
+            )
+        original = app_module.scan_status_snapshot()
+        try:
+            with app_module.SCAN_LOCK:
+                app_module.SCAN_STATUS.update(
+                    {
+                        "active": True,
+                        "job_id": "parent-job",
+                        "state": "running",
+                        "cancel_requested": False,
+                        "face_job_id": "child-job",
+                    }
+                )
+            response = app_module.app.test_client().post("/api/scan/jobs/parent-job/cancel", json={})
+            with connect_db(self.db_path) as conn:
+                child = conn.execute(
+                    "SELECT state FROM face_scan_jobs WHERE id='child-job'"
+                ).fetchone()["state"]
+            self.assertEqual(response.status_code, 202)
+            self.assertEqual(child, "cancelled")
+        finally:
+            with app_module.SCAN_LOCK:
+                app_module.SCAN_STATUS.clear()
+                app_module.SCAN_STATUS.update(original)
+
+    def test_explicit_face_scan_does_not_duplicate_automatic_job(self):
+        create_png(self.images_root / "output" / "one.png")
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            set_face_setting(conn, "automatic_scan", True)
+        client = app_module.app.test_client()
+
+        response = client.post(
+            "/api/scan",
+            json={
+                "sync": True,
+                "rescan_existing": False,
+                "face_recognition": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        with connect_db(self.db_path) as conn:
+            jobs = conn.execute("SELECT COUNT(*) AS total FROM face_scan_jobs").fetchone()["total"]
+        self.assertEqual(jobs, 1)
+        self.assertEqual(self.engine.analyze_calls, 1)
+
+    def test_automatic_face_setting_still_applies_when_modal_option_is_false(self):
+        create_png(self.images_root / "output" / "automatic.png")
+        init_db(self.db_path)
+        with connect_db(self.db_path) as conn:
+            set_face_setting(conn, "automatic_scan", True)
+        client = app_module.app.test_client()
+
+        with patch("app.start_face_worker"):
+            response = client.post(
+                "/api/scan",
+                json={
+                    "sync": True,
+                    "rescan_existing": False,
+                    "face_recognition": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        with connect_db(self.db_path) as conn:
+            job = conn.execute("SELECT scope, state FROM face_scan_jobs").fetchone()
+        self.assertEqual(dict(job), {"scope": "automatic", "state": "queued"})
 
     def test_reference_upload_requires_selection_and_stays_outside_static(self):
         init_db(self.db_path)

@@ -19,6 +19,10 @@ ALBUM_PATH_RETRY_DELAYS = (0.15, 0.35)
 ALBUM_PATH_UNAVAILABLE_PREFIX = "Album path is unavailable:"
 
 
+class ScanCancelled(RuntimeError):
+    pass
+
+
 class GalleryConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
         try:
@@ -355,12 +359,22 @@ def scan_albums(
     images_root,
     thumbnail_root,
     scan_metadata=False,
+    rescan_existing=True,
     progress_callback=None,
+    cancel_callback=None,
     commit_interval=25,
     album_name=None,
 ):
     init_db(db_path)
-    summary = {"albums": 0, "photos": 0, "errors": []}
+    summary = {
+        "albums": 0,
+        "photos": 0,
+        "processed": 0,
+        "skipped": 0,
+        "missing": 0,
+        "processed_photo_ids": [],
+        "errors": [],
+    }
     with connect_db(db_path) as conn:
         discover_albums(conn, images_root)
         conn.commit()
@@ -372,6 +386,7 @@ def scan_albums(
                 raise ValueError(f"Album introuvable: {album_name}")
             albums = [album]
         for album in albums:
+            _raise_if_scan_cancelled(cancel_callback)
             _report_scan_progress(
                 progress_callback,
                 event="album_start",
@@ -380,16 +395,32 @@ def scan_albums(
                 photos=summary["photos"],
             )
             print(f"[scan] album '{album['name']}' start: {album['path']}", flush=True)
+
+            def report_album_progress(progress):
+                payload = dict(progress)
+                if "processed" in payload:
+                    payload["processed"] += summary["processed"]
+                if "skipped" in payload:
+                    payload["skipped"] += summary["skipped"]
+                if progress_callback:
+                    progress_callback(payload)
+
             result = scan_album(
                 conn,
                 album,
                 thumbnail_root,
                 scan_metadata=scan_metadata,
-                progress_callback=progress_callback,
+                rescan_existing=rescan_existing,
+                progress_callback=report_album_progress,
+                cancel_callback=cancel_callback,
                 commit_interval=commit_interval,
             )
             summary["albums"] += 1
             summary["photos"] += result["photos"]
+            summary["processed"] += result["processed"]
+            summary["skipped"] += result["skipped"]
+            summary["missing"] += result["missing"]
+            summary["processed_photo_ids"].extend(result["processed_photo_ids"])
             if result["error"]:
                 summary["errors"].append({"album": album["name"], "error": result["error"]})
             conn.commit()
@@ -405,24 +436,81 @@ def scan_albums(
                 message=f"Album {album['name']} termine",
                 album_photos=result["photos"],
                 photos=summary["photos"],
+                processed=summary["processed"],
+                skipped=summary["skipped"],
                 error=result["error"],
             )
+    summary["processed_photo_ids"] = list(dict.fromkeys(summary["processed_photo_ids"]))
     return summary
 
 
-def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callback=None, commit_interval=25):
+def scan_album(
+    conn,
+    album,
+    thumbnail_root,
+    scan_metadata=False,
+    rescan_existing=True,
+    progress_callback=None,
+    cancel_callback=None,
+    commit_interval=25,
+):
     album_path = Path(album["path"])
     seen_keys = set()
     protected_keys = set()
+    processed_photo_ids = []
     count = 0
+    processed = 0
+    skipped = 0
     error = None
 
     try:
         for image_path in _iter_image_files(album_path):
+            _raise_if_scan_cancelled(cancel_callback)
             relative_path = None
             try:
                 relative_path = image_path.relative_to(album_path).as_posix()
                 stat = image_path.stat()
+                existing_rows = conn.execute(
+                    """
+                    SELECT photo_id, relative_path, mtime, file_size
+                    FROM album_photos
+                    WHERE album_id=? AND relative_path=?
+                    """,
+                    (album["id"], relative_path),
+                ).fetchall()
+                unchanged = next(
+                    (
+                        row
+                        for row in existing_rows
+                        if row["file_size"] == stat.st_size and row["mtime"] == stat.st_mtime
+                    ),
+                    None,
+                )
+                if not rescan_existing and unchanged:
+                    conn.execute(
+                        """
+                        UPDATE album_photos
+                        SET filename=?, is_missing=0, updated_at=CURRENT_TIMESTAMP
+                        WHERE album_id=? AND photo_id=? AND relative_path=?
+                        """,
+                        (image_path.name, album["id"], unchanged["photo_id"], relative_path),
+                    )
+                    seen_keys.add((unchanged["photo_id"], relative_path))
+                    count += 1
+                    skipped += 1
+                    if count == 1 or count % commit_interval == 0:
+                        conn.commit()
+                        _report_scan_progress(
+                            progress_callback,
+                            event="file",
+                            album=album["name"],
+                            file=relative_path,
+                            album_photos=count,
+                            processed=processed,
+                            skipped=skipped,
+                            message=f"{album['name']}: {count} photos",
+                        )
+                    continue
                 checksum = checksum_file(image_path)
                 width, height = image_size(image_path)
                 photo_id = upsert_photo(conn, checksum, width, height, stat.st_size)
@@ -444,6 +532,8 @@ def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callba
                 if scan_metadata:
                     rescan_metadata(conn, photo_id, image_path)
                 count += 1
+                processed += 1
+                processed_photo_ids.append(photo_id)
                 if count == 1 or count % commit_interval == 0:
                     conn.commit()
                     print(f"[scan] {album['name']}: {count} photos, current: {relative_path}", flush=True)
@@ -453,6 +543,8 @@ def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callba
                         album=album["name"],
                         file=relative_path,
                         album_photos=count,
+                        processed=processed,
+                        skipped=skipped,
                         message=f"{album['name']}: {count} photos",
                     )
             except (OSError, ValueError) as exc:
@@ -479,12 +571,21 @@ def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callba
             (error, album["id"]),
         )
         conn.commit()
-        return {"photos": count, "error": error}
+        return {
+            "photos": count,
+            "processed": processed,
+            "skipped": skipped,
+            "missing": 0,
+            "processed_photo_ids": list(dict.fromkeys(processed_photo_ids)),
+            "error": error,
+        }
 
+    _raise_if_scan_cancelled(cancel_callback)
     conn.commit()
     rows = conn.execute("SELECT photo_id, relative_path FROM album_photos WHERE album_id=?", (album["id"],)).fetchall()
     missing_count = 0
     for row in rows:
+        _raise_if_scan_cancelled(cancel_callback)
         key = (row["photo_id"], row["relative_path"])
         if key not in seen_keys and key not in protected_keys:
             conn.execute(
@@ -499,7 +600,14 @@ def scan_album(conn, album, thumbnail_root, scan_metadata=False, progress_callba
         (error, album["id"]),
     )
     conn.commit()
-    return {"photos": count, "error": error}
+    return {
+        "photos": count,
+        "processed": processed,
+        "skipped": skipped,
+        "missing": missing_count,
+        "processed_photo_ids": list(dict.fromkeys(processed_photo_ids)),
+        "error": error,
+    }
 
 
 def _report_scan_progress(progress_callback, **payload):
@@ -508,6 +616,11 @@ def _report_scan_progress(progress_callback, **payload):
             progress_callback({"updated_at": time.time(), **payload})
         except Exception as exc:
             print(f"[scan] progress callback error: {exc}", flush=True)
+
+
+def _raise_if_scan_cancelled(cancel_callback):
+    if cancel_callback and cancel_callback():
+        raise ScanCancelled("Scan annule")
 
 
 def _iter_image_files(root):

@@ -5,6 +5,8 @@ const state = {
     playTimer: null,
     scanPollTimer: null,
     scanStatusClosed: false,
+    scanJob: null,
+    scanBusyDone: null,
     detailsVisible: window.localStorage.getItem("gallery.detailsVisible") === "true",
     comfyAvailable: false,
     comfyOptions: null,
@@ -82,6 +84,7 @@ function escapeHtml(value) {
 const LONG_PRESS_DELAY = 500;
 const LONG_PRESS_MOVE_TOLERANCE = 10;
 const LINKED_STRIP_IDLE_DELAY = 3000;
+const SCAN_OPTIONS_STORAGE_KEY = "gallery.scanOptions.v1";
 
 function selectedPhotoIds() {
     return Array.from(state.selectedPhotoIds);
@@ -1832,6 +1835,10 @@ function renderFaceJobStatus(job, options = {}) {
     if (!box || !job) {
         return;
     }
+    if (job.params?.parent_scan_job_id) {
+        box.hidden = true;
+        return;
+    }
     if (!options.force && !job.active && job.state !== "error") {
         return;
     }
@@ -1839,6 +1846,7 @@ function renderFaceJobStatus(job, options = {}) {
         return;
     }
     box.hidden = false;
+    box.dataset.jobId = job.id;
     box.dataset.state = job.state;
     $("#face-job-status-title").textContent = job.state === "done" ? "Visages analyses"
         : job.state === "error" ? "Reconnaissance en erreur"
@@ -1848,12 +1856,12 @@ function renderFaceJobStatus(job, options = {}) {
     const percent = job.total ? Math.round((job.processed / job.total) * 100) : 0;
     $("#face-job-status-detail").textContent = `${job.processed}/${job.total} (${percent} %) · ${job.recognized} reconnu(s) · ${job.pending} a confirmer · ${job.errors_count} erreur(s)`;
     $("#face-job-status-close").hidden = Boolean(job.active);
-    const cancel = $("#cancel-face-job-button");
+    const cancelButtons = [$("#cancel-face-job-button"), $("#face-job-status-cancel")].filter(Boolean);
     const resume = $("#resume-face-job-button");
-    if (cancel) {
+    cancelButtons.forEach((cancel) => {
         cancel.hidden = !job.active || job.state === "cancel_requested";
         cancel.dataset.jobId = job.id;
-    }
+    });
     if (resume) {
         resume.hidden = !["error", "cancelled"].includes(job.state);
         resume.dataset.jobId = job.id;
@@ -2378,61 +2386,131 @@ async function saveAlbum(event) {
     renderAlbumAdmin();
 }
 
-function closeScanActionsMenu() {
-    const menu = $("#scan-actions-menu");
-    const button = $("#scan-button");
-    if (menu) {
-        menu.hidden = true;
-    }
-    if (button) {
-        button.setAttribute("aria-expanded", "false");
+function savedScanOptions() {
+    try {
+        return JSON.parse(window.localStorage.getItem(SCAN_OPTIONS_STORAGE_KEY) || "{}");
+    } catch (_error) {
+        return {};
     }
 }
 
-function toggleScanActionsMenu() {
-    const menu = $("#scan-actions-menu");
-    const button = $("#scan-button");
-    if (!menu || !button || button.disabled) {
+function setScanOptionsStatus(message, isError = false) {
+    const status = $("#scan-options-status");
+    if (!status) {
         return;
     }
-    const willOpen = menu.hidden;
-    menu.hidden = !willOpen;
-    button.setAttribute("aria-expanded", willOpen ? "true" : "false");
+    status.textContent = message || "";
+    status.classList.toggle("error", Boolean(isError));
 }
 
-async function scanAlbums(albumName = null) {
-    closeScanActionsMenu();
-    const done = setBusy($("#scan-button"), "…");
+function updateScanForceOptionVisibility() {
+    const fullScan = $('[name="scan-existing-mode"]:checked')?.value === "full";
+    const faces = $("#scan-options-faces")?.checked;
+    const row = $("#scan-options-force-faces-row");
+    if (row) {
+        row.hidden = !(fullScan && faces);
+    }
+}
+
+function openScanOptionsModal() {
+    const modal = $("#scan-options-modal");
+    if (!modal || $("#scan-button")?.disabled) {
+        return;
+    }
+    const saved = savedScanOptions();
+    const scope = $("#scan-options-scope");
+    const currentAvailable = Boolean(state.selectedAlbum?.name);
+    scope.value = saved.scope === "all" || !currentAvailable ? "all" : "current";
+    const mode = saved.rescan_existing ? "full" : "incremental";
+    const modeInput = $(`[name="scan-existing-mode"][value="${mode}"]`);
+    if (modeInput) {
+        modeInput.checked = true;
+    }
+    $("#scan-options-metadata").checked = Boolean(saved.metadata);
+    $("#scan-options-faces").checked = Boolean(saved.face_recognition);
+    $("#scan-options-force-faces").checked = Boolean(saved.force_face_rescan);
+    $("#scan-options-image-analysis").checked = false;
+    updateScanForceOptionVisibility();
+    setScanOptionsStatus("");
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+    scope.focus();
+}
+
+function closeScanOptionsModal() {
+    const modal = $("#scan-options-modal");
+    modal?.classList.remove("open");
+    modal?.setAttribute("aria-hidden", "true");
+}
+
+function scanOptionsFromForm() {
+    const rescanExisting = $('[name="scan-existing-mode"]:checked')?.value === "full";
+    const faceRecognition = $("#scan-options-faces").checked;
+    return {
+        scope: $("#scan-options-scope").value,
+        album: $("#scan-options-scope").value === "current" ? state.selectedAlbum?.name || null : null,
+        rescan_existing: rescanExisting,
+        metadata: $("#scan-options-metadata").checked,
+        face_recognition: faceRecognition,
+        force_face_rescan: Boolean(faceRecognition && rescanExisting && $("#scan-options-force-faces").checked),
+        image_analysis: false,
+    };
+}
+
+async function submitScanOptions(event) {
+    event.preventDefault();
+    const options = scanOptionsFromForm();
+    const done = setBusy($("#scan-options-submit"), "Lancement…", { spinner: true });
+    setScanOptionsStatus("");
     try {
         state.scanStatusClosed = false;
         const data = await fetchJson("/api/scan", {
             method: "POST",
-            body: JSON.stringify({ metadata: false, album: albumName }),
+            body: JSON.stringify(options),
         });
+        if (data.already_running) {
+            state.scanJob = data.job;
+            renderScanStatus(data.job, { force: true });
+            startScanPolling();
+            setScanOptionsStatus("Un scan est déjà en cours.", true);
+            return;
+        }
+        try {
+            window.localStorage.setItem(SCAN_OPTIONS_STORAGE_KEY, JSON.stringify(options));
+        } catch (_error) {
+            // A disabled or full local storage must not hide a successfully started job.
+        }
+        closeScanOptionsModal();
         renderScanStatus(data.job, { force: true });
-        startScanPolling(done);
+        startScanPolling();
     } catch (error) {
-        alert(error.message);
+        setScanOptionsStatus(error.message, true);
+    } finally {
         done();
     }
 }
 
-function startScanPolling(done) {
+function startScanPolling() {
     window.clearInterval(state.scanPollTimer);
+    if (!state.scanBusyDone) {
+        state.scanBusyDone = setBusy($("#scan-button"), "…");
+    }
     state.scanPollTimer = window.setInterval(async () => {
         try {
             const data = await fetchJson("/api/scan/status");
             renderScanStatus(data.job, { force: true });
             if (!data.job.active) {
                 window.clearInterval(state.scanPollTimer);
-                done();
+                state.scanBusyDone?.();
+                state.scanBusyDone = null;
                 if (data.job.state === "done") {
                     window.location.reload();
                 }
             }
         } catch (error) {
             window.clearInterval(state.scanPollTimer);
-            done();
+            state.scanBusyDone?.();
+            state.scanBusyDone = null;
             alert(error.message);
         }
     }, 1000);
@@ -2449,20 +2527,38 @@ function renderScanStatus(job, options = {}) {
     if (state.scanStatusClosed && !job.active) {
         return;
     }
+    state.scanJob = job;
     box.hidden = false;
     box.dataset.state = job.state || "running";
-    $("#scan-status-title").textContent = job.state === "done" ? "Scan termine" : job.state === "error" ? "Scan en erreur" : "Scan en cours";
+    $("#scan-status-title").textContent = job.state === "done" ? "Scan terminé"
+        : job.state === "error" ? "Scan en erreur"
+        : job.state === "cancelled" ? "Scan annulé"
+        : job.state === "cancel_requested" ? "Arrêt du scan"
+        : job.stage === "faces" ? "Reconnaissance faciale"
+        : "Scan en cours";
     $("#scan-status-message").textContent = job.message || "Scan...";
     $("#scan-status-close").hidden = Boolean(job.active);
+    const cancel = $("#scan-status-cancel");
+    cancel.hidden = !job.active;
+    cancel.disabled = job.state === "cancel_requested";
+    cancel.textContent = job.state === "cancel_requested" ? "Arrêt…" : "Arrêter";
     const details = [];
+    if (job.stage) {
+        details.push(`étape: ${job.stage === "faces" ? "visages" : job.stage}`);
+    }
     if (job.album) {
         details.push(`album: ${job.album}`);
     }
     if (job.file) {
         details.push(`fichier: ${job.file}`);
     }
-    if (job.album_photos || job.photos) {
+    if (job.processed || job.skipped) {
+        details.push(`traitées: ${job.processed || 0} · ignorées: ${job.skipped || 0}`);
+    } else if (job.album_photos || job.photos) {
         details.push(`images: ${job.album_photos || 0} album / ${job.photos || 0} total`);
+    }
+    if (job.face_job) {
+        details.push(`visages: ${job.face_job.processed || 0}/${job.face_job.total || 0}`);
     }
     if (job.errors && job.errors.length) {
         details.push(`erreurs: ${job.errors.length}`);
@@ -2470,13 +2566,29 @@ function renderScanStatus(job, options = {}) {
     $("#scan-status-detail").textContent = details.join(" | ");
 }
 
+async function cancelScanJob() {
+    const job = state.scanJob;
+    if (!job?.active || job.state === "cancel_requested") {
+        return;
+    }
+    try {
+        const data = await fetchJson(`/api/scan/jobs/${job.job_id}/cancel`, {
+            method: "POST",
+            body: "{}",
+        });
+        renderScanStatus(data.job, { force: true });
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
 async function resumeScanStatusIfNeeded() {
     try {
         const data = await fetchJson("/api/scan/status");
+        state.scanJob = data.job;
         if (data.job.active) {
-            const done = setBusy($("#scan-button"), "…");
             renderScanStatus(data.job, { force: true });
-            startScanPolling(done);
+            startScanPolling();
         }
     } catch (_error) {
         // Scan status is non-critical during initial page load.
@@ -2511,7 +2623,12 @@ function bindEvents() {
         window.location.href = `?album=${encodeURIComponent(event.target.value)}&page=1`;
     });
     $("#filter-button")?.addEventListener("click", openTagFilter);
-    $("#scan-button")?.addEventListener("click", toggleScanActionsMenu);
+    $("#scan-button")?.addEventListener("click", openScanOptionsModal);
+    $("#scan-options-form")?.addEventListener("submit", submitScanOptions);
+    $$("[data-close-scan-options]").forEach((button) => button.addEventListener("click", closeScanOptionsModal));
+    $$('[name="scan-existing-mode"]').forEach((input) => input.addEventListener("change", updateScanForceOptionVisibility));
+    $("#scan-options-faces")?.addEventListener("change", updateScanForceOptionVisibility);
+    $("#scan-status-cancel")?.addEventListener("click", cancelScanJob);
     $("#scan-status-close")?.addEventListener("click", () => {
         state.scanStatusClosed = true;
         $("#scan-status").hidden = true;
@@ -2534,6 +2651,9 @@ function bindEvents() {
         startFaceJob("all").catch((error) => alert(error.message));
     });
     $("#cancel-face-job-button")?.addEventListener("click", (event) => {
+        cancelFaceJob(event.currentTarget.dataset.jobId).catch((error) => alert(error.message));
+    });
+    $("#face-job-status-cancel")?.addEventListener("click", (event) => {
         cancelFaceJob(event.currentTarget.dataset.jobId).catch((error) => alert(error.message));
     });
     $("#resume-face-job-button")?.addEventListener("click", (event) => {
@@ -2662,14 +2782,6 @@ function bindEvents() {
         }
         if (!event.target.closest(".selection-actions")) {
             closeSelectionActionsMenu();
-        }
-        if (!event.target.closest(".scan-actions")) {
-            closeScanActionsMenu();
-        }
-        const scanAction = event.target.closest("[data-scan-scope]");
-        if (scanAction && !scanAction.disabled) {
-            const albumName = scanAction.dataset.scanScope === "current" ? state.selectedAlbum?.name : null;
-            scanAlbums(albumName);
         }
         const batchAction = event.target.closest("[data-batch-action]");
         if (batchAction) {
@@ -2805,8 +2917,8 @@ function bindEvents() {
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
-            if (!$("#scan-actions-menu")?.hidden) {
-                closeScanActionsMenu();
+            if ($("#scan-options-modal")?.classList.contains("open")) {
+                closeScanOptionsModal();
                 return;
             }
             if (!$("#selection-actions-menu")?.hidden) {

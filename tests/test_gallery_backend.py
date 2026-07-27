@@ -8,7 +8,9 @@ from unittest.mock import patch
 from PIL import Image, PngImagePlugin
 
 import app as app_module
+import gallery_db as gallery_db_module
 from gallery_db import (
+    ScanCancelled,
     connect_db,
     find_photo_file,
     get_album_by_name,
@@ -578,9 +580,141 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertNotIn('id="face-admin-modal"', html)
         self.assertIn('id="admin-modal"', html)
         self.assertIn('id="detail-faces"', html)
-        self.assertIn('id="scan-actions-menu"', html)
-        self.assertIn('data-scan-scope="all"', html)
-        self.assertIn('data-scan-scope="current"', html)
+        self.assertIn('id="scan-options-modal"', html)
+        self.assertIn('id="scan-options-scope"', html)
+        self.assertIn('id="scan-options-metadata"', html)
+        self.assertIn('id="scan-options-faces"', html)
+        self.assertIn('id="scan-options-force-faces"', html)
+        self.assertIn('id="scan-options-image-analysis" type="checkbox" disabled', html)
+        self.assertIn('id="scan-status-cancel"', html)
+
+    def test_incremental_scan_skips_unchanged_reprocesses_modified_and_marks_deleted(self):
+        unchanged = self.images_root / "output" / "unchanged.png"
+        modified = self.images_root / "output" / "modified.png"
+        deleted = self.images_root / "output" / "deleted.png"
+        create_png(unchanged)
+        create_png(modified, color=(30, 50, 70))
+        create_png(deleted, color=(70, 50, 30))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        create_png(modified, color=(90, 20, 40))
+        current_mtime = modified.stat().st_mtime
+        os.utime(modified, (current_mtime + 5, current_mtime + 5))
+        deleted.unlink()
+
+        with patch("gallery_db.checksum_file", wraps=gallery_db_module.checksum_file) as checksum:
+            summary = scan_albums(
+                self.db_path,
+                self.images_root,
+                self.thumbnails,
+                rescan_existing=False,
+            )
+
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["missing"], 2)
+        self.assertEqual(checksum.call_count, 1)
+        with connect_db(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT filename, is_missing FROM album_photos WHERE album_id=(SELECT id FROM albums WHERE name='output')"
+            ).fetchall()
+        states = {}
+        for row in rows:
+            states.setdefault(row["filename"], []).append(row["is_missing"])
+        self.assertEqual(states["unchanged.png"], [0])
+        self.assertEqual(sorted(states["modified.png"]), [0, 1])
+        self.assertEqual(states["deleted.png"], [1])
+
+    def test_incremental_json_scan_skips_metadata_until_full_rescan(self):
+        image_path = self.images_root / "output" / "metadata.png"
+        create_png(image_path, prompt="stored prompt")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        incremental = scan_albums(
+            self.db_path,
+            self.images_root,
+            self.thumbnails,
+            scan_metadata=True,
+            rescan_existing=False,
+        )
+        with connect_db(self.db_path) as conn:
+            self.assertIsNone(conn.execute("SELECT prompt FROM photo_metadata").fetchone())
+
+        full = scan_albums(
+            self.db_path,
+            self.images_root,
+            self.thumbnails,
+            scan_metadata=True,
+            rescan_existing=True,
+        )
+        with connect_db(self.db_path) as conn:
+            metadata_count = conn.execute("SELECT COUNT(*) AS total FROM photo_metadata").fetchone()["total"]
+        self.assertEqual(incremental["skipped"], 1)
+        self.assertEqual(full["processed"], 1)
+        self.assertEqual(metadata_count, 1)
+
+    def test_cancelled_scan_does_not_mark_unvisited_membership_missing(self):
+        kept = self.images_root / "output" / "a-kept.png"
+        removed = self.images_root / "output" / "z-removed.png"
+        create_png(kept)
+        create_png(removed, color=(70, 50, 30))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        removed.unlink()
+        checks = {"count": 0}
+
+        def cancel_after_traversal():
+            checks["count"] += 1
+            return checks["count"] >= 3
+
+        with self.assertRaises(ScanCancelled):
+            scan_albums(
+                self.db_path,
+                self.images_root,
+                self.thumbnails,
+                rescan_existing=False,
+                cancel_callback=cancel_after_traversal,
+                album_name="output",
+            )
+
+        with connect_db(self.db_path) as conn:
+            missing = conn.execute(
+                "SELECT is_missing FROM album_photos WHERE filename='z-removed.png'"
+            ).fetchone()["is_missing"]
+        self.assertEqual(missing, 0)
+
+    def test_scan_api_validates_options_and_cancel_is_idempotent(self):
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+
+        unsupported = client.post("/api/scan", json={"image_analysis": True})
+        invalid = client.post("/api/scan", json={"metadata": "yes"})
+        self.assertEqual(unsupported.status_code, 400)
+        self.assertEqual(invalid.status_code, 400)
+
+        original = app_module.scan_status_snapshot()
+        try:
+            app_module.SCAN_STATUS.update(
+                {
+                    "active": True,
+                    "job_id": "scan-test",
+                    "state": "running",
+                    "cancel_requested": False,
+                    "face_job_id": None,
+                }
+            )
+            first = client.post("/api/scan/jobs/scan-test/cancel", json={})
+            second = client.post("/api/scan/jobs/scan-test/cancel", json={})
+            missing = client.post("/api/scan/jobs/missing/cancel", json={})
+            self.assertEqual(first.status_code, 202)
+            self.assertEqual(second.status_code, 202)
+            self.assertEqual(first.get_json()["job"]["state"], "cancel_requested")
+            self.assertEqual(missing.status_code, 404)
+        finally:
+            with app_module.SCAN_LOCK:
+                app_module.SCAN_STATUS.clear()
+                app_module.SCAN_STATUS.update(original)
 
     def test_album_tag_stats_and_gallery_filters(self):
         output_files = {

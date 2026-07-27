@@ -29,6 +29,7 @@ from comfy_generation import (
 from gallery_db import (
     ALLOWED_ALBUM_TYPES,
     ALLOWED_LINK_TYPES,
+    ScanCancelled,
     connect_db,
     create_lora_tag_mapping,
     create_photo_link,
@@ -104,12 +105,19 @@ SCAN_STATUS = {
     "active": False,
     "job_id": None,
     "state": "idle",
+    "stage": None,
     "message": "Aucun scan en cours",
     "album": None,
     "file": None,
     "photos": 0,
     "album_photos": 0,
+    "processed": 0,
+    "skipped": 0,
     "errors": [],
+    "options": {},
+    "cancel_requested": False,
+    "face_job_id": None,
+    "face_job": None,
     "started_at": None,
     "updated_at": None,
     "finished_at": None,
@@ -228,6 +236,8 @@ def run_face_job(job_id):
                     (job_id,),
                 )
                 return get_face_scan_job(conn, job_id)
+            if job["state"] not in {"queued", "running"}:
+                return job
             item = conn.execute(
                 "SELECT photo_id FROM face_scan_items WHERE job_id=? AND state='queued' ORDER BY photo_id LIMIT 1",
                 (job_id,),
@@ -257,8 +267,11 @@ def run_face_job(job_id):
                 image_path = find_photo_file(conn, photo_id) if mode == "detect" else None
                 if mode == "detect" and not image_path:
                     raise ValueError("No file found for this photo")
-                cached = mode == "match" or photo_face_cache_valid(
-                    conn, photo_id, photo["checksum"], engine.model_name, engine.model_version
+                cached = mode == "match" or (
+                    not job["params"].get("force", False)
+                    and photo_face_cache_valid(
+                        conn, photo_id, photo["checksum"], engine.model_name, engine.model_version
+                    )
                 )
             if mode == "detect" and not cached:
                 detections = engine.analyze_path(image_path)
@@ -312,6 +325,33 @@ def enqueue_face_job(scope, photo_ids, mode="detect", params=None, sync=False):
     return job
 
 
+def request_face_job_cancel(job_id):
+    with connect_db(DB_PATH) as conn:
+        job = get_face_scan_job(conn, job_id)
+        if not job:
+            return None
+        conn.execute(
+            """
+            UPDATE face_scan_jobs
+            SET state=CASE state
+                    WHEN 'queued' THEN 'cancelled'
+                    WHEN 'running' THEN 'cancel_requested'
+                    ELSE state
+                END,
+                message=CASE state
+                    WHEN 'queued' THEN 'Analyse annulee'
+                    WHEN 'running' THEN 'Annulation demandee'
+                    ELSE message
+                END,
+                finished_at=CASE WHEN state='queued' THEN CURRENT_TIMESTAMP ELSE finished_at END,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND state IN ('queued', 'running')
+            """,
+            (job_id,),
+        )
+        return get_face_scan_job(conn, job_id)
+
+
 def enqueue_rematch_all(sync=False):
     with connect_db(DB_PATH) as conn:
         photo_ids = photo_ids_for_face_scope(conn, "rematch", mode="match")
@@ -320,7 +360,7 @@ def enqueue_rematch_all(sync=False):
     return enqueue_face_job("rematch", photo_ids, mode="match", sync=sync)
 
 
-def enqueue_automatic_face_scan():
+def enqueue_automatic_face_scan(params=None):
     with connect_db(DB_PATH) as conn:
         if not get_face_setting(conn, "automatic_scan", False):
             return None
@@ -339,7 +379,7 @@ def enqueue_automatic_face_scan():
             (engine.model_name, engine.model_version),
         ).fetchall()
     photo_ids = [row["id"] for row in rows]
-    return enqueue_face_job("automatic", photo_ids, mode="detect") if photo_ids else None
+    return enqueue_face_job("automatic", photo_ids, mode="detect", params=params) if photo_ids else None
 
 
 class ComfyJobAlreadyActive(RuntimeError):
@@ -593,6 +633,15 @@ def normalized_query_tag_names(values):
     return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
 
 
+def scan_payload_boolean(payload, key, default=False):
+    if key not in payload:
+        return default
+    value = payload[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
 def normalized_batch_photo_ids(payload):
     values = payload.get("photo_ids")
     if not isinstance(values, list) or not values:
@@ -661,10 +710,43 @@ def update_scan_status(**updates):
         SCAN_STATUS["updated_at"] = time.time()
 
 
+def scan_job_cancel_requested(job_id):
+    with SCAN_LOCK:
+        return bool(
+            SCAN_STATUS.get("active")
+            and SCAN_STATUS.get("job_id") == job_id
+            and SCAN_STATUS.get("cancel_requested")
+        )
+
+
+def request_scan_job_cancel(job_id):
+    face_job_id = None
+    with SCAN_LOCK:
+        if SCAN_STATUS.get("job_id") != job_id:
+            return None
+        if SCAN_STATUS.get("active") and not SCAN_STATUS.get("cancel_requested"):
+            SCAN_STATUS.update(
+                {
+                    "cancel_requested": True,
+                    "state": "cancel_requested",
+                    "message": "Arret demande",
+                    "updated_at": time.time(),
+                }
+            )
+        face_job_id = SCAN_STATUS.get("face_job_id")
+    if face_job_id:
+        request_face_job_cancel(face_job_id)
+    return scan_status_snapshot()
+
+
 def apply_scan_progress(progress):
+    with SCAN_LOCK:
+        cancel_requested = SCAN_STATUS.get("cancel_requested")
+        current_message = SCAN_STATUS.get("message")
     updates = {
-        "state": "running",
-        "message": progress.get("message", SCAN_STATUS.get("message")),
+        "state": "cancel_requested" if cancel_requested else "running",
+        "stage": "scan",
+        "message": progress.get("message", current_message),
         "album": progress.get("album"),
         "file": progress.get("file"),
         "updated_at": progress.get("updated_at", time.time()),
@@ -673,6 +755,10 @@ def apply_scan_progress(progress):
         updates["photos"] = progress["photos"]
     if "album_photos" in progress:
         updates["album_photos"] = progress["album_photos"]
+    if "processed" in progress:
+        updates["processed"] = progress["processed"]
+    if "skipped" in progress:
+        updates["skipped"] = progress["skipped"]
     if progress.get("error"):
         with SCAN_LOCK:
             SCAN_STATUS["errors"].append(
@@ -685,32 +771,113 @@ def apply_scan_progress(progress):
     update_scan_status(**updates)
 
 
-def run_scan_job(job_id, scan_metadata, album_name=None):
+def wait_for_scan_face_job(scan_job_id, face_job_id):
+    while True:
+        if scan_job_cancel_requested(scan_job_id):
+            request_face_job_cancel(face_job_id)
+        with connect_db(DB_PATH) as conn:
+            face_job = get_face_scan_job(conn, face_job_id)
+        if not face_job:
+            raise RuntimeError("Le job de reconnaissance faciale est introuvable")
+        update_scan_status(
+            stage="faces",
+            face_job=face_job,
+            state="cancel_requested" if scan_job_cancel_requested(scan_job_id) else "running",
+            message=face_job.get("message") or "Reconnaissance faciale",
+        )
+        if not face_job["active"]:
+            if face_job["state"] == "cancelled":
+                raise ScanCancelled("Reconnaissance faciale annulee")
+            if face_job["state"] == "error":
+                raise RuntimeError(face_job.get("error") or face_job.get("message") or "Reconnaissance faciale en erreur")
+            return face_job
+        time.sleep(0.2)
+
+
+def enqueue_scan_face_stage(job_id, options, processed_photo_ids):
+    album_name = options.get("album")
+    if options.get("face_recognition"):
+        if options.get("rescan_existing"):
+            scope = "album" if album_name else "all"
+            with connect_db(DB_PATH) as conn:
+                photo_ids = photo_ids_for_face_scope(
+                    conn,
+                    scope,
+                    album_name=album_name,
+                    mode="detect",
+                )
+        else:
+            scope = "selection"
+            photo_ids = processed_photo_ids
+        if not photo_ids:
+            return None
+        return enqueue_face_job(
+            scope,
+            photo_ids,
+            mode="detect",
+            params={
+                "album_name": album_name,
+                "force": bool(options.get("force_face_rescan") and options.get("rescan_existing")),
+                "parent_scan_job_id": job_id,
+            },
+        )
+    return enqueue_automatic_face_scan(params={"parent_scan_job_id": job_id})
+
+
+def run_scan_job(job_id, options):
     try:
         summary = scan_albums(
             DB_PATH,
             IMAGES_ROOT,
             THUMBNAIL_ROOT,
-            scan_metadata=scan_metadata,
+            scan_metadata=options["metadata"],
+            rescan_existing=options["rescan_existing"],
             progress_callback=apply_scan_progress,
+            cancel_callback=lambda: scan_job_cancel_requested(job_id),
             commit_interval=25,
-            album_name=album_name,
+            album_name=options.get("album"),
         )
+        processed_photo_ids = summary.pop("processed_photo_ids", [])
+        if scan_job_cancel_requested(job_id):
+            raise ScanCancelled("Scan annule")
+        face_job = enqueue_scan_face_stage(job_id, options, processed_photo_ids)
+        if face_job:
+            update_scan_status(
+                stage="faces",
+                face_job_id=face_job["id"],
+                face_job=face_job,
+                message="Reconnaissance faciale en attente",
+            )
+            if scan_job_cancel_requested(job_id):
+                request_face_job_cancel(face_job["id"])
+            wait_for_scan_face_job(job_id, face_job["id"])
+        if scan_job_cancel_requested(job_id):
+            raise ScanCancelled("Scan annule")
         update_scan_status(
             active=False,
             state="done",
-            message=f"Scan termine: {summary['photos']} images",
+            stage="done",
+            message=f"Scan termine: {summary['processed']} image(s) traitee(s), {summary['skipped']} ignoree(s)",
             finished_at=time.time(),
             summary=summary,
         )
-        enqueue_automatic_face_scan()
         print(f"[scan] job {job_id} done: {summary}", flush=True)
+    except ScanCancelled:
+        update_scan_status(
+            active=False,
+            state="cancelled",
+            stage="cancelled",
+            message="Scan annule",
+            finished_at=time.time(),
+        )
+        print(f"[scan] job {job_id} cancelled", flush=True)
     except Exception as exc:
         print(f"[scan] job {job_id} failed: {exc}", flush=True)
         traceback.print_exc()
         update_scan_status(
             active=False,
             state="error",
+            stage="error",
             message=str(exc),
             finished_at=time.time(),
             summary=None,
@@ -800,18 +967,62 @@ def api_scan():
     album_name = payload.get("album")
     if album_name is not None and (not isinstance(album_name, str) or not album_name):
         return jsonify({"ok": False, "error": "album must be a non-empty string"}), 400
-    if payload.get("sync"):
+    try:
+        options = {
+            "album": album_name,
+            "rescan_existing": scan_payload_boolean(payload, "rescan_existing", True),
+            "metadata": scan_payload_boolean(payload, "metadata", False),
+            "face_recognition": scan_payload_boolean(payload, "face_recognition", False),
+            "force_face_rescan": scan_payload_boolean(payload, "force_face_rescan", False),
+            "image_analysis": scan_payload_boolean(payload, "image_analysis", False),
+        }
+        sync = scan_payload_boolean(payload, "sync", False)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if options["image_analysis"]:
+        return jsonify({"ok": False, "error": "L'analyse d'image ComfyUI n'est pas encore disponible"}), 400
+    if not options["face_recognition"] or not options["rescan_existing"]:
+        options["force_face_rescan"] = False
+
+    if sync:
         try:
             summary = scan_albums(
                 DB_PATH,
                 IMAGES_ROOT,
                 THUMBNAIL_ROOT,
-                scan_metadata=bool(payload.get("metadata")),
+                scan_metadata=options["metadata"],
+                rescan_existing=options["rescan_existing"],
                 album_name=album_name,
             )
+            processed_photo_ids = summary.pop("processed_photo_ids", [])
+            if options["face_recognition"]:
+                if options["rescan_existing"]:
+                    scope = "album" if album_name else "all"
+                    with connect_db(DB_PATH) as conn:
+                        photo_ids = photo_ids_for_face_scope(
+                            conn,
+                            scope,
+                            album_name=album_name,
+                            mode="detect",
+                        )
+                else:
+                    scope = "selection"
+                    photo_ids = processed_photo_ids
+                if photo_ids:
+                    enqueue_face_job(
+                        scope,
+                        photo_ids,
+                        mode="detect",
+                        params={
+                            "album_name": album_name,
+                            "force": options["force_face_rescan"],
+                        },
+                        sync=True,
+                    )
+            else:
+                enqueue_automatic_face_scan()
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 404
-        enqueue_automatic_face_scan()
         return jsonify({"ok": True, "summary": summary})
 
     with SCAN_LOCK:
@@ -823,12 +1034,19 @@ def api_scan():
                 "active": True,
                 "job_id": job_id,
                 "state": "running",
+                "stage": "scan",
                 "message": f"Scan de l'album {album_name} demarre" if album_name else "Scan de tous les albums demarre",
                 "album": album_name,
                 "file": None,
                 "photos": 0,
                 "album_photos": 0,
+                "processed": 0,
+                "skipped": 0,
                 "errors": [],
+                "options": deepcopy(options),
+                "cancel_requested": False,
+                "face_job_id": None,
+                "face_job": None,
                 "started_at": time.time(),
                 "updated_at": time.time(),
                 "finished_at": None,
@@ -838,8 +1056,9 @@ def api_scan():
         job = deepcopy(SCAN_STATUS)
     thread = threading.Thread(
         target=run_scan_job,
-        args=(job_id, bool(payload.get("metadata")), album_name),
+        args=(job_id, options),
         daemon=True,
+        name=f"gallery-scan-{job_id[:8]}",
     )
     thread.start()
     return jsonify({"ok": True, "job": job}), 202
@@ -848,6 +1067,14 @@ def api_scan():
 @app.get("/api/scan/status")
 def api_scan_status():
     return jsonify({"ok": True, "job": scan_status_snapshot()})
+
+
+@app.post("/api/scan/jobs/<job_id>/cancel")
+def api_cancel_scan_job(job_id):
+    job = request_scan_job_cancel(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Scan job not found"}), 404
+    return jsonify({"ok": True, "job": job}), 202 if job["active"] else 200
 
 
 @app.get("/api/comfy/status")
@@ -1551,6 +1778,7 @@ def api_create_face_job():
     scope = payload.get("scope", "all")
     mode = payload.get("mode", "detect")
     try:
+        force = scan_payload_boolean(payload, "force", False)
         with connect_db(DB_PATH) as conn:
             photo_ids = photo_ids_for_face_scope(
                 conn,
@@ -1566,7 +1794,7 @@ def api_create_face_job():
             scope,
             photo_ids,
             mode=mode,
-            params={"album_name": payload.get("album_name")},
+            params={"album_name": payload.get("album_name"), "force": force},
             sync=bool(payload.get("sync")),
         )
         return jsonify({"ok": True, "job": job}), 200 if payload.get("sync") else 202
@@ -1594,16 +1822,9 @@ def api_face_job(job_id):
 @app.post("/api/face/jobs/<job_id>/cancel")
 def api_cancel_face_job(job_id):
     ensure_ready()
-    with connect_db(DB_PATH) as conn:
-        job = get_face_scan_job(conn, job_id)
-        if not job:
-            return jsonify({"ok": False, "error": "Face scan job not found"}), 404
-        if job["active"]:
-            conn.execute(
-                "UPDATE face_scan_jobs SET state='cancel_requested', message='Annulation demandee', updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (job_id,),
-            )
-        job = get_face_scan_job(conn, job_id)
+    job = request_face_job_cancel(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Face scan job not found"}), 404
     return jsonify({"ok": True, "job": job})
 
 

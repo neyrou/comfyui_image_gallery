@@ -79,8 +79,7 @@ small {
     gap: 10px;
 }
 
-.selection-actions,
-.scan-actions {
+.selection-actions {
     position: relative;
 }
 
@@ -232,10 +231,17 @@ button:disabled {
     display: none;
 }
 
-.scan-status > div {
+.scan-status > div:first-child {
     display: grid;
     min-width: 0;
     gap: 4px;
+}
+
+.scan-status-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
 }
 
 .scan-status button {
@@ -245,8 +251,23 @@ button:disabled {
     flex: 0 0 auto;
 }
 
+.scan-status-actions .danger-button {
+    width: auto;
+    padding-right: 12px;
+    padding-left: 12px;
+}
+
 .scan-status[data-state="done"] {
     background: #243429;
+}
+
+.scan-status[data-state="cancel_requested"] {
+    background: #3a3124;
+    border-color: #b88a3b;
+}
+
+.scan-status[data-state="cancelled"] {
+    background: #332f2a;
 }
 
 .scan-status[data-state="error"] {
@@ -612,12 +633,56 @@ button:disabled {
 .config-panel,
 .album-action-panel,
 .batch-tag-panel,
+.scan-options-panel,
 .comfy-panel,
 .tag-filter-panel {
     position: relative;
     overflow: auto;
     padding: 18px;
     background: var(--surface);
+}
+
+.scan-options-panel {
+    position: relative;
+    width: min(560px, calc(100vw - 28px));
+    max-height: calc(100vh - 28px);
+    margin: 14px auto;
+    overflow: auto;
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+}
+
+.scan-options-panel form {
+    display: grid;
+    gap: 16px;
+}
+
+.scan-option-group {
+    display: grid;
+    gap: 10px;
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+}
+
+.scan-option-group legend {
+    padding: 0 6px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.scan-option-nested {
+    margin-left: 24px;
+}
+
+.checkbox-field.is-disabled {
+    opacity: 0.55;
+}
+
+.scan-option-group [hidden] {
+    display: none;
 }
 
 .photo-viewer:not(.details-open) .details-panel {
@@ -654,6 +719,7 @@ button:disabled {
 .face-admin-panel h2,
 .config-panel h2,
 .batch-tag-panel h2,
+.scan-options-panel h2,
 .comfy-panel h2,
 .tag-filter-panel h2 {
     font-size: 20px;
@@ -1637,8 +1703,7 @@ pre {
         white-space: nowrap;
     }
 
-    .toolbar > .toolbar-icon-button,
-    .toolbar > .scan-actions > .toolbar-icon-button {
+    .toolbar > .toolbar-icon-button {
         width: 48px;
         min-width: 48px;
         padding: 0;

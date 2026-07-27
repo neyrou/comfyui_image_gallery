@@ -36,21 +36,13 @@
                     <path d="M4 5h16l-6 7v5l-4 2v-7z"></path>
                 </svg>
             </button>
-            <div class="scan-actions">
-                <button id="scan-button" class="toolbar-icon-button" type="button" title="Rescanner" aria-label="Choisir la portée du scan"
-                        aria-haspopup="true" aria-expanded="false">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M20 11a8 8 0 1 0-2.34 5.66"></path>
-                        <path d="M20 4v7h-7"></path>
-                    </svg>
-                </button>
-                <div class="selection-actions-dropdown" id="scan-actions-menu" hidden>
-                    <button type="button" data-scan-scope="all">Scanner tous les albums</button>
-                    <button type="button" data-scan-scope="current" {% if not selected_album %}disabled{% endif %}>
-                        Scanner l'album courant
-                    </button>
-                </div>
-            </div>
+            <button id="scan-button" class="toolbar-icon-button" type="button" title="Scanner" aria-label="Configurer et lancer un scan"
+                    aria-haspopup="dialog">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 11a8 8 0 1 0-2.34 5.66"></path>
+                    <path d="M20 4v7h-7"></path>
+                </svg>
+            </button>
             <button id="admin-button" class="toolbar-icon-button" type="button" title="Configuration" aria-label="Ouvrir la configuration">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"></path>
@@ -84,7 +76,10 @@
             <span id="scan-status-message">En attente...</span>
             <small id="scan-status-detail"></small>
         </div>
-        <button type="button" id="scan-status-close" title="Fermer" hidden>×</button>
+        <div class="scan-status-actions">
+            <button type="button" id="scan-status-cancel" class="danger-button" hidden>Arr&ecirc;ter</button>
+            <button type="button" id="scan-status-close" title="Fermer" hidden>&times;</button>
+        </div>
     </div>
     <div class="scan-status face-job-status" id="face-job-status" hidden>
         <div>
@@ -92,7 +87,10 @@
             <span id="face-job-status-message">En attente...</span>
             <small id="face-job-status-detail"></small>
         </div>
-        <button type="button" id="face-job-status-close" title="Fermer" hidden>&times;</button>
+        <div class="scan-status-actions">
+            <button type="button" id="face-job-status-cancel" class="danger-button" hidden>Arr&ecirc;ter</button>
+            <button type="button" id="face-job-status-close" title="Fermer" hidden>&times;</button>
+        </div>
     </div>
     <div class="scan-status comfy-job-status" id="comfy-job-status" role="status" aria-live="polite" hidden>
         <div>
@@ -150,6 +148,63 @@
             {% endif %}
         </nav>
     </main>
+
+    <div class="modal" id="scan-options-modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close-scan-options></div>
+        <section class="scan-options-panel" role="dialog" aria-modal="true" aria-labelledby="scan-options-title">
+            <div class="panel-header">
+                <div>
+                    <h2 id="scan-options-title">Lancer un scan</h2>
+                    <small>Choisissez la port&eacute;e et les analyses &agrave; ex&eacute;cuter.</small>
+                </div>
+                <button type="button" data-close-scan-options title="Fermer" aria-label="Fermer">&times;</button>
+            </div>
+            <form id="scan-options-form">
+                <label class="form-field">
+                    <span>Port&eacute;e</span>
+                    <select id="scan-options-scope">
+                        <option value="current" {% if not selected_album %}disabled{% endif %}>Album courant{% if selected_album %} : {{ selected_album.display_name }}{% endif %}</option>
+                        <option value="all">Tous les albums</option>
+                    </select>
+                </label>
+                <fieldset class="scan-option-group">
+                    <legend>Images &agrave; traiter</legend>
+                    <label class="checkbox-field">
+                        <input type="radio" name="scan-existing-mode" value="incremental" checked>
+                        <span>Nouvelles images et images modifi&eacute;es uniquement</span>
+                    </label>
+                    <label class="checkbox-field">
+                        <input type="radio" name="scan-existing-mode" value="full">
+                        <span>Re-scanner aussi les images existantes</span>
+                    </label>
+                </fieldset>
+                <fieldset class="scan-option-group">
+                    <legend>Analyses</legend>
+                    <label class="checkbox-field">
+                        <input id="scan-options-metadata" type="checkbox">
+                        <span>Scan JSON</span>
+                    </label>
+                    <label class="checkbox-field">
+                        <input id="scan-options-faces" type="checkbox">
+                        <span>Reconnaissance faciale</span>
+                    </label>
+                    <label class="checkbox-field scan-option-nested" id="scan-options-force-faces-row" hidden>
+                        <input id="scan-options-force-faces" type="checkbox">
+                        <span>Forcer une nouvelle d&eacute;tection des visages</span>
+                    </label>
+                    <label class="checkbox-field is-disabled">
+                        <input id="scan-options-image-analysis" type="checkbox" disabled>
+                        <span>Analyse d'image avec ComfyUI <small>(bient&ocirc;t disponible)</small></span>
+                    </label>
+                </fieldset>
+                <div class="comfy-status" id="scan-options-status" role="status" aria-live="polite"></div>
+                <div class="panel-footer">
+                    <button type="button" data-close-scan-options>Annuler</button>
+                    <button type="submit" id="scan-options-submit">Lancer le scan</button>
+                </div>
+            </form>
+        </section>
+    </div>
 
     <div class="modal" id="photo-modal" aria-hidden="true">
         <div class="modal-backdrop" data-close-modal></div>
