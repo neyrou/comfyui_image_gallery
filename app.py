@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 from flask import Flask, Response, jsonify, render_template, request, send_file
-from PIL import Image
+from PIL import Image, ImageOps
 from werkzeug.utils import secure_filename
 
 from comfy_generation import (
@@ -2126,7 +2126,7 @@ def api_decide_face_match(face_id):
 
 def _cropped_face_response(image_path, bbox):
     with Image.open(image_path) as image:
-        image = image.convert("RGB")
+        image = ImageOps.exif_transpose(image).convert("RGB")
         left, top, right, bottom = (float(value) for value in bbox)
         padding = max(right - left, bottom - top) * 0.20
         crop_box = (

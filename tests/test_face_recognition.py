@@ -137,6 +137,23 @@ class FaceRecognitionTests(unittest.TestCase):
             row = conn.execute("SELECT source FROM photo_tags WHERE photo_id=1 AND tag_id=1").fetchone()
             self.assertEqual(row["source"], "manual")
 
+    def test_face_crop_applies_exif_orientation_before_bounding_box(self):
+        image_path = self.images_root / "output" / "oriented.jpg"
+        image = Image.new("RGB", (80, 40), (220, 20, 20))
+        image.paste((20, 20, 220), (40, 0, 80, 40))
+        exif = Image.Exif()
+        exif[274] = 6
+        image.save(image_path, quality=100, subsampling=0, exif=exif)
+
+        with app_module.app.test_request_context():
+            response = app_module._cropped_face_response(image_path, (5, 50, 35, 70))
+            response.direct_passthrough = False
+            cropped = Image.open(io.BytesIO(response.get_data()))
+            center = cropped.getpixel((cropped.width // 2, cropped.height // 2))
+
+        self.assertGreater(center[2], 180)
+        self.assertLess(center[0], 60)
+
     def test_manual_tag_survives_rematch_and_rejection_persists(self):
         create_png(self.images_root / "output" / "reference.png")
         create_png(self.images_root / "output" / "target.png", (80, 30, 10))
