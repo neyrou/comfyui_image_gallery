@@ -1,0 +1,10 @@
+# Install a PyTorch build suitable for the machine separately when needed:
+# https://pytorch.org/get-started/locally/
+transformers>=4.49
+timm>=1.0.15
+huggingface-hub>=0.28
+nudenet==3.4.2
+
+# NudeNet and WD SwinV2 use ONNX Runtime. Keep only one backend installed.
+# NVIDIA GPU: python -m pip install onnxruntime-gpu
+# CPU only:   python -m pip install onnxruntime

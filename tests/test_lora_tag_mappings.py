@@ -177,6 +177,19 @@ class LoraTagMappingTests(unittest.TestCase):
             [tag["name"] for tag in mapping["tags"]],
             ["cinematic", "portrait", "style"],
         )
+        style_tag = next(tag for tag in mapping["tags"] if tag["name"] == "style")
+        self.assertEqual(
+            client.patch(
+                f"/api/tags/{style_tag['id']}",
+                json={"category": "clothing"},
+            ).status_code,
+            200,
+        )
+        refreshed_mapping = client.get("/api/lora-tag-mappings").get_json()["mappings"][0]
+        refreshed_style = next(
+            tag for tag in refreshed_mapping["tags"] if tag["name"] == "style"
+        )
+        self.assertEqual(refreshed_style["category"], "clothing")
         self.assertEqual(
             client.post(
                 "/api/lora-tag-mappings",

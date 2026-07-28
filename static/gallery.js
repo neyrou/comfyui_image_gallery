@@ -38,6 +38,9 @@ const state = {
     albumActionBatch: false,
     photoModalHistoryActive: false,
     tagFilterDraft: {},
+    tagFilterQuery: "",
+    tagFacetRequestId: 0,
+    tagFacetAbortController: null,
     selectionMode: false,
     selectedPhotoIds: new Set(),
     longPressTimer: null,
@@ -56,6 +59,8 @@ const state = {
     loraTagMappings: [],
     loraTagCatalog: [],
     loraTagEditingId: null,
+    tagSensitivities: [],
+    tagSensitivityQuery: "",
     linkedStripIdleTimer: null,
 };
 
@@ -70,7 +75,53 @@ function renderTags(tags) {
     if (!tags || !tags.length) {
         return '<span class="muted">Aucun</span>';
     }
-    return tags.map((tag) => `<span class="tag">${escapeHtml(tag.name || tag)}</span>`).join("");
+    return tags.map((tag) => {
+        const item = typeof tag === "string" ? { name: tag, category: null } : tag;
+        return `
+            <span class="tag">
+                ${tagCategoryIcon(item.category)}
+                <span>${escapeHtml(item.name)}</span>
+            </span>
+        `;
+    }).join("");
+}
+
+const TAG_CATEGORY_LABELS = {
+    clothing: "Vêtement",
+    person: "Personne",
+    constraint: "Contrainte",
+};
+
+function tagCategoryIcon(category) {
+    const label = TAG_CATEGORY_LABELS[category];
+    if (!label) {
+        return "";
+    }
+    const paths = category === "clothing"
+        ? '<path d="M8 5 5 7l-2 5 4 2v7h10v-7l4-2-2-5-3-2c-.7 1.3-2.1 2-4 2s-3.3-.7-4-2Z"></path>'
+        : category === "person"
+            ? '<circle cx="12" cy="8" r="4"></circle><path d="M4.5 21c.7-5 3.2-7 7.5-7s6.8 2 7.5 7"></path>'
+            : '<path d="M9.5 14.5 7 17a3.5 3.5 0 0 1-5-5l3-3a3.5 3.5 0 0 1 5 0"></path><path d="m14.5 9.5 2.5-2.5a3.5 3.5 0 0 1 5 5l-3 3a3.5 3.5 0 0 1-5 0"></path><path d="m8.5 15.5 7-7"></path>';
+    return `
+        <span class="tag-category-icon is-${category}" title="${label}" aria-label="${label}">
+            <svg viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>
+        </span>
+    `;
+}
+
+function sensitivitySelectorHtml(selected, attributes = "") {
+    const levels = state.sensitivityLevels || ["neutral", "low", "medium", "high"];
+    return `
+        <span class="sensitivity-selector" role="radiogroup" ${attributes}>
+            ${levels.map((level) => `
+                <button type="button" role="radio"
+                        class="sensitivity-step sensitivity-${level}${selected === level ? " is-selected" : ""}"
+                        data-sensitivity-value="${level}"
+                        aria-checked="${selected === level}"
+                        title="${level}">${level.slice(0, 1).toUpperCase()}</button>
+            `).join("")}
+        </span>
+    `;
 }
 
 function escapeHtml(value) {
@@ -368,11 +419,51 @@ function renderPhotoDetail(photo) {
         : '<span class="muted">Aucun</span>';
     $("#detail-prompt").textContent = metadata.prompt || "Aucun prompt extrait.";
     $("#detail-tags").innerHTML = renderTags(photo.tags);
-    $("#photo-tags-input").value = photo.tags.map((tag) => tag.name).join(", ");
+    $("#photo-tags-input").value = photo.tags
+        .filter((tag) => tag.source === "manual")
+        .map((tag) => tag.name)
+        .join(", ");
+    renderImageAnalysis(photo);
     renderPhotoFaces(photo.face_analysis);
     renderLinks(photo.links);
     renderLinkedStrip(photo.links);
     refreshComfyStatus();
+}
+
+function renderImageAnalysis(photo) {
+    const badge = $("#detail-effective-sensitivity");
+    const content = $("#detail-image-analysis-content");
+    if (!badge || !content) {
+        return;
+    }
+    const effective = photo.effective_sensitivity || "neutral";
+    badge.textContent = effective;
+    badge.dataset.sensitivity = effective;
+    const analysis = photo.image_analysis;
+    if (!analysis?.scanned) {
+        content.innerHTML = '<p class="muted">Photo non analysée. Le niveau effectif provient uniquement de ses tags.</p>';
+        return;
+    }
+    const scores = Object.entries(analysis.freepik_scores || {})
+        .map(([level, score]) => `<li><span>${escapeHtml(level)}</span><strong>${(Number(score) * 100).toFixed(1)}%</strong></li>`)
+        .join("");
+    const detections = (analysis.nudenet_detections || [])
+        .filter((item) => Number(item.score) >= 0.60)
+        .map((item) => `<li>${escapeHtml(item.class)} <strong>${(Number(item.score) * 100).toFixed(1)}%</strong></li>`)
+        .join("");
+    const automaticTags = (analysis.automatic_tags || [])
+        .map((item) => `<span class="tag" title="${(Number(item.score) * 100).toFixed(1)}%">${escapeHtml(item.display_name || item.name)}</span>`)
+        .join("");
+    content.innerHTML = `
+        <p>Niveau modèles : <strong>${escapeHtml(analysis.analysis_level)}</strong>
+           · Freepik : <strong>${escapeHtml(analysis.freepik_level)}</strong></p>
+        <div class="analysis-detail-grid">
+            <div><h4>Scores Freepik</h4><ul>${scores || "<li>Aucun</li>"}</ul></div>
+            <div><h4>Détections NudeNet</h4><ul>${detections || "<li>Aucune ≥ 60%</li>"}</ul></div>
+        </div>
+        <h4>Tags automatiques</h4>
+        <div class="tag-row">${automaticTags || '<span class="muted">Aucun</span>'}</div>
+    `;
 }
 
 function renderPhotoFaces(analysis) {
@@ -596,6 +687,33 @@ async function rescanCurrentMetadata() {
         const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/metadata/rescan`, { method: "POST", body: "{}" });
         state.currentPhoto = data.photo;
         renderPhotoDetail(data.photo);
+    } catch (error) {
+        alert(error.message);
+    } finally {
+        done();
+    }
+}
+
+async function rescanCurrentImageAnalysis() {
+    if (!state.currentPhoto) {
+        return;
+    }
+    const photoId = state.currentPhoto.id;
+    const done = setBusy($("#rescan-image-analysis-button"), "Analyse...", { spinner: true });
+    try {
+        const data = await fetchJson(`/api/photos/${photoId}/image-analysis/rescan`, {
+            method: "POST",
+            body: "{}",
+        });
+        syncPhotoInCurrentGallery(data.photo);
+        if (state.currentPhoto?.id === photoId) {
+            state.currentPhoto = data.photo;
+            renderPhotoDetail(data.photo);
+            const analysisDetail = $("#detail-image-analysis");
+            if (analysisDetail) {
+                analysisDetail.open = true;
+            }
+        }
     } catch (error) {
         alert(error.message);
     } finally {
@@ -1693,33 +1811,87 @@ function stopSlideshow() {
     $("#play-button").textContent = "▶";
 }
 
-function appliedTagFilterState(tagName) {
-    if ((state.tagFilters?.include || []).includes(tagName)) {
-        return "true";
+function tagFilterDraftLists() {
+    const include = [];
+    const exclude = [];
+    Object.entries(state.tagFilterDraft || {}).forEach(([tagName, value]) => {
+        if (value === "true") {
+            include.push(tagName);
+        } else if (value === "false") {
+            exclude.push(tagName);
+        }
+    });
+    return { include, exclude };
+}
+
+function tagFilterMetadata(tagName) {
+    return [...(state.activeTagStats || []), ...(state.albumTagStats || [])]
+        .find((tag) => tag.name === tagName) || { name: tagName, category: null };
+}
+
+function renderActiveTagFilters() {
+    const container = $("#tag-filter-active-list");
+    if (!container) {
+        return;
     }
-    if ((state.tagFilters?.exclude || []).includes(tagName)) {
-        return "false";
-    }
-    return "any";
+    const { include, exclude } = tagFilterDraftLists();
+    const active = [
+        ...include.map((name) => ({ name, value: "true" })),
+        ...exclude.map((name) => ({ name, value: "false" })),
+    ];
+    container.innerHTML = active.length ? active.map(({ name, value }) => {
+        const tag = tagFilterMetadata(name);
+        const escapedName = escapeHtml(name);
+        const included = value === "true";
+        return `
+            <span class="tag-filter-active is-${included ? "include" : "exclude"}">
+                ${tagCategoryIcon(tag.category)}
+                <span class="tag-filter-active-name">${escapedName}</span>
+                <button type="button" class="tag-filter-active-state"
+                        data-active-filter-toggle="${escapedName}"
+                        title="Basculer en ${included ? "exclu" : "inclus"}"
+                        aria-label="Basculer ${escapedName} en ${included ? "exclu" : "inclus"}">
+                    ${included ? "Inclus" : "Exclu"}
+                </button>
+                <button type="button" class="tag-filter-active-clear"
+                        data-active-filter-clear="${escapedName}"
+                        title="Retirer le filtre" aria-label="Retirer le filtre ${escapedName}">×</button>
+            </span>
+        `;
+    }).join("") : '<span class="muted">Aucun filtre actif</span>';
 }
 
 function renderTagFilters() {
     const container = $("#tag-filter-list");
-    const tagStats = state.albumTagStats || [];
+    const query = state.tagFilterQuery.trim().toLowerCase();
+    const tagStats = (state.albumTagStats || []).filter((tag) => {
+        const isActive = (state.tagFilterDraft[tag.name] || "any") !== "any";
+        return !isActive && (!query || tag.name.toLowerCase().includes(query));
+    });
+    renderActiveTagFilters();
+    const matchCount = $("#tag-filter-match-count");
+    if (matchCount) {
+        const count = Number(state.tagFacetMatchingCount ?? state.filteredPhotoCount ?? 0);
+        matchCount.textContent = `${count} photo${count === 1 ? "" : "s"} correspondante${count === 1 ? "" : "s"}`;
+    }
     if (!tagStats.length) {
-        container.innerHTML = '<p class="muted tag-filter-empty">Aucun tag photo dans cet album.</p>';
+        container.innerHTML = `<p class="muted tag-filter-empty">${
+            query ? "Aucun tag ne correspond à la recherche." : "Aucun autre tag dans les photos filtrées."
+        }</p>`;
         return;
     }
     const maxOccurrence = Math.max(...tagStats.map((tag) => Number(tag.occurrence_count) || 0), 1);
     container.innerHTML = tagStats.map((tag) => {
-        const tagId = String(tag.id);
-        const selected = state.tagFilterDraft[tagId] || "any";
+        const selected = state.tagFilterDraft[tag.name] || "any";
         const occurrence = Number(tag.occurrence_count) || 0;
         const progress = Math.min(100, Math.max(0, (occurrence / maxOccurrence) * 100));
         const escapedName = escapeHtml(tag.name);
         return `
             <div class="tag-filter-row">
-                <span class="tag-filter-name" title="${escapedName}">${escapedName}</span>
+                <span class="tag-filter-name" title="${escapedName}">
+                    ${tagCategoryIcon(tag.category)}
+                    <span>${escapedName}</span>
+                </span>
                 <span class="tag-filter-count" style="--tag-progress: ${progress}%" title="${occurrence} occurrence${occurrence > 1 ? "s" : ""}">
                     ${occurrence}
                 </span>
@@ -1727,7 +1899,7 @@ function renderTagFilters() {
                     ${["any", "true", "false"].map((value) => `
                         <button type="button"
                                 class="tag-filter-choice is-${value}${selected === value ? " is-selected" : ""}"
-                                data-tag-filter-id="${tagId}"
+                                data-tag-filter-name="${escapedName}"
                                 data-tag-filter-value="${value}"
                                 aria-pressed="${selected === value}">
                             ${value === "any" ? "Any" : value === "true" ? "True" : "False"}
@@ -1739,14 +1911,71 @@ function renderTagFilters() {
     }).join("");
 }
 
+async function refreshTagFacets() {
+    if (!state.selectedAlbum?.id) {
+        return;
+    }
+    state.tagFacetAbortController?.abort();
+    const controller = new AbortController();
+    state.tagFacetAbortController = controller;
+    const requestId = ++state.tagFacetRequestId;
+    const status = $("#tag-filter-status");
+    if (status) {
+        status.textContent = "Mise à jour des tags...";
+        status.classList.remove("error");
+    }
+    const { include, exclude } = tagFilterDraftLists();
+    const url = new URL(
+        `/api/albums/${state.selectedAlbum.id}/tag-facets`,
+        window.location.origin,
+    );
+    include.forEach((name) => url.searchParams.append("include_tag", name));
+    exclude.forEach((name) => url.searchParams.append("exclude_tag", name));
+    url.searchParams.set("max_sensitivity", state.maxSensitivity || "neutral");
+    try {
+        const data = await fetchJson(url.toString(), { signal: controller.signal });
+        if (requestId !== state.tagFacetRequestId) {
+            return;
+        }
+        state.albumTagStats = data.tags || [];
+        state.activeTagStats = data.active_tags || [];
+        state.tagFacetMatchingCount = Number(data.matching_photo_count) || 0;
+        if (status) {
+            status.textContent = "";
+        }
+        renderTagFilters();
+    } catch (error) {
+        if (error.name === "AbortError" || requestId !== state.tagFacetRequestId) {
+            return;
+        }
+        if (status) {
+            status.textContent = error.message;
+            status.classList.add("error");
+        }
+    }
+}
+
 function openTagFilter() {
     state.tagFilterDraft = {};
-    (state.albumTagStats || []).forEach((tag) => {
-        state.tagFilterDraft[String(tag.id)] = appliedTagFilterState(tag.name);
+    (state.tagFilters?.include || []).forEach((name) => {
+        state.tagFilterDraft[name] = "true";
     });
+    (state.tagFilters?.exclude || []).forEach((name) => {
+        if (!state.tagFilterDraft[name]) {
+            state.tagFilterDraft[name] = "false";
+        }
+    });
+    state.tagFilterQuery = "";
+    state.tagFacetMatchingCount = state.filteredPhotoCount || 0;
+    const search = $("#tag-filter-search");
+    if (search) {
+        search.value = "";
+    }
     renderTagFilters();
     $("#tag-filter-modal").classList.add("open");
     $("#tag-filter-modal").setAttribute("aria-hidden", "false");
+    refreshTagFacets();
+    search?.focus();
 }
 
 function sameTagSet(left, right) {
@@ -1756,16 +1985,7 @@ function sameTagSet(left, right) {
 }
 
 function applyTagFilters() {
-    const include = [];
-    const exclude = [];
-    (state.albumTagStats || []).forEach((tag) => {
-        const value = state.tagFilterDraft[String(tag.id)] || "any";
-        if (value === "true") {
-            include.push(tag.name);
-        } else if (value === "false") {
-            exclude.push(tag.name);
-        }
-    });
+    const { include, exclude } = tagFilterDraftLists();
     const currentInclude = state.tagFilters?.include || [];
     const currentExclude = state.tagFilters?.exclude || [];
     if (sameTagSet(include, currentInclude) && sameTagSet(exclude, currentExclude)) {
@@ -1785,18 +2005,36 @@ function closeTagFilter() {
     if (!modal.classList.contains("open")) {
         return;
     }
+    state.tagFacetAbortController?.abort();
+    state.tagFacetAbortController = null;
     modal.classList.remove("open");
     modal.setAttribute("aria-hidden", "true");
     applyTagFilters();
 }
 
 function chooseTagFilter(event) {
+    const clearButton = event.target.closest("[data-active-filter-clear]");
+    if (clearButton) {
+        state.tagFilterDraft[clearButton.dataset.activeFilterClear] = "any";
+        renderTagFilters();
+        refreshTagFacets();
+        return;
+    }
+    const toggleButton = event.target.closest("[data-active-filter-toggle]");
+    if (toggleButton) {
+        const tagName = toggleButton.dataset.activeFilterToggle;
+        state.tagFilterDraft[tagName] = state.tagFilterDraft[tagName] === "true" ? "false" : "true";
+        renderTagFilters();
+        refreshTagFacets();
+        return;
+    }
     const button = event.target.closest("[data-tag-filter-value]");
     if (!button) {
         return;
     }
-    state.tagFilterDraft[button.dataset.tagFilterId] = button.dataset.tagFilterValue;
+    state.tagFilterDraft[button.dataset.tagFilterName] = button.dataset.tagFilterValue;
     renderTagFilters();
+    refreshTagFacets();
 }
 
 async function loadFaceIdentities() {
@@ -2168,7 +2406,8 @@ function closeAdmin() {
 async function switchConfigSection(section) {
     const descriptions = {
         albums: "Gérer les albums de la galerie.",
-        tags: "Configurer les tags ajoutés automatiquement depuis les LoRA.",
+        tags: "Configurer la sensibilité des tags présents dans la galerie.",
+        "lora-tags": "Configurer les tags ajoutés automatiquement depuis les LoRA.",
         faces: "Configurer l’analyse et l’identification des visages.",
     };
     if (!descriptions[section]) {
@@ -2188,9 +2427,117 @@ async function switchConfigSection(section) {
     });
     $("#config-section-description").textContent = descriptions[section];
     if (section === "tags") {
+        await loadTagSensitivities();
+    } else if (section === "lora-tags") {
         await loadLoraTagMappings();
     } else if (section === "faces") {
         await loadFaceAdmin();
+    }
+}
+
+async function loadTagSensitivities() {
+    const data = await fetchJson("/api/tags");
+    state.tagSensitivities = data.tags || [];
+    renderTagSensitivities();
+}
+
+function tagCategorySelectHtml(tag) {
+    const selected = tag.category || "";
+    const options = [
+        ["", "Aucune"],
+        ["clothing", "Vêtement"],
+        ["person", "Personne"],
+        ["constraint", "Contrainte"],
+    ];
+    return `
+        <label class="tag-category-field" title="${
+            tag.is_face_tag ? "Les tags de visage restent dans la catégorie Personne" : "Catégorie du tag"
+        }">
+            <span class="sr-only">Catégorie de ${escapeHtml(tag.name)}</span>
+            <select class="tag-category-select" data-tag-category ${tag.is_face_tag ? "disabled" : ""}>
+                ${options.map(([value, label]) => `
+                    <option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>
+                `).join("")}
+            </select>
+        </label>
+    `;
+}
+
+function renderTagSensitivities() {
+    const container = $("#tag-sensitivity-list");
+    if (!container) {
+        return;
+    }
+    const query = state.tagSensitivityQuery.trim().toLowerCase();
+    const tags = state.tagSensitivities.filter((tag) => !query || tag.name.toLowerCase().includes(query));
+    container.innerHTML = tags.length ? tags.map((tag) => `
+        <div class="tag-sensitivity-row" data-tag-sensitivity-id="${tag.id}">
+            <span class="tag-sensitivity-name" title="${escapeHtml(tag.name)}">
+                ${tagCategoryIcon(tag.category)}
+                <span>${escapeHtml(tag.name)}</span>
+            </span>
+            <span class="tag-sensitivity-count">${tag.occurrence_count} photo${tag.occurrence_count === 1 ? "" : "s"}</span>
+            ${tagCategorySelectHtml(tag)}
+            ${sensitivitySelectorHtml(tag.sensitivity || "neutral", `aria-label="Sensibilité de ${escapeHtml(tag.name)}"`)}
+        </div>
+    `).join("") : '<p class="lora-tag-empty">Aucun tag trouvé.</p>';
+}
+
+async function updateTagSensitivity(button) {
+    const row = button.closest("[data-tag-sensitivity-id]");
+    if (!row) {
+        return;
+    }
+    const tagId = Number(row.dataset.tagSensitivityId);
+    const sensitivity = button.dataset.sensitivityValue;
+    const status = $("#tag-sensitivity-status");
+    row.classList.add("is-saving");
+    try {
+        const data = await fetchJson(`/api/tags/${tagId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ sensitivity }),
+        });
+        const tag = state.tagSensitivities.find((item) => item.id === tagId);
+        if (tag) {
+            tag.sensitivity = data.tag.sensitivity;
+        }
+        status.textContent = `Sensibilité de « ${data.tag.name} » : ${data.tag.sensitivity}.`;
+        status.classList.remove("error");
+        renderTagSensitivities();
+    } catch (error) {
+        status.textContent = error.message;
+        status.classList.add("error");
+        row.classList.remove("is-saving");
+    }
+}
+
+async function updateTagCategory(select) {
+    const row = select.closest("[data-tag-sensitivity-id]");
+    if (!row) {
+        return;
+    }
+    const tagId = Number(row.dataset.tagSensitivityId);
+    const category = select.value || null;
+    const status = $("#tag-sensitivity-status");
+    row.classList.add("is-saving");
+    try {
+        const data = await fetchJson(`/api/tags/${tagId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ category }),
+        });
+        const tag = state.tagSensitivities.find((item) => item.id === tagId);
+        if (tag) {
+            tag.category = data.tag.category;
+            tag.is_face_tag = Boolean(data.tag.is_face_tag);
+        }
+        const categoryLabel = TAG_CATEGORY_LABELS[data.tag.category] || "Aucune";
+        status.textContent = `Catégorie de « ${data.tag.name} » : ${categoryLabel}.`;
+        status.classList.remove("error");
+        renderTagSensitivities();
+    } catch (error) {
+        status.textContent = error.message;
+        status.classList.add("error");
+        renderTagSensitivities();
     }
 }
 
@@ -2429,7 +2776,7 @@ function openScanOptionsModal() {
     $("#scan-options-metadata").checked = Boolean(saved.metadata);
     $("#scan-options-faces").checked = Boolean(saved.face_recognition);
     $("#scan-options-force-faces").checked = Boolean(saved.force_face_rescan);
-    $("#scan-options-image-analysis").checked = false;
+    $("#scan-options-image-analysis").checked = Boolean(saved.image_analysis);
     updateScanForceOptionVisibility();
     setScanOptionsStatus("");
     modal.classList.add("open");
@@ -2453,7 +2800,7 @@ function scanOptionsFromForm() {
         metadata: $("#scan-options-metadata").checked,
         face_recognition: faceRecognition,
         force_face_rescan: Boolean(faceRecognition && rescanExisting && $("#scan-options-force-faces").checked),
-        image_analysis: false,
+        image_analysis: $("#scan-options-image-analysis").checked,
     };
 }
 
@@ -2535,6 +2882,7 @@ function renderScanStatus(job, options = {}) {
         : job.state === "cancelled" ? "Scan annulé"
         : job.state === "cancel_requested" ? "Arrêt du scan"
         : job.stage === "faces" ? "Reconnaissance faciale"
+        : job.stage === "image_analysis" ? "Analyse d'image"
         : "Scan en cours";
     $("#scan-status-message").textContent = job.message || "Scan...";
     $("#scan-status-close").hidden = Boolean(job.active);
@@ -2544,7 +2892,7 @@ function renderScanStatus(job, options = {}) {
     cancel.textContent = job.state === "cancel_requested" ? "Arrêt…" : "Arrêter";
     const details = [];
     if (job.stage) {
-        details.push(`étape: ${job.stage === "faces" ? "visages" : job.stage}`);
+        details.push(`étape: ${job.stage === "faces" ? "visages" : job.stage === "image_analysis" ? "analyse image" : job.stage}`);
     }
     if (job.album) {
         details.push(`album: ${job.album}`);
@@ -2556,6 +2904,11 @@ function renderScanStatus(job, options = {}) {
         details.push(`traitées: ${job.processed || 0} · ignorées: ${job.skipped || 0}`);
     } else if (job.album_photos || job.photos) {
         details.push(`images: ${job.album_photos || 0} album / ${job.photos || 0} total`);
+    }
+    if (job.stage === "image_analysis" && job.analysis_total) {
+        details.push(
+            `analyse: ${job.analysis_processed || 0} traitée(s), ${job.analysis_skipped || 0} en cache, ${job.analysis_errors || 0} erreur(s)`
+        );
     }
     if (job.face_job) {
         details.push(`visages: ${job.face_job.processed || 0}/${job.face_job.total || 0}`);
@@ -2618,10 +2971,33 @@ function endComfyReferencePointer(event) {
     }
 }
 
+function navigateGallery({ album, maxSensitivity } = {}) {
+    const url = new URL(window.location.href);
+    if (album) {
+        url.searchParams.set("album", album);
+    }
+    if (maxSensitivity) {
+        url.searchParams.set("max_sensitivity", maxSensitivity);
+    }
+    url.searchParams.set("page", "1");
+    window.location.href = url.toString();
+}
+
+function selectGallerySensitivity(event) {
+    const button = event.target.closest("[data-gallery-sensitivity]");
+    if (!button) {
+        return;
+    }
+    const sensitivity = button.dataset.gallerySensitivity;
+    document.cookie = `gallery_max_sensitivity=${encodeURIComponent(sensitivity)}; Max-Age=31536000; Path=/; SameSite=Lax`;
+    navigateGallery({ maxSensitivity: sensitivity });
+}
+
 function bindEvents() {
     $("#album-select")?.addEventListener("change", (event) => {
-        window.location.href = `?album=${encodeURIComponent(event.target.value)}&page=1`;
+        navigateGallery({ album: event.target.value });
     });
+    $("#gallery-sensitivity-selector")?.addEventListener("click", selectGallerySensitivity);
     $("#filter-button")?.addEventListener("click", openTagFilter);
     $("#scan-button")?.addEventListener("click", openScanOptionsModal);
     $("#scan-options-form")?.addEventListener("submit", submitScanOptions);
@@ -2639,6 +3015,7 @@ function bindEvents() {
         toggleSelectionActionsMenu();
     });
     $("#rescan-metadata-button")?.addEventListener("click", rescanCurrentMetadata);
+    $("#rescan-image-analysis-button")?.addEventListener("click", rescanCurrentImageAnalysis);
     $("#refresh-thumbnail-button")?.addEventListener("click", refreshCurrentThumbnail);
     $("#scan-photo-faces-button")?.addEventListener("click", scanCurrentPhotoFaces);
     $("#face-automatic-scan")?.addEventListener("change", setAutomaticFaceScan);
@@ -2907,7 +3284,33 @@ function bindEvents() {
             updateLoraTagMapping(event);
         }
     });
+    $("#tag-sensitivity-search")?.addEventListener("input", (event) => {
+        state.tagSensitivityQuery = event.target.value;
+        renderTagSensitivities();
+    });
+    $("#tag-sensitivity-list")?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-sensitivity-value]");
+        if (button) {
+            updateTagSensitivity(button).catch((error) => {
+                $("#tag-sensitivity-status").textContent = error.message;
+                $("#tag-sensitivity-status").classList.add("error");
+            });
+        }
+    });
+    $("#tag-sensitivity-list")?.addEventListener("change", (event) => {
+        if (event.target.matches("[data-tag-category]")) {
+            updateTagCategory(event.target).catch((error) => {
+                $("#tag-sensitivity-status").textContent = error.message;
+                $("#tag-sensitivity-status").classList.add("error");
+            });
+        }
+    });
+    $("#tag-filter-search")?.addEventListener("input", (event) => {
+        state.tagFilterQuery = event.target.value;
+        renderTagFilters();
+    });
     $("#tag-filter-list")?.addEventListener("click", chooseTagFilter);
+    $("#tag-filter-active-list")?.addEventListener("click", chooseTagFilter);
     $$('[data-close-tag-filter]').forEach((button) => button.addEventListener("click", closeTagFilter));
     $("#face-identity-list")?.addEventListener("submit", (event) => {
         if (event.target.matches(".face-identity-card")) {

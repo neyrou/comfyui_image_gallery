@@ -15,11 +15,18 @@ from metadata_extractor import extract_from_image
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 ALLOWED_ALBUM_TYPES = {"input", "output", "user"}
 ALLOWED_LINK_TYPES = {"variant", "original"}
+SENSITIVITY_LEVELS = ("neutral", "low", "medium", "high")
+SENSITIVITY_RANKS = {level: index for index, level in enumerate(SENSITIVITY_LEVELS)}
+TAG_CATEGORIES = ("clothing", "person", "constraint")
 ALBUM_PATH_RETRY_DELAYS = (0.15, 0.35)
 ALBUM_PATH_UNAVAILABLE_PREFIX = "Album path is unavailable:"
 
 
 class ScanCancelled(RuntimeError):
+    pass
+
+
+class TagCategoryLocked(ValueError):
     pass
 
 
@@ -83,6 +90,11 @@ def init_db(db_path):
             CREATE TABLE IF NOT EXISTS tags (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
+                machine_key TEXT,
+                sensitivity TEXT NOT NULL DEFAULT 'neutral'
+                    CHECK(sensitivity IN ('neutral', 'low', 'medium', 'high')),
+                category TEXT
+                    CHECK(category IS NULL OR category IN ('clothing', 'person', 'constraint')),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -130,6 +142,22 @@ def init_db(db_path):
                 photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
                 image_name TEXT NOT NULL,
                 PRIMARY KEY(photo_id, image_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS photo_image_analyses (
+                photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                checksum TEXT NOT NULL,
+                analysis_signature TEXT NOT NULL,
+                analysis_level TEXT NOT NULL
+                    CHECK(analysis_level IN ('neutral', 'low', 'medium', 'high')),
+                freepik_level TEXT NOT NULL
+                    CHECK(freepik_level IN ('neutral', 'low', 'medium', 'high')),
+                freepik_scores_json TEXT NOT NULL,
+                nudenet_detections_json TEXT NOT NULL,
+                automatic_tags_json TEXT NOT NULL,
+                models_json TEXT NOT NULL,
+                provider TEXT,
+                analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS face_identities (
@@ -252,6 +280,8 @@ def init_db(db_path):
             CREATE INDEX IF NOT EXISTS idx_album_photos_album ON album_photos(album_id, mtime DESC);
             CREATE INDEX IF NOT EXISTS idx_album_photos_photo ON album_photos(photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_tags_tag_photo ON photo_tags(tag_id, photo_id);
+            CREATE INDEX IF NOT EXISTS idx_photo_image_analyses_level
+                ON photo_image_analyses(analysis_level, photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_links_source ON photo_links(source_photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_links_target ON photo_links(target_photo_id);
             CREATE INDEX IF NOT EXISTS idx_photo_faces_photo ON photo_faces(photo_id);
@@ -261,6 +291,33 @@ def init_db(db_path):
             """
         )
         _ensure_column(conn, "photo_tags", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        _ensure_column(
+            conn,
+            "tags",
+            "sensitivity",
+            "TEXT NOT NULL DEFAULT 'neutral' CHECK(sensitivity IN ('neutral', 'low', 'medium', 'high'))",
+        )
+        _ensure_column(conn, "tags", "machine_key", "TEXT")
+        _ensure_column(
+            conn,
+            "tags",
+            "category",
+            "TEXT CHECK(category IS NULL OR category IN ('clothing', 'person', 'constraint'))",
+        )
+        conn.execute(
+            """
+            UPDATE tags
+            SET category='person'
+            WHERE id IN (SELECT tag_id FROM face_identities)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_machine_key
+            ON tags(machine_key)
+            WHERE machine_key IS NOT NULL
+            """
+        )
         _init_lora_tag_mapping_schema(conn)
 
 
@@ -912,19 +969,79 @@ def _photo_tag_filter_sql(include_tags, exclude_tags, photo_id_expression="ap.ph
     return " AND ".join(clauses), params
 
 
-def list_gallery_photos(conn, album_name, page=1, per_page=100, include_tags=None, exclude_tags=None):
+def normalize_sensitivity(value, default="neutral"):
+    value = str(value or default).strip().lower()
+    if value not in SENSITIVITY_RANKS:
+        raise ValueError("Invalid sensitivity")
+    return value
+
+
+def normalize_tag_category(value):
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    if value not in TAG_CATEGORIES:
+        raise ValueError("Invalid tag category")
+    return value
+
+
+def _sensitivity_rank_sql(value_expression):
+    return (
+        f"CASE {value_expression} "
+        "WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END"
+    )
+
+
+def _effective_sensitivity_rank_sql(photo_id_expression="p.id", analysis_alias="pia"):
+    analysis_rank = _sensitivity_rank_sql(f"COALESCE({analysis_alias}.analysis_level, 'neutral')")
+    tag_rank = _sensitivity_rank_sql("t_sensitivity.sensitivity")
+    return f"""
+        MAX(
+            {analysis_rank},
+            COALESCE((
+                SELECT MAX({tag_rank})
+                FROM photo_tags pt_sensitivity
+                JOIN tags t_sensitivity ON t_sensitivity.id=pt_sensitivity.tag_id
+                WHERE pt_sensitivity.photo_id={photo_id_expression}
+            ), 0)
+        )
+    """
+
+
+def sensitivity_from_rank(rank):
+    try:
+        return SENSITIVITY_LEVELS[max(0, min(int(rank), len(SENSITIVITY_LEVELS) - 1))]
+    except (TypeError, ValueError):
+        return "neutral"
+
+
+def list_gallery_photos(
+    conn,
+    album_name,
+    page=1,
+    per_page=100,
+    include_tags=None,
+    exclude_tags=None,
+    max_sensitivity="neutral",
+):
     album = get_album_by_name(conn, album_name)
     if not album:
         return None, [], 0
+    max_sensitivity = normalize_sensitivity(max_sensitivity)
+    max_sensitivity_rank = SENSITIVITY_RANKS[max_sensitivity]
     filter_sql, filter_params = _photo_tag_filter_sql(include_tags, exclude_tags)
     filter_clause = f" AND {filter_sql}" if filter_sql else ""
+    effective_rank_sql = _effective_sensitivity_rank_sql()
+    sensitivity_clause = f" AND ({effective_rank_sql}) <= ?"
     total = conn.execute(
         f"""
         SELECT COUNT(*) AS total
         FROM album_photos ap
-        WHERE ap.album_id=? AND ap.is_missing=0{filter_clause}
+        JOIN photos p ON p.id=ap.photo_id
+        LEFT JOIN photo_image_analyses pia ON pia.photo_id=p.id
+        WHERE ap.album_id=? AND ap.is_missing=0{filter_clause}{sensitivity_clause}
         """,
-        (album["id"], *filter_params),
+        (album["id"], *filter_params, max_sensitivity_rank),
     ).fetchone()["total"]
     offset = max(page - 1, 0) * per_page
     rows = conn.execute(
@@ -932,10 +1049,13 @@ def list_gallery_photos(conn, album_name, page=1, per_page=100, include_tags=Non
         SELECT p.*, ap.relative_path, ap.filename, ap.mtime, ap.file_size AS album_file_size,
                a.name AS album_name,
                fav.has_output, fav.has_user, fav.album_count, fav.user_album_count,
-               GROUP_CONCAT(DISTINCT t.name) AS tags
+               GROUP_CONCAT(DISTINCT t.name) AS tags,
+               pia.analysis_level,
+               ({effective_rank_sql}) AS effective_sensitivity_rank
         FROM album_photos ap
         JOIN photos p ON p.id = ap.photo_id
         JOIN albums a ON a.id = ap.album_id
+        LEFT JOIN photo_image_analyses pia ON pia.photo_id=p.id
         LEFT JOIN photo_tags pt ON pt.photo_id = p.id
         LEFT JOIN tags t ON t.id = pt.tag_id
         JOIN (
@@ -949,33 +1069,114 @@ def list_gallery_photos(conn, album_name, page=1, per_page=100, include_tags=Non
             WHERE ap2.is_missing = 0
             GROUP BY ap2.photo_id
         ) fav ON fav.photo_id = p.id
-        WHERE ap.album_id=? AND ap.is_missing=0{filter_clause}
+        WHERE ap.album_id=? AND ap.is_missing=0{filter_clause}{sensitivity_clause}
         GROUP BY p.id, ap.relative_path
         ORDER BY ap.mtime DESC
         LIMIT ? OFFSET ?
         """,
-        (album["id"], *filter_params, per_page, offset),
+        (album["id"], *filter_params, max_sensitivity_rank, per_page, offset),
     ).fetchall()
     return dict(album), [serialize_gallery_photo(row) for row in rows], total
 
 
-def list_album_tag_stats(conn, album_name):
+def list_album_tag_facets(
+    conn,
+    album_id,
+    include_tags=None,
+    exclude_tags=None,
+    max_sensitivity="neutral",
+):
+    include_tags = _normalized_tag_names(include_tags)
+    exclude_tags = _normalized_tag_names(exclude_tags)
+    max_sensitivity = normalize_sensitivity(max_sensitivity)
+    max_sensitivity_rank = SENSITIVITY_RANKS[max_sensitivity]
+    filter_sql, filter_params = _photo_tag_filter_sql(include_tags, exclude_tags)
+    filter_clause = f" AND {filter_sql}" if filter_sql else ""
+    effective_rank_sql = _effective_sensitivity_rank_sql()
+    cte_sql = f"""
+        WITH filtered_photos AS (
+            SELECT DISTINCT ap.photo_id
+            FROM album_photos ap
+            JOIN photos p ON p.id=ap.photo_id
+            LEFT JOIN photo_image_analyses pia ON pia.photo_id=p.id
+            WHERE ap.album_id=?
+              AND ap.is_missing=0
+              {filter_clause}
+              AND ({effective_rank_sql}) <= ?
+        )
+    """
+    params = (int(album_id), *filter_params, max_sensitivity_rank)
+    matching_photo_count = conn.execute(
+        cte_sql + "SELECT COUNT(*) AS total FROM filtered_photos",
+        params,
+    ).fetchone()["total"]
+    rows = conn.execute(
+        cte_sql
+        + """
+        SELECT t.id, t.name, t.category,
+               COUNT(DISTINCT fp.photo_id) AS occurrence_count
+        FROM filtered_photos fp
+        JOIN photo_tags pt ON pt.photo_id=fp.photo_id
+        JOIN tags t ON t.id=pt.tag_id
+        GROUP BY t.id, t.name, t.category
+        HAVING COUNT(DISTINCT fp.photo_id) > 0
+        ORDER BY occurrence_count DESC, t.name COLLATE NOCASE
+        """,
+        params,
+    ).fetchall()
+
+    active_names = list(include_tags)
+    active_names.extend(name for name in exclude_tags if name not in include_tags)
+    active_by_name = {}
+    if active_names:
+        placeholders = ",".join("?" for _ in active_names)
+        active_by_name = {
+            row["name"]: dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT id, name, category
+                FROM tags
+                WHERE name IN ({placeholders})
+                """,
+                tuple(active_names),
+            ).fetchall()
+        }
+    active_tags = []
+    for name in active_names:
+        item = active_by_name.get(
+            name,
+            {"id": None, "name": name, "category": None},
+        )
+        active_tags.append(
+            {
+                **item,
+                "filter_state": "include" if name in include_tags else "exclude",
+            }
+        )
+    return {
+        "matching_photo_count": matching_photo_count,
+        "tags": [dict(row) for row in rows],
+        "active_tags": active_tags,
+    }
+
+
+def list_album_tag_stats(
+    conn,
+    album_name,
+    include_tags=None,
+    exclude_tags=None,
+    max_sensitivity="high",
+):
     album = get_album_by_name(conn, album_name)
     if not album:
         return []
-    rows = conn.execute(
-        """
-        SELECT t.id, t.name, COUNT(*) AS occurrence_count
-        FROM album_photos ap
-        JOIN photo_tags pt ON pt.photo_id = ap.photo_id
-        JOIN tags t ON t.id = pt.tag_id
-        WHERE ap.album_id=? AND ap.is_missing=0
-        GROUP BY t.id, t.name
-        ORDER BY occurrence_count DESC, t.name COLLATE NOCASE
-        """,
-        (album["id"],),
-    ).fetchall()
-    return [dict(row) for row in rows]
+    return list_album_tag_facets(
+        conn,
+        album["id"],
+        include_tags=include_tags,
+        exclude_tags=exclude_tags,
+        max_sensitivity=max_sensitivity,
+    )["tags"]
 
 
 def serialize_gallery_photo(row):
@@ -993,6 +1194,8 @@ def serialize_gallery_photo(row):
         "height": data["height"],
         "mtime": data["mtime"],
         "tags": _split_tags(data.get("tags")),
+        "analysis_level": data.get("analysis_level"),
+        "effective_sensitivity": sensitivity_from_rank(data.get("effective_sensitivity_rank")),
         "favorite": bool(data["has_output"] and data["has_user"]),
         "album_count": data["album_count"],
         "user_album_count": data["user_album_count"],
@@ -1022,13 +1225,26 @@ def get_photo_detail(conn, photo_id):
     links = list_photo_links(conn, photo_id)
     tags = conn.execute(
         """
-        SELECT t.id, t.name, pt.source FROM tags t
+        SELECT t.id, t.name, t.category, pt.source FROM tags t
         JOIN photo_tags pt ON pt.tag_id=t.id
         WHERE pt.photo_id=?
         ORDER BY t.name COLLATE NOCASE
         """,
         (photo_id,),
     ).fetchall()
+    image_analysis = conn.execute(
+        "SELECT * FROM photo_image_analyses WHERE photo_id=?",
+        (photo_id,),
+    ).fetchone()
+    effective_row = conn.execute(
+        f"""
+        SELECT ({_effective_sensitivity_rank_sql('p.id', 'pia')}) AS effective_sensitivity_rank
+        FROM photos p
+        LEFT JOIN photo_image_analyses pia ON pia.photo_id=p.id
+        WHERE p.id=?
+        """,
+        (photo_id,),
+    ).fetchone()
     serialized_memberships = []
     first_available = None
     for row in memberships:
@@ -1047,6 +1263,17 @@ def get_photo_detail(conn, photo_id):
         serialized_memberships.append(membership)
         if available and first_available is None:
             first_available = membership
+    serialized_analysis = None
+    if image_analysis:
+        serialized_analysis = dict(image_analysis)
+        for source_key, target_key in (
+            ("freepik_scores_json", "freepik_scores"),
+            ("nudenet_detections_json", "nudenet_detections"),
+            ("automatic_tags_json", "automatic_tags"),
+            ("models_json", "models"),
+        ):
+            serialized_analysis[target_key] = json.loads(serialized_analysis.pop(source_key) or "null")
+        serialized_analysis["scanned"] = True
     return {
         "id": photo["id"],
         "checksum": photo["checksum"],
@@ -1061,6 +1288,10 @@ def get_photo_detail(conn, photo_id):
         "used_images": [row["image_name"] for row in used_images],
         "links": links,
         "face_analysis": list_photo_faces(conn, photo_id),
+        "image_analysis": serialized_analysis,
+        "effective_sensitivity": sensitivity_from_rank(
+            effective_row["effective_sensitivity_rank"] if effective_row else 0
+        ),
     }
 
 
@@ -1304,12 +1535,35 @@ def upsert_tag(conn, name):
     return conn.execute("SELECT * FROM tags WHERE name=?", (cleaned,)).fetchone()
 
 
+def upsert_machine_tag(conn, machine_key, display_name):
+    machine_key = str(machine_key or "").strip()
+    display_name = str(display_name or "").strip()
+    if not machine_key or not display_name:
+        raise ValueError("Machine tag key and display name are required")
+    row = conn.execute("SELECT * FROM tags WHERE machine_key=?", (machine_key,)).fetchone()
+    if row:
+        return row
+    row = conn.execute("SELECT * FROM tags WHERE name=?", (display_name,)).fetchone()
+    if row:
+        if not row["machine_key"]:
+            conn.execute("UPDATE tags SET machine_key=? WHERE id=?", (machine_key, row["id"]))
+        return conn.execute("SELECT * FROM tags WHERE id=?", (row["id"],)).fetchone()
+    conn.execute(
+        "INSERT INTO tags(name, machine_key) VALUES (?, ?)",
+        (display_name, machine_key),
+    )
+    return conn.execute("SELECT * FROM tags WHERE machine_key=?", (machine_key,)).fetchone()
+
+
 def set_photo_tags(conn, photo_id, tag_names):
-    conn.execute("DELETE FROM photo_tags WHERE photo_id=?", (photo_id,))
+    conn.execute("DELETE FROM photo_tags WHERE photo_id=? AND source='manual'", (photo_id,))
     for name in tag_names:
         tag = upsert_tag(conn, name)
         conn.execute(
-            "INSERT OR REPLACE INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, 'manual')",
+            """
+            INSERT INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, 'manual')
+            ON CONFLICT(photo_id, tag_id) DO UPDATE SET source='manual'
+            """,
             (photo_id, tag["id"]),
         )
 
@@ -1357,6 +1611,151 @@ def list_tags(conn):
     return [dict(row) for row in conn.execute("SELECT * FROM tags ORDER BY name COLLATE NOCASE").fetchall()]
 
 
+def list_tag_stats(conn):
+    rows = conn.execute(
+        """
+        SELECT t.id, t.name, t.machine_key, t.sensitivity, t.category,
+               CASE WHEN fi.id IS NULL THEN 0 ELSE 1 END AS is_face_tag,
+               COUNT(DISTINCT pt.photo_id) AS occurrence_count
+        FROM tags t
+        JOIN photo_tags pt ON pt.tag_id=t.id
+        JOIN album_photos ap ON ap.photo_id=pt.photo_id AND ap.is_missing=0
+        LEFT JOIN face_identities fi ON fi.tag_id=t.id
+        GROUP BY t.id
+        ORDER BY occurrence_count DESC, t.name COLLATE NOCASE
+        """
+    ).fetchall()
+    return [
+        {
+            **dict(row),
+            "is_face_tag": bool(row["is_face_tag"]),
+        }
+        for row in rows
+    ]
+
+
+def set_tag_sensitivity(conn, tag_id, sensitivity):
+    return update_tag_settings(conn, tag_id, sensitivity=sensitivity)
+
+
+_TAG_SETTING_UNSET = object()
+
+
+def update_tag_settings(
+    conn,
+    tag_id,
+    sensitivity=_TAG_SETTING_UNSET,
+    category=_TAG_SETTING_UNSET,
+):
+    tag_id = int(tag_id)
+    current = conn.execute(
+        """
+        SELECT t.*,
+               CASE WHEN fi.id IS NULL THEN 0 ELSE 1 END AS is_face_tag
+        FROM tags t
+        LEFT JOIN face_identities fi ON fi.tag_id=t.id
+        WHERE t.id=?
+        """,
+        (tag_id,),
+    ).fetchone()
+    if not current:
+        raise KeyError("Tag not found")
+    updates = {}
+    if sensitivity is not _TAG_SETTING_UNSET:
+        updates["sensitivity"] = normalize_sensitivity(sensitivity)
+    if category is not _TAG_SETTING_UNSET:
+        normalized_category = normalize_tag_category(category)
+        if current["is_face_tag"] and normalized_category != "person":
+            raise TagCategoryLocked("Face tags must keep the person category")
+        updates["category"] = normalized_category
+    if updates:
+        assignments = ", ".join(f"{column}=?" for column in updates)
+        conn.execute(
+            f"UPDATE tags SET {assignments} WHERE id=?",
+            (*updates.values(), tag_id),
+        )
+    row = conn.execute(
+        """
+        SELECT t.*,
+               CASE WHEN fi.id IS NULL THEN 0 ELSE 1 END AS is_face_tag
+        FROM tags t
+        LEFT JOIN face_identities fi ON fi.tag_id=t.id
+        WHERE t.id=?
+        """,
+        (tag_id,),
+    ).fetchone()
+    return {
+        **dict(row),
+        "is_face_tag": bool(row["is_face_tag"]),
+    }
+
+
+def photo_image_analysis_cache_valid(conn, photo_id, checksum, analysis_signature):
+    row = conn.execute(
+        """
+        SELECT 1 FROM photo_image_analyses
+        WHERE photo_id=? AND checksum=? AND analysis_signature=?
+        """,
+        (photo_id, checksum, analysis_signature),
+    ).fetchone()
+    return bool(row)
+
+
+def replace_photo_image_analysis(conn, photo_id, checksum, analysis_signature, result):
+    automatic_tags = list(result.get("automatic_tags") or [])
+    conn.execute("DELETE FROM photo_tags WHERE photo_id=? AND source='image_auto'", (photo_id,))
+    for automatic_tag in automatic_tags:
+        raw_name = str(automatic_tag.get("name") or "").strip()
+        display_name = str(automatic_tag.get("display_name") or raw_name.replace("_", " ")).strip()
+        if not raw_name or not display_name:
+            continue
+        tag = upsert_machine_tag(conn, f"wd:{raw_name}", display_name)
+        conn.execute(
+            """
+            INSERT INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, 'image_auto')
+            ON CONFLICT(photo_id, tag_id) DO UPDATE SET
+                source=CASE
+                    WHEN photo_tags.source='image_auto' THEN excluded.source
+                    ELSE photo_tags.source
+                END
+            """,
+            (photo_id, tag["id"]),
+        )
+    conn.execute(
+        """
+        INSERT INTO photo_image_analyses(
+            photo_id, checksum, analysis_signature, analysis_level, freepik_level,
+            freepik_scores_json, nudenet_detections_json, automatic_tags_json,
+            models_json, provider, analyzed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(photo_id) DO UPDATE SET
+            checksum=excluded.checksum,
+            analysis_signature=excluded.analysis_signature,
+            analysis_level=excluded.analysis_level,
+            freepik_level=excluded.freepik_level,
+            freepik_scores_json=excluded.freepik_scores_json,
+            nudenet_detections_json=excluded.nudenet_detections_json,
+            automatic_tags_json=excluded.automatic_tags_json,
+            models_json=excluded.models_json,
+            provider=excluded.provider,
+            analyzed_at=CURRENT_TIMESTAMP
+        """,
+        (
+            photo_id,
+            checksum,
+            analysis_signature,
+            normalize_sensitivity(result.get("analysis_level")),
+            normalize_sensitivity(result.get("freepik_level")),
+            json.dumps(result.get("freepik_scores") or {}, ensure_ascii=False),
+            json.dumps(result.get("nudenet_detections") or [], ensure_ascii=False),
+            json.dumps(automatic_tags, ensure_ascii=False),
+            json.dumps(result.get("models") or {}, ensure_ascii=False),
+            result.get("provider"),
+        ),
+    )
+
+
 def list_lora_tag_mappings(conn):
     rows = conn.execute(
         """
@@ -1365,7 +1764,8 @@ def list_lora_tag_mappings(conn):
             ltm.lora_name,
             ltm.created_at,
             t.id AS tag_id,
-            t.name AS tag_name
+            t.name AS tag_name,
+            t.category AS tag_category
         FROM lora_tag_mappings ltm
         JOIN lora_tag_mapping_tags lmtt ON lmtt.mapping_id=ltm.id
         JOIN tags t ON t.id=lmtt.tag_id
@@ -1385,7 +1785,13 @@ def list_lora_tag_mappings(conn):
             }
             by_id[row["id"]] = mapping
             mappings.append(mapping)
-        mapping["tags"].append({"id": row["tag_id"], "name": row["tag_name"]})
+        mapping["tags"].append(
+            {
+                "id": row["tag_id"],
+                "name": row["tag_name"],
+                "category": row["tag_category"],
+            }
+        )
     return mappings
 
 
@@ -1502,6 +1908,10 @@ def create_face_identity(
         review_threshold, automatic_threshold, margin_threshold
     )
     tag = upsert_tag(conn, tag_name)
+    conn.execute(
+        "UPDATE tags SET category='person' WHERE id=?",
+        (tag["id"],),
+    )
     existing = conn.execute("SELECT id FROM face_identities WHERE tag_id=?", (tag["id"],)).fetchone()
     if existing:
         raise ValueError("This tag already has a face identity")
@@ -1592,6 +2002,10 @@ def update_face_identity(conn, identity_id, **updates):
         if conflict:
             raise ValueError("This tag already has a face identity")
         tag_id = tag["id"]
+    conn.execute(
+        "UPDATE tags SET category='person' WHERE id=?",
+        (tag_id,),
+    )
     enabled = int(bool(updates.get("enabled", current["enabled"])))
     conn.execute(
         """

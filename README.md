@@ -95,6 +95,30 @@ Existing tags are migrated as manual tags. A face rescan can remove only tags th
 
 The InsightFace source code and its pretrained model weights have different license terms. The supplied `buffalo_l` weights are intended here for local non-commercial use; obtain the appropriate model license before commercial deployment.
 
+## Local image analysis
+
+The scan dialog can classify image sensitivity and add visual tags without sending gallery images to ComfyUI or another remote service:
+
+- `Freepik/nsfw_image_detector` supplies the ordered `neutral`, `low`, `medium`, and `high` probabilities.
+- NudeNet confirms exposed body regions and can raise the resulting sensitivity.
+- `SmilingWolf/wd-swinv2-tagger-v3` adds general English tags such as clothing and visual attributes.
+
+Install the optional runtime:
+
+```powershell
+python -m pip install -r requirements-analysis.txt
+```
+
+Install a PyTorch build and exactly one ONNX Runtime backend appropriate for the machine. The NVIDIA variant is:
+
+```powershell
+python -m pip install onnxruntime-gpu
+```
+
+The Freepik and WD SwinV2 files are downloaded automatically on the first image-analysis scan. NudeNet's default 320n model is included in its Python package. Files are cached below `instance/image_models`; set `IMAGE_MODEL_ROOT` to use another cache directory and `HF_TOKEN` when Hugging Face authentication is required.
+
+The first analysis can therefore take several minutes. Missing dependencies or download failures are reported by the scan and do not delete an older successful analysis. A single photo can be analyzed again from its detail panel with the `Image IA` button.
+
 Customization
 You can customize the gallery's appearance and behavior by modifying the HTML templates, CSS styles, and the Flask application code. Feel free to tailor it to your specific requirements.
 

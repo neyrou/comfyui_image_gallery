@@ -29,7 +29,9 @@ from comfy_generation import (
 from gallery_db import (
     ALLOWED_ALBUM_TYPES,
     ALLOWED_LINK_TYPES,
+    SENSITIVITY_LEVELS,
     ScanCancelled,
+    TagCategoryLocked,
     connect_db,
     create_lora_tag_mapping,
     create_photo_link,
@@ -45,17 +47,21 @@ from gallery_db import (
     import_output_photo,
     init_db,
     is_album_path_available,
-    list_album_tag_stats,
+    list_album_tag_facets,
     list_albums,
     list_gallery_photos,
     list_lora_tag_mappings,
+    list_tag_stats,
     list_tags,
     output_paths_from_history,
     rescan_metadata,
+    replace_photo_image_analysis,
     scan_albums,
     search_photos,
     set_photo_tags,
+    photo_image_analysis_cache_valid,
     update_lora_tag_mapping,
+    update_tag_settings,
     update_photo_tags,
     update_album,
     add_gallery_face_reference,
@@ -80,6 +86,7 @@ from gallery_db import (
     update_face_identity,
 )
 from face_recognition import FaceRecognitionError, FaceRecognitionUnavailable, InsightFaceEngine
+from image_analysis import ImageAnalysisError, ImageAnalysisUnavailable, LocalImageAnalysisEngine
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -93,6 +100,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 COMFY_CLIENT_FACTORY = ComfyClient
 FACE_ENGINE_FACTORY = InsightFaceEngine
+IMAGE_ANALYSIS_ENGINE_FACTORY = LocalImageAnalysisEngine
 SCAN_LOCK = threading.Lock()
 COMFY_JOB_LOCK = threading.Lock()
 FACE_WORKER_LOCK = threading.Lock()
@@ -100,6 +108,9 @@ FACE_ENGINE_LOCK = threading.Lock()
 COMFY_JOBS = {}
 FACE_WORKER_THREAD = None
 FACE_ENGINE_INSTANCE = None
+IMAGE_ANALYSIS_ENGINE_INSTANCE = None
+IMAGE_ANALYSIS_ENGINE_LOCK = threading.Lock()
+IMAGE_ANALYSIS_RUN_LOCK = threading.Lock()
 FACE_RECOVERED_DATABASES = set()
 SCAN_STATUS = {
     "active": False,
@@ -118,6 +129,10 @@ SCAN_STATUS = {
     "cancel_requested": False,
     "face_job_id": None,
     "face_job": None,
+    "analysis_total": 0,
+    "analysis_processed": 0,
+    "analysis_skipped": 0,
+    "analysis_errors": 0,
     "started_at": None,
     "updated_at": None,
     "finished_at": None,
@@ -142,6 +157,14 @@ def get_face_engine():
         if FACE_ENGINE_INSTANCE is None:
             FACE_ENGINE_INSTANCE = FACE_ENGINE_FACTORY()
         return FACE_ENGINE_INSTANCE
+
+
+def get_image_analysis_engine():
+    global IMAGE_ANALYSIS_ENGINE_INSTANCE
+    with IMAGE_ANALYSIS_ENGINE_LOCK:
+        if IMAGE_ANALYSIS_ENGINE_INSTANCE is None:
+            IMAGE_ANALYSIS_ENGINE_INSTANCE = IMAGE_ANALYSIS_ENGINE_FACTORY()
+        return IMAGE_ANALYSIS_ENGINE_INSTANCE
 
 
 def recover_face_jobs():
@@ -692,8 +715,18 @@ def photo_membership_summary(conn, photo_id):
     }
 
 
-def gallery_page_url(album_name, page, include_tags=None, exclude_tags=None):
-    params = [("album", album_name), ("page", page)]
+def gallery_page_url(
+    album_name,
+    page,
+    include_tags=None,
+    exclude_tags=None,
+    max_sensitivity="neutral",
+):
+    params = [
+        ("album", album_name),
+        ("page", page),
+        ("max_sensitivity", max_sensitivity),
+    ]
     params.extend(("include_tag", tag_name) for tag_name in include_tags or [])
     params.extend(("exclude_tag", tag_name) for tag_name in exclude_tags or [])
     return f"?{urlencode(params)}"
@@ -824,6 +857,99 @@ def enqueue_scan_face_stage(job_id, options, processed_photo_ids):
     return enqueue_automatic_face_scan(params={"parent_scan_job_id": job_id})
 
 
+def image_analysis_photo_ids(options, processed_photo_ids):
+    if not options.get("image_analysis"):
+        return []
+    if not options.get("rescan_existing"):
+        return list(dict.fromkeys(processed_photo_ids))
+    with connect_db(DB_PATH) as conn:
+        if options.get("album"):
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ap.photo_id
+                FROM album_photos ap
+                JOIN albums a ON a.id=ap.album_id
+                WHERE a.name=? AND ap.is_missing=0
+                ORDER BY ap.photo_id
+                """,
+                (options["album"],),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT photo_id FROM album_photos WHERE is_missing=0 ORDER BY photo_id"
+            ).fetchall()
+    return [row["photo_id"] for row in rows]
+
+
+def run_image_analysis_stage(job_id, options, processed_photo_ids, sync=False):
+    photo_ids = image_analysis_photo_ids(options, processed_photo_ids)
+    if not photo_ids:
+        return {"total": 0, "processed": 0, "skipped": 0, "errors": 0}
+    engine = get_image_analysis_engine()
+
+    def model_progress(message):
+        if not sync:
+            update_scan_status(stage="image_analysis", message=message, analysis_total=len(photo_ids))
+
+    with IMAGE_ANALYSIS_RUN_LOCK:
+        engine.preload(progress_callback=model_progress)
+    summary = {"total": len(photo_ids), "processed": 0, "skipped": 0, "errors": 0}
+    force = bool(options.get("rescan_existing"))
+    for position, photo_id in enumerate(photo_ids, start=1):
+        if not sync and scan_job_cancel_requested(job_id):
+            raise ScanCancelled("Analyse d'image annulee")
+        try:
+            with connect_db(DB_PATH) as conn:
+                photo = conn.execute("SELECT id, checksum FROM photos WHERE id=?", (photo_id,)).fetchone()
+                if not photo:
+                    raise ValueError("Photo introuvable")
+                image_path = find_photo_file(conn, photo_id)
+                if not image_path:
+                    raise ValueError("Fichier photo introuvable")
+                cached = (
+                    not force
+                    and photo_image_analysis_cache_valid(
+                        conn,
+                        photo_id,
+                        photo["checksum"],
+                        engine.analysis_signature,
+                    )
+                )
+            if cached:
+                summary["skipped"] += 1
+            else:
+                with IMAGE_ANALYSIS_RUN_LOCK:
+                    result = engine.analyze_path(image_path)
+                with connect_db(DB_PATH) as conn:
+                    replace_photo_image_analysis(
+                        conn,
+                        photo_id,
+                        photo["checksum"],
+                        engine.analysis_signature,
+                        result,
+                    )
+                summary["processed"] += 1
+        except ImageAnalysisUnavailable:
+            raise
+        except Exception as exc:
+            summary["errors"] += 1
+            if not sync:
+                with SCAN_LOCK:
+                    SCAN_STATUS["errors"].append(
+                        {"photo_id": photo_id, "stage": "image_analysis", "error": str(exc)}
+                    )
+        if not sync:
+            update_scan_status(
+                stage="image_analysis",
+                message=f"Analyse d'image {position}/{len(photo_ids)}",
+                analysis_total=len(photo_ids),
+                analysis_processed=summary["processed"],
+                analysis_skipped=summary["skipped"],
+                analysis_errors=summary["errors"],
+            )
+    return summary
+
+
 def run_scan_job(job_id, options):
     try:
         summary = scan_albums(
@@ -838,6 +964,10 @@ def run_scan_job(job_id, options):
             album_name=options.get("album"),
         )
         processed_photo_ids = summary.pop("processed_photo_ids", [])
+        if scan_job_cancel_requested(job_id):
+            raise ScanCancelled("Scan annule")
+        analysis_summary = run_image_analysis_stage(job_id, options, processed_photo_ids)
+        summary["image_analysis"] = analysis_summary
         if scan_job_cancel_requested(job_id):
             raise ScanCancelled("Scan annule")
         face_job = enqueue_scan_face_stage(job_id, options, processed_photo_ids)
@@ -889,6 +1019,13 @@ def image_gallery():
     ensure_ready()
     page = max(request.args.get("page", 1, type=int), 1)
     requested_album = request.args.get("album")
+    max_sensitivity = (
+        request.args.get("max_sensitivity")
+        or request.cookies.get("gallery_max_sensitivity")
+        or "neutral"
+    )
+    if max_sensitivity not in SENSITIVITY_LEVELS:
+        max_sensitivity = "neutral"
     include_tags = normalized_query_tag_names(request.args.getlist("include_tag"))
     exclude_tags = normalized_query_tag_names(request.args.getlist("exclude_tag"))
     with connect_db(DB_PATH) as conn:
@@ -902,17 +1039,34 @@ def image_gallery():
                 per_page=PER_PAGE,
                 include_tags=include_tags,
                 exclude_tags=exclude_tags,
+                max_sensitivity=max_sensitivity,
             )
             if album_name
             else (None, [], 0)
         )
         album = next((item for item in albums if item["name"] == album_name), None)
-        album_tag_stats = list_album_tag_stats(conn, album_name) if album_name else []
+        album_facets = (
+            list_album_tag_facets(
+                conn,
+                album["id"],
+                include_tags=include_tags,
+                exclude_tags=exclude_tags,
+                max_sensitivity=max_sensitivity,
+            )
+            if album
+            else {"matching_photo_count": 0, "tags": [], "active_tags": []}
+        )
         tags = list_tags(conn)
     total_pages = max((total + PER_PAGE - 1) // PER_PAGE, 1)
     pagination_urls = (
         {
-            page_number: gallery_page_url(album_name, page_number, include_tags, exclude_tags)
+            page_number: gallery_page_url(
+                album_name,
+                page_number,
+                include_tags,
+                exclude_tags,
+                max_sensitivity,
+            )
             for page_number in range(1, total_pages + 1)
         }
         if album_name
@@ -927,10 +1081,15 @@ def image_gallery():
         page=page,
         total_pages=total_pages,
         pagination_urls=pagination_urls,
-        album_tag_stats=album_tag_stats,
+        album_tag_stats=album_facets["tags"],
+        active_tag_stats=album_facets["active_tags"],
+        filtered_photo_count=total,
         include_tags=include_tags,
         exclude_tags=exclude_tags,
         filter_active=bool(include_tags or exclude_tags),
+        gallery_filter_active=bool(include_tags or exclude_tags or max_sensitivity != "high"),
+        max_sensitivity=max_sensitivity,
+        sensitivity_levels=SENSITIVITY_LEVELS,
         allowed_album_types=sorted(ALLOWED_ALBUM_TYPES),
         allowed_link_types=sorted(ALLOWED_LINK_TYPES),
     )
@@ -941,6 +1100,31 @@ def api_albums():
     ensure_ready()
     with connect_db(DB_PATH) as conn:
         return jsonify({"albums": list_albums(conn)})
+
+
+@app.get("/api/albums/<int:album_id>/tag-facets")
+def api_album_tag_facets(album_id):
+    ensure_ready()
+    max_sensitivity = request.args.get("max_sensitivity") or "neutral"
+    if max_sensitivity not in SENSITIVITY_LEVELS:
+        return jsonify({"ok": False, "error": "Invalid sensitivity"}), 400
+    include_tags = normalized_query_tag_names(request.args.getlist("include_tag"))
+    exclude_tags = normalized_query_tag_names(request.args.getlist("exclude_tag"))
+    with connect_db(DB_PATH) as conn:
+        album = conn.execute(
+            "SELECT id FROM albums WHERE id=?",
+            (album_id,),
+        ).fetchone()
+        if not album:
+            return jsonify({"ok": False, "error": "Album not found"}), 404
+        facets = list_album_tag_facets(
+            conn,
+            album_id,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            max_sensitivity=max_sensitivity,
+        )
+    return jsonify({"ok": True, **facets})
 
 
 @app.patch("/api/albums/<int:album_id>")
@@ -979,8 +1163,6 @@ def api_scan():
         sync = scan_payload_boolean(payload, "sync", False)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    if options["image_analysis"]:
-        return jsonify({"ok": False, "error": "L'analyse d'image ComfyUI n'est pas encore disponible"}), 400
     if not options["face_recognition"] or not options["rescan_existing"]:
         options["force_face_rescan"] = False
 
@@ -995,6 +1177,12 @@ def api_scan():
                 album_name=album_name,
             )
             processed_photo_ids = summary.pop("processed_photo_ids", [])
+            summary["image_analysis"] = run_image_analysis_stage(
+                "sync",
+                options,
+                processed_photo_ids,
+                sync=True,
+            )
             if options["face_recognition"]:
                 if options["rescan_existing"]:
                     scope = "album" if album_name else "all"
@@ -1047,6 +1235,10 @@ def api_scan():
                 "cancel_requested": False,
                 "face_job_id": None,
                 "face_job": None,
+                "analysis_total": 0,
+                "analysis_processed": 0,
+                "analysis_skipped": 0,
+                "analysis_errors": 0,
                 "started_at": time.time(),
                 "updated_at": time.time(),
                 "finished_at": None,
@@ -1090,6 +1282,45 @@ def api_photo_detail(photo_id):
         detail = get_photo_detail(conn, photo_id)
     if not detail:
         return jsonify({"ok": False, "error": "Photo not found"}), 404
+    return jsonify({"ok": True, "photo": detail})
+
+
+@app.post("/api/photos/<int:photo_id>/image-analysis/rescan")
+def api_rescan_photo_image_analysis(photo_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        photo = conn.execute(
+            "SELECT id, checksum FROM photos WHERE id=?",
+            (photo_id,),
+        ).fetchone()
+        image_path = find_photo_file(conn, photo_id) if photo else None
+    if not photo:
+        return jsonify({"ok": False, "error": "Photo not found"}), 404
+    if not image_path:
+        return jsonify({"ok": False, "error": "No file found for this photo"}), 404
+
+    engine = get_image_analysis_engine()
+    try:
+        with IMAGE_ANALYSIS_RUN_LOCK:
+            result = engine.analyze_path(image_path)
+    except ImageAnalysisUnavailable as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503
+    except ImageAnalysisError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 422
+    except Exception as exc:
+        return jsonify(
+            {"ok": False, "error": f"Échec de l'analyse d'image : {exc}"}
+        ), 500
+
+    with connect_db(DB_PATH) as conn:
+        replace_photo_image_analysis(
+            conn,
+            photo_id,
+            photo["checksum"],
+            engine.analysis_signature,
+            result,
+        )
+        detail = get_photo_detail(conn, photo_id)
     return jsonify({"ok": True, "photo": detail})
 
 
@@ -1536,7 +1767,35 @@ def api_delete_link(link_id):
 def api_tags():
     ensure_ready()
     with connect_db(DB_PATH) as conn:
-        return jsonify({"ok": True, "tags": list_tags(conn)})
+        return jsonify({"ok": True, "tags": list_tag_stats(conn)})
+
+
+@app.patch("/api/tags/<int:tag_id>")
+def api_update_tag(tag_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    allowed_keys = {"sensitivity", "category"}
+    if (
+        not isinstance(payload, dict)
+        or not payload
+        or not set(payload).issubset(allowed_keys)
+    ):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "Provide sensitivity and/or category only",
+            }
+        ), 400
+    try:
+        with connect_db(DB_PATH) as conn:
+            tag = update_tag_settings(conn, tag_id, **payload)
+    except TagCategoryLocked as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except KeyError:
+        return jsonify({"ok": False, "error": "Tag not found"}), 404
+    return jsonify({"ok": True, "tag": tag})
 
 
 @app.get("/api/lora-tag-mappings")

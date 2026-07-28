@@ -13,7 +13,9 @@
             <div>
                 <h1>ComfyUI Gallery</h1>
                 {% if selected_album %}
-                    <p>{{ selected_album.display_name }} · {{ selected_album.type }} · {{ selected_album.photo_count or 0 }} images</p>
+                    <p>{{ selected_album.display_name }} · {{ selected_album.type }} ·
+                        <strong class="album-photo-ratio">{{ filtered_photo_count }}/{{ selected_album.photo_count or 0 }}</strong> images
+                    </p>
                 {% else %}
                     <p>Aucun album disponible</p>
                 {% endif %}
@@ -29,6 +31,19 @@
                         </option>
                     {% endfor %}
                 </select>
+            </label>
+            <label class="field sensitivity-toolbar-field">
+                <span>Sensibilit&eacute;</span>
+                <span class="sensitivity-selector" id="gallery-sensitivity-selector"
+                      role="radiogroup" aria-label="Sensibilit&eacute; maximale">
+                    {% for level in sensitivity_levels %}
+                        <button type="button" role="radio"
+                                class="sensitivity-step sensitivity-{{ level }}{% if level == max_sensitivity %} is-selected{% endif %}"
+                                data-gallery-sensitivity="{{ level }}"
+                                aria-checked="{{ 'true' if level == max_sensitivity else 'false' }}"
+                                title="{{ level }}">{{ level|capitalize }}</button>
+                    {% endfor %}
+                </span>
             </label>
             <button id="filter-button" class="toolbar-icon-button{% if filter_active %} is-active{% endif %}" type="button"
                     title="Filtrer par tags" aria-label="Filtrer par tags" aria-pressed="{{ 'true' if filter_active else 'false' }}">
@@ -122,9 +137,9 @@
             </ul>
         {% else %}
             <section class="empty-state">
-                {% if filter_active %}
+                {% if gallery_filter_active %}
                     <h2>Aucune photo ne correspond aux filtres</h2>
-                    <p>Modifie ou réinitialise les filtres de tags pour afficher davantage de photos.</p>
+                    <p>Modifiez la sensibilit&eacute; ou les filtres de tags pour afficher davantage de photos.</p>
                 {% else %}
                     <h2>Aucune image scannée</h2>
                     <p>Lance un rescan si les dossiers viennent d’être ajoutés ou si les albums sont des liens symboliques.</p>
@@ -192,9 +207,9 @@
                         <input id="scan-options-force-faces" type="checkbox">
                         <span>Forcer une nouvelle d&eacute;tection des visages</span>
                     </label>
-                    <label class="checkbox-field is-disabled">
-                        <input id="scan-options-image-analysis" type="checkbox" disabled>
-                        <span>Analyse d'image avec ComfyUI <small>(bient&ocirc;t disponible)</small></span>
+                    <label class="checkbox-field">
+                        <input id="scan-options-image-analysis" type="checkbox">
+                        <span>Analyse d'image locale <small>(sensibilit&eacute; + tags)</small></span>
                     </label>
                 </fieldset>
                 <div class="comfy-status" id="scan-options-status" role="status" aria-live="polite"></div>
@@ -237,6 +252,8 @@
                 <div class="panel-header">
                     <h2 id="detail-title">Détails</h2>
                     <div class="panel-actions">
+                        <button type="button" id="rescan-image-analysis-button"
+                                title="Réanalyser l'image localement">Image IA &#8635;</button>
                         <button type="button" id="rescan-metadata-button">JSON &#128472;</button>
                     </div>
                 </div>
@@ -262,6 +279,13 @@
                         <button id="save-photo-tags-button" type="button">Enregistrer</button>
                     </div>
                 </section>
+                <details class="image-analysis-detail" id="detail-image-analysis">
+                    <summary>
+                        Analyse d'image
+                        <span class="sensitivity-badge" id="detail-effective-sensitivity">neutral</span>
+                    </summary>
+                    <div id="detail-image-analysis-content"></div>
+                </details>
                 <section class="face-detail-section">
                     <div class="section-heading-row">
                         <h3>Visages</h3>
@@ -397,6 +421,8 @@
                     <button class="config-nav-button" type="button" role="tab" aria-selected="false"
                             aria-controls="config-section-tags" data-config-section="tags">Tags</button>
                     <button class="config-nav-button" type="button" role="tab" aria-selected="false"
+                            aria-controls="config-section-lora-tags" data-config-section="lora-tags">Lora Tags</button>
+                    <button class="config-nav-button" type="button" role="tab" aria-selected="false"
                             aria-controls="config-section-faces" data-config-section="faces">Reconnaissance faciale</button>
                 </nav>
                 <div class="config-content">
@@ -407,6 +433,17 @@
                     </section>
 
                     <section class="config-section" id="config-section-tags" role="tabpanel" data-config-panel="tags" hidden>
+                        <h3>Tags</h3>
+                        <p class="config-section-intro">Affectez une sensibilit&eacute; et une cat&eacute;gorie aux tags trouv&eacute;s dans la galerie.</p>
+                        <label class="form-field tag-sensitivity-search">
+                            <span>Rechercher</span>
+                            <input id="tag-sensitivity-search" type="search" placeholder="bikini, android, portrait...">
+                        </label>
+                        <div class="comfy-status" id="tag-sensitivity-status" role="status" aria-live="polite"></div>
+                        <div class="tag-sensitivity-list" id="tag-sensitivity-list"></div>
+                    </section>
+
+                    <section class="config-section" id="config-section-lora-tags" role="tabpanel" data-config-panel="lora-tags" hidden>
                         <h3>Affectations automatiques</h3>
                         <p class="config-section-intro">Associez un LoRA actif à un ou plusieurs tags ajoutés lors du prochain Scan JSON.</p>
                         <form id="lora-tag-mapping-form" class="lora-tag-mapping-form">
@@ -485,7 +522,22 @@
                 </div>
                 <button type="button" data-close-tag-filter title="Fermer" aria-label="Fermer">×</button>
             </div>
-            <div class="tag-filter-list" id="tag-filter-list"></div>
+            <div class="tag-filter-controls">
+                <label class="form-field tag-filter-search">
+                    <span>Rechercher</span>
+                    <input id="tag-filter-search" type="search" placeholder="bikini, portrait, contrainte...">
+                </label>
+                <div class="tag-filter-summary">
+                    <strong>Filtres actifs</strong>
+                    <span id="tag-filter-match-count"></span>
+                </div>
+                <div class="tag-filter-active-list" id="tag-filter-active-list"></div>
+                <div class="comfy-status tag-filter-status" id="tag-filter-status"
+                     role="status" aria-live="polite"></div>
+            </div>
+            <div class="tag-filter-scroll">
+                <div class="tag-filter-list" id="tag-filter-list"></div>
+            </div>
         </section>
     </div>
 
@@ -498,10 +550,14 @@
             selectedAlbum: {{ selected_album|tojson }},
             allowedAlbumTypes: {{ allowed_album_types|tojson }},
             albumTagStats: {{ album_tag_stats|tojson }},
+            activeTagStats: {{ active_tag_stats|tojson }},
+            filteredPhotoCount: {{ filtered_photo_count|tojson }},
             tagFilters: {
                 include: {{ include_tags|tojson }},
                 exclude: {{ exclude_tags|tojson }}
-            }
+            },
+            maxSensitivity: {{ max_sensitivity|tojson }},
+            sensitivityLevels: {{ sensitivity_levels|tojson }}
         };
     </script>
     <script src="{{ url_for('static', filename='gallery.js') }}"></script>

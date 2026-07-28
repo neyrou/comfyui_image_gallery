@@ -12,15 +12,18 @@ import gallery_db as gallery_db_module
 from gallery_db import (
     ScanCancelled,
     connect_db,
+    create_face_identity,
     find_photo_file,
     get_album_by_name,
     get_photo_detail,
+    list_album_tag_facets,
     list_album_tag_stats,
     list_albums,
     list_gallery_photos,
     scan_album,
     scan_albums,
     set_photo_tags,
+    set_tag_sensitivity,
 )
 
 
@@ -574,6 +577,7 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertNotIn('id="face-admin-button"', html)
         self.assertIn('id="config-section-albums"', html)
         self.assertIn('id="config-section-tags"', html)
+        self.assertIn('id="config-section-lora-tags"', html)
         self.assertIn('id="config-section-faces"', html)
         self.assertIn('data-batch-action="faces"', html)
         self.assertIn('class="danger-menu-item" data-batch-action="delete"', html)
@@ -585,7 +589,14 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertIn('id="scan-options-metadata"', html)
         self.assertIn('id="scan-options-faces"', html)
         self.assertIn('id="scan-options-force-faces"', html)
-        self.assertIn('id="scan-options-image-analysis" type="checkbox" disabled', html)
+        self.assertIn('id="scan-options-image-analysis" type="checkbox"', html)
+        self.assertIn("Analyse d'image locale", html)
+        self.assertIn('id="gallery-sensitivity-selector"', html)
+        self.assertIn('id="tag-filter-search"', html)
+        self.assertIn('id="tag-filter-active-list"', html)
+        self.assertIn('class="tag-filter-scroll"', html)
+        self.assertIn('id="detail-image-analysis"', html)
+        self.assertIn('id="rescan-image-analysis-button"', html)
         self.assertIn('id="scan-status-cancel"', html)
 
     def test_incremental_scan_skips_unchanged_reprocesses_modified_and_marks_deleted(self):
@@ -688,9 +699,9 @@ class GalleryBackendTests(unittest.TestCase):
         app_module.THUMBNAIL_ROOT = self.thumbnails
         client = app_module.app.test_client()
 
-        unsupported = client.post("/api/scan", json={"image_analysis": True})
+        enabled = client.post("/api/scan", json={"image_analysis": True, "sync": True})
         invalid = client.post("/api/scan", json={"metadata": "yes"})
-        self.assertEqual(unsupported.status_code, 400)
+        self.assertEqual(enabled.status_code, 200)
         self.assertEqual(invalid.status_code, 400)
 
         original = app_module.scan_status_snapshot()
@@ -715,6 +726,92 @@ class GalleryBackendTests(unittest.TestCase):
             with app_module.SCAN_LOCK:
                 app_module.SCAN_STATUS.clear()
                 app_module.SCAN_STATUS.update(original)
+
+    def test_tags_api_lists_occurrences_and_validates_sensitivity_updates(self):
+        create_png(self.images_root / "output" / "one.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute(
+                "SELECT photo_id FROM album_photos WHERE filename='one.png'"
+            ).fetchone()["photo_id"]
+            set_photo_tags(conn, photo_id, ["bikini"])
+            tag_id = conn.execute(
+                "SELECT id FROM tags WHERE name='bikini'"
+            ).fetchone()["id"]
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+
+        listed = client.get("/api/tags")
+        updated = client.patch(
+            f"/api/tags/{tag_id}",
+            json={"sensitivity": "medium"},
+        )
+        categorized = client.patch(
+            f"/api/tags/{tag_id}",
+            json={"category": "clothing"},
+        )
+        cleared_category = client.patch(
+            f"/api/tags/{tag_id}",
+            json={"category": None},
+        )
+        invalid_level = client.patch(
+            f"/api/tags/{tag_id}",
+            json={"sensitivity": "extreme"},
+        )
+        invalid_body = client.patch(
+            f"/api/tags/{tag_id}",
+            json={"sensitivity": "low", "name": "other"},
+        )
+        invalid_category = client.patch(
+            f"/api/tags/{tag_id}",
+            json={"category": "other"},
+        )
+        empty_body = client.patch(f"/api/tags/{tag_id}", json={})
+        invalid_payload = client.patch(f"/api/tags/{tag_id}", json=[["category", "person"]])
+        missing = client.patch(
+            "/api/tags/999999",
+            json={"sensitivity": "low"},
+        )
+
+        self.assertEqual(listed.status_code, 200)
+        listed_tag = next(tag for tag in listed.get_json()["tags"] if tag["id"] == tag_id)
+        self.assertEqual(listed_tag["occurrence_count"], 1)
+        self.assertEqual(listed_tag["sensitivity"], "neutral")
+        self.assertIsNone(listed_tag["category"])
+        self.assertFalse(listed_tag["is_face_tag"])
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.get_json()["tag"]["sensitivity"], "medium")
+        self.assertEqual(categorized.status_code, 200)
+        self.assertEqual(categorized.get_json()["tag"]["category"], "clothing")
+        self.assertEqual(cleared_category.status_code, 200)
+        self.assertIsNone(cleared_category.get_json()["tag"]["category"])
+        self.assertEqual(invalid_level.status_code, 400)
+        self.assertEqual(invalid_body.status_code, 400)
+        self.assertEqual(invalid_category.status_code, 400)
+        self.assertEqual(empty_body.status_code, 400)
+        self.assertEqual(invalid_payload.status_code, 400)
+        self.assertEqual(missing.status_code, 404)
+
+        with connect_db(self.db_path) as conn:
+            face_identity = create_face_identity(conn, "Alice")
+            face_tag_id = face_identity["tag_id"]
+            conn.execute(
+                "INSERT INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, 'face_confirmed')",
+                (photo_id, face_tag_id),
+            )
+
+        locked = client.patch(
+            f"/api/tags/{face_tag_id}",
+            json={"category": "constraint"},
+        )
+        face_listed = client.get("/api/tags").get_json()["tags"]
+        face_tag = next(tag for tag in face_listed if tag["id"] == face_tag_id)
+        self.assertEqual(locked.status_code, 409)
+        self.assertEqual(face_tag["category"], "person")
+        self.assertTrue(face_tag["is_face_tag"])
 
     def test_album_tag_stats_and_gallery_filters(self):
         output_files = {
@@ -788,6 +885,63 @@ class GalleryBackendTests(unittest.TestCase):
             self.assertEqual(total, 2)
             self.assertEqual(len(photos), 1)
 
+    def test_album_tag_facets_follow_draft_filters_and_sensitivity(self):
+        for index, filename in enumerate(("one.png", "two.png", "three.png", "adult.png")):
+            create_png(
+                self.images_root / "output" / filename,
+                color=(20 + index * 10, 30, 40),
+            )
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            album = get_album_by_name(conn, "output")
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute(
+                    "SELECT filename, photo_id FROM album_photos WHERE album_id=?",
+                    (album["id"],),
+                ).fetchall()
+            }
+            set_photo_tags(conn, photo_ids["one.png"], ["portrait", "warm"])
+            set_photo_tags(conn, photo_ids["two.png"], ["portrait", "cold"])
+            set_photo_tags(conn, photo_ids["three.png"], ["warm", "blocked"])
+            set_photo_tags(conn, photo_ids["adult.png"], ["adult"])
+            adult_tag_id = conn.execute(
+                "SELECT id FROM tags WHERE name='adult'"
+            ).fetchone()["id"]
+            set_tag_sensitivity(conn, adult_tag_id, "medium")
+
+            facets = list_album_tag_facets(
+                conn,
+                album["id"],
+                include_tags=["portrait"],
+                exclude_tags=["cold"],
+                max_sensitivity="neutral",
+            )
+
+        self.assertEqual(facets["matching_photo_count"], 1)
+        self.assertEqual(
+            {item["name"]: item["occurrence_count"] for item in facets["tags"]},
+            {"portrait": 1, "warm": 1},
+        )
+        self.assertEqual(
+            [(item["name"], item["filter_state"]) for item in facets["active_tags"]],
+            [("portrait", "include"), ("cold", "exclude")],
+        )
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        response = app_module.app.test_client().get(
+            f"/api/albums/{album['id']}/tag-facets"
+            "?include_tag=portrait&exclude_tag=cold&max_sensitivity=neutral"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["matching_photo_count"], 1)
+        self.assertNotIn(
+            "cold",
+            {item["name"] for item in response.get_json()["tags"]},
+        )
+
     def test_gallery_route_preserves_tag_filters_in_state_and_pagination(self):
         create_png(self.images_root / "output" / "one.png", color=(20, 30, 40))
         create_png(self.images_root / "output" / "two.png", color=(30, 40, 50))
@@ -822,7 +976,11 @@ class GalleryBackendTests(unittest.TestCase):
             self.assertIn('include: ["portrait"]', html)
             self.assertIn('exclude: ["blocked"]', html)
             self.assertIn(
-                'href="?album=output&amp;page=2&amp;include_tag=portrait&amp;exclude_tag=blocked"',
+                '<strong class="album-photo-ratio">2/3</strong> images',
+                html,
+            )
+            self.assertIn(
+                'href="?album=output&amp;page=2&amp;max_sensitivity=neutral&amp;include_tag=portrait&amp;exclude_tag=blocked"',
                 html,
             )
 
