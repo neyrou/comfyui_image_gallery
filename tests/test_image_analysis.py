@@ -55,6 +55,23 @@ def analysis_result(level="neutral", tags=None):
     }
 
 
+class FakeImageAnalysisEngine:
+    analysis_signature = "fake-analysis-v2"
+
+    def __init__(self):
+        self.preload_calls = 0
+        self.analyze_calls = 0
+
+    def preload(self, progress_callback=None):
+        self.preload_calls += 1
+        if progress_callback:
+            progress_callback("ready")
+
+    def analyze_path(self, _image_path):
+        self.analyze_calls += 1
+        return analysis_result()
+
+
 class ImageAnalysisRulesTests(unittest.TestCase):
     def test_freepik_uses_ordered_cumulative_probabilities(self):
         self.assertEqual(
@@ -150,6 +167,57 @@ class ImageAnalysisDatabaseTests(unittest.TestCase):
             self.assertEqual(tag["sensitivity"], "neutral")
             self.assertIsNone(tag["machine_key"])
             self.assertIsNone(tag["category"])
+
+    def test_missing_analysis_skips_valid_cache_retries_stale_and_avoids_model_preload(self):
+        engine = FakeImageAnalysisEngine()
+        with connect_db(self.db_path) as conn:
+            ids = self.photo_ids(conn)
+            checksums = {
+                row["id"]: row["checksum"]
+                for row in conn.execute("SELECT id, checksum FROM photos").fetchall()
+            }
+            replace_photo_image_analysis(
+                conn,
+                ids["one.png"],
+                checksums[ids["one.png"]],
+                engine.analysis_signature,
+                analysis_result(),
+            )
+            replace_photo_image_analysis(
+                conn,
+                ids["two.png"],
+                checksums[ids["two.png"]],
+                "obsolete-signature",
+                analysis_result(),
+            )
+        previous = {
+            "DB_PATH": app_module.DB_PATH,
+            "IMAGE_ANALYSIS_ENGINE_INSTANCE": app_module.IMAGE_ANALYSIS_ENGINE_INSTANCE,
+        }
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGE_ANALYSIS_ENGINE_INSTANCE = engine
+        options = {"scan_mode": "missing", "image_analysis": True}
+        try:
+            first = app_module.run_image_analysis_stage(
+                "sync",
+                options,
+                [ids["one.png"], ids["two.png"]],
+                sync=True,
+            )
+            second = app_module.run_image_analysis_stage(
+                "sync",
+                options,
+                [ids["one.png"], ids["two.png"]],
+                sync=True,
+            )
+        finally:
+            for name, value in previous.items():
+                setattr(app_module, name, value)
+
+        self.assertEqual(first, {"total": 2, "processed": 1, "skipped": 1, "errors": 0})
+        self.assertEqual(second, {"total": 2, "processed": 0, "skipped": 2, "errors": 0})
+        self.assertEqual(engine.analyze_calls, 1)
+        self.assertEqual(engine.preload_calls, 1)
 
     def test_face_identity_forces_and_locks_person_category(self):
         with connect_db(self.db_path) as conn:

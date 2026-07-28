@@ -129,10 +129,16 @@ SCAN_STATUS = {
     "cancel_requested": False,
     "face_job_id": None,
     "face_job": None,
+    "metadata_total": 0,
+    "metadata_processed": 0,
+    "metadata_skipped": 0,
+    "metadata_errors": 0,
     "analysis_total": 0,
     "analysis_processed": 0,
     "analysis_skipped": 0,
     "analysis_errors": 0,
+    "face_total": 0,
+    "face_skipped": 0,
     "started_at": None,
     "updated_at": None,
     "finished_at": None,
@@ -694,6 +700,59 @@ def missing_photo_ids(conn, photo_ids):
     return [photo_id for photo_id in photo_ids if photo_id not in existing]
 
 
+def normalize_scan_options(payload):
+    album_name = payload.get("album")
+    if album_name is not None and (not isinstance(album_name, str) or not album_name):
+        raise ValueError("album must be a non-empty string")
+
+    explicit_scope = payload.get("scope")
+    scope = explicit_scope or ("current" if album_name else "all")
+    if scope not in {"current", "all", "selection"}:
+        raise ValueError("scope must be current, all, or selection")
+    if scope == "current" and not album_name:
+        raise ValueError("album is required for the current scope")
+    if scope in {"all", "selection"} and album_name is not None:
+        raise ValueError(f"album is not allowed for the {scope} scope")
+
+    if "scan_mode" in payload:
+        scan_mode = payload["scan_mode"]
+        if scan_mode not in {"incremental", "missing", "full"}:
+            raise ValueError("scan_mode must be incremental, missing, or full")
+    else:
+        scan_mode = "full" if scan_payload_boolean(payload, "rescan_existing", True) else "incremental"
+
+    photo_ids = normalized_batch_photo_ids(payload) if scope == "selection" else []
+    if scope != "selection" and "photo_ids" in payload:
+        raise ValueError("photo_ids is only allowed for the selection scope")
+    if scope == "selection" and scan_mode == "incremental":
+        raise ValueError("selection scope does not support incremental scan mode")
+
+    options = {
+        "scope": scope,
+        "album": album_name,
+        "photo_ids": photo_ids,
+        "scan_mode": scan_mode,
+        "rescan_existing": scan_mode == "full",
+        "metadata": scan_payload_boolean(payload, "metadata", False),
+        "face_recognition": scan_payload_boolean(payload, "face_recognition", False),
+        "force_face_rescan": scan_payload_boolean(payload, "force_face_rescan", False),
+        "image_analysis": scan_payload_boolean(payload, "image_analysis", False),
+    }
+    if not options["face_recognition"] or scan_mode != "full":
+        options["force_face_rescan"] = False
+    return options
+
+
+def validate_scan_selection(options):
+    if options["scope"] != "selection":
+        return
+    init_db(DB_PATH)
+    with connect_db(DB_PATH) as conn:
+        missing = missing_photo_ids(conn, options["photo_ids"])
+    if missing:
+        raise ValueError(f"Unknown photo ids: {', '.join(str(photo_id) for photo_id in missing)}")
+
+
 def photo_membership_summary(conn, photo_id):
     row = conn.execute(
         """
@@ -827,65 +886,95 @@ def wait_for_scan_face_job(scan_job_id, face_job_id):
         time.sleep(0.2)
 
 
-def enqueue_scan_face_stage(job_id, options, processed_photo_ids):
-    album_name = options.get("album")
-    if options.get("face_recognition"):
-        if options.get("rescan_existing"):
-            scope = "album" if album_name else "all"
-            with connect_db(DB_PATH) as conn:
-                photo_ids = photo_ids_for_face_scope(
-                    conn,
-                    scope,
-                    album_name=album_name,
-                    mode="detect",
-                )
-        else:
-            scope = "selection"
-            photo_ids = processed_photo_ids
-        if not photo_ids:
-            return None
-        return enqueue_face_job(
-            scope,
-            photo_ids,
-            mode="detect",
-            params={
-                "album_name": album_name,
-                "force": bool(options.get("force_face_rescan") and options.get("rescan_existing")),
-                "parent_scan_job_id": job_id,
-            },
-        )
-    return enqueue_automatic_face_scan(params={"parent_scan_job_id": job_id})
-
-
-def image_analysis_photo_ids(options, processed_photo_ids):
-    if not options.get("image_analysis"):
-        return []
-    if not options.get("rescan_existing"):
-        return list(dict.fromkeys(processed_photo_ids))
+def scan_scope_photo_ids(options):
+    if options["scope"] == "selection":
+        return list(options["photo_ids"])
     with connect_db(DB_PATH) as conn:
-        if options.get("album"):
-            rows = conn.execute(
-                """
-                SELECT DISTINCT ap.photo_id
-                FROM album_photos ap
-                JOIN albums a ON a.id=ap.album_id
-                WHERE a.name=? AND ap.is_missing=0
-                ORDER BY ap.photo_id
-                """,
-                (options["album"],),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT DISTINCT photo_id FROM album_photos WHERE is_missing=0 ORDER BY photo_id"
-            ).fetchall()
-    return [row["photo_id"] for row in rows]
+        return photo_ids_for_face_scope(
+            conn,
+            "album" if options["scope"] == "current" else "all",
+            album_name=options.get("album"),
+            mode="detect",
+        )
 
 
-def run_image_analysis_stage(job_id, options, processed_photo_ids, sync=False):
-    photo_ids = image_analysis_photo_ids(options, processed_photo_ids)
+def scan_stage_photo_ids(options, processed_photo_ids):
+    if options["scan_mode"] == "incremental":
+        return list(dict.fromkeys(processed_photo_ids))
+    return scan_scope_photo_ids(options)
+
+
+def run_metadata_stage(job_id, options, photo_ids, sync=False):
+    if not options.get("metadata") or not photo_ids:
+        return {"total": 0, "processed": 0, "skipped": 0, "errors": 0}
+    photo_ids = list(dict.fromkeys(photo_ids))
+    summary = {"total": len(photo_ids), "processed": 0, "skipped": 0, "errors": 0}
+    force = options["scan_mode"] == "full"
+    for position, photo_id in enumerate(photo_ids, start=1):
+        if not sync and scan_job_cancel_requested(job_id):
+            raise ScanCancelled("Scan JSON annule")
+        try:
+            with connect_db(DB_PATH) as conn:
+                cached = conn.execute(
+                    "SELECT 1 FROM photo_metadata WHERE photo_id=?",
+                    (photo_id,),
+                ).fetchone()
+                if cached and not force:
+                    summary["skipped"] += 1
+                else:
+                    image_path = find_photo_file(conn, photo_id)
+                    if not image_path:
+                        raise ValueError("Fichier photo introuvable")
+                    rescan_metadata(conn, photo_id, image_path)
+                    summary["processed"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            if not sync:
+                with SCAN_LOCK:
+                    SCAN_STATUS["errors"].append(
+                        {"photo_id": photo_id, "stage": "metadata", "error": str(exc)}
+                    )
+        if not sync:
+            update_scan_status(
+                stage="metadata",
+                message=f"Scan JSON {position}/{len(photo_ids)}",
+                metadata_total=len(photo_ids),
+                metadata_processed=summary["processed"],
+                metadata_skipped=summary["skipped"],
+                metadata_errors=summary["errors"],
+            )
+    return summary
+
+
+def run_image_analysis_stage(job_id, options, photo_ids, sync=False):
+    if not options.get("image_analysis"):
+        return {"total": 0, "processed": 0, "skipped": 0, "errors": 0}
+    photo_ids = list(dict.fromkeys(photo_ids))
     if not photo_ids:
         return {"total": 0, "processed": 0, "skipped": 0, "errors": 0}
     engine = get_image_analysis_engine()
+    summary = {"total": len(photo_ids), "processed": 0, "skipped": 0, "errors": 0}
+    force = options["scan_mode"] == "full"
+    pending_photo_ids = []
+    with connect_db(DB_PATH) as conn:
+        for photo_id in photo_ids:
+            photo = conn.execute("SELECT checksum FROM photos WHERE id=?", (photo_id,)).fetchone()
+            cached = bool(
+                photo
+                and not force
+                and photo_image_analysis_cache_valid(
+                    conn,
+                    photo_id,
+                    photo["checksum"],
+                    engine.analysis_signature,
+                )
+            )
+            if cached:
+                summary["skipped"] += 1
+            else:
+                pending_photo_ids.append(photo_id)
+    if not pending_photo_ids:
+        return summary
 
     def model_progress(message):
         if not sync:
@@ -893,9 +982,7 @@ def run_image_analysis_stage(job_id, options, processed_photo_ids, sync=False):
 
     with IMAGE_ANALYSIS_RUN_LOCK:
         engine.preload(progress_callback=model_progress)
-    summary = {"total": len(photo_ids), "processed": 0, "skipped": 0, "errors": 0}
-    force = bool(options.get("rescan_existing"))
-    for position, photo_id in enumerate(photo_ids, start=1):
+    for position, photo_id in enumerate(pending_photo_ids, start=1):
         if not sync and scan_job_cancel_requested(job_id):
             raise ScanCancelled("Analyse d'image annulee")
         try:
@@ -906,29 +993,17 @@ def run_image_analysis_stage(job_id, options, processed_photo_ids, sync=False):
                 image_path = find_photo_file(conn, photo_id)
                 if not image_path:
                     raise ValueError("Fichier photo introuvable")
-                cached = (
-                    not force
-                    and photo_image_analysis_cache_valid(
-                        conn,
-                        photo_id,
-                        photo["checksum"],
-                        engine.analysis_signature,
-                    )
+            with IMAGE_ANALYSIS_RUN_LOCK:
+                result = engine.analyze_path(image_path)
+            with connect_db(DB_PATH) as conn:
+                replace_photo_image_analysis(
+                    conn,
+                    photo_id,
+                    photo["checksum"],
+                    engine.analysis_signature,
+                    result,
                 )
-            if cached:
-                summary["skipped"] += 1
-            else:
-                with IMAGE_ANALYSIS_RUN_LOCK:
-                    result = engine.analyze_path(image_path)
-                with connect_db(DB_PATH) as conn:
-                    replace_photo_image_analysis(
-                        conn,
-                        photo_id,
-                        photo["checksum"],
-                        engine.analysis_signature,
-                        result,
-                    )
-                summary["processed"] += 1
+            summary["processed"] += 1
         except ImageAnalysisUnavailable:
             raise
         except Exception as exc:
@@ -939,9 +1014,10 @@ def run_image_analysis_stage(job_id, options, processed_photo_ids, sync=False):
                         {"photo_id": photo_id, "stage": "image_analysis", "error": str(exc)}
                     )
         if not sync:
+            completed = summary["processed"] + summary["errors"] + summary["skipped"]
             update_scan_status(
                 stage="image_analysis",
-                message=f"Analyse d'image {position}/{len(photo_ids)}",
+                message=f"Analyse d'image {completed}/{len(photo_ids)}",
                 analysis_total=len(photo_ids),
                 analysis_processed=summary["processed"],
                 analysis_skipped=summary["skipped"],
@@ -950,44 +1026,147 @@ def run_image_analysis_stage(job_id, options, processed_photo_ids, sync=False):
     return summary
 
 
-def run_scan_job(job_id, options):
-    try:
+def face_stage_candidates(options, photo_ids):
+    photo_ids = list(dict.fromkeys(photo_ids))
+    if not photo_ids:
+        return [], 0
+    force = options["scan_mode"] == "full" and options.get("force_face_rescan")
+    if force:
+        return photo_ids, 0
+    engine = get_face_engine()
+    pending_photo_ids = []
+    with connect_db(DB_PATH) as conn:
+        for photo_id in photo_ids:
+            photo = conn.execute("SELECT checksum FROM photos WHERE id=?", (photo_id,)).fetchone()
+            cached = bool(
+                photo
+                and photo_face_cache_valid(
+                    conn,
+                    photo_id,
+                    photo["checksum"],
+                    engine.model_name,
+                    engine.model_version,
+                )
+            )
+            if not cached:
+                pending_photo_ids.append(photo_id)
+    return pending_photo_ids, len(photo_ids) - len(pending_photo_ids)
+
+
+def enqueue_scan_face_stage(job_id, options, photo_ids, sync=False):
+    if not options.get("face_recognition"):
+        return enqueue_automatic_face_scan(params={"parent_scan_job_id": job_id}), None
+    pending_photo_ids, skipped = face_stage_candidates(options, photo_ids)
+    summary = {
+        "total": len(photo_ids),
+        "processed": 0,
+        "skipped": skipped,
+        "errors": 0,
+    }
+    if not pending_photo_ids:
+        return None, summary
+    face_job = enqueue_face_job(
+        "selection",
+        pending_photo_ids,
+        mode="detect",
+        params={
+            "album_name": options.get("album"),
+            "force": bool(options.get("force_face_rescan")),
+            "parent_scan_job_id": job_id,
+        },
+        sync=sync,
+    )
+    return face_job, summary
+
+
+def empty_catalog_summary():
+    return {
+        "albums": 0,
+        "photos": 0,
+        "processed": 0,
+        "skipped": 0,
+        "missing": 0,
+        "processed_photo_ids": [],
+        "errors": [],
+    }
+
+
+def run_scan_pipeline(job_id, options, sync=False):
+    if options["scope"] == "selection":
+        summary = empty_catalog_summary()
+        summary["selected"] = len(options["photo_ids"])
+    else:
         summary = scan_albums(
             DB_PATH,
             IMAGES_ROOT,
             THUMBNAIL_ROOT,
-            scan_metadata=options["metadata"],
-            rescan_existing=options["rescan_existing"],
-            progress_callback=apply_scan_progress,
-            cancel_callback=lambda: scan_job_cancel_requested(job_id),
+            scan_metadata=False,
+            rescan_existing=options["scan_mode"] == "full",
+            progress_callback=None if sync else apply_scan_progress,
+            cancel_callback=None if sync else lambda: scan_job_cancel_requested(job_id),
             commit_interval=25,
             album_name=options.get("album"),
         )
-        processed_photo_ids = summary.pop("processed_photo_ids", [])
+    processed_photo_ids = summary.pop("processed_photo_ids", [])
+    target_photo_ids = scan_stage_photo_ids(options, processed_photo_ids)
+    summary["targeted"] = len(target_photo_ids)
+    if not sync and scan_job_cancel_requested(job_id):
+        raise ScanCancelled("Scan annule")
+    summary["metadata"] = run_metadata_stage(job_id, options, target_photo_ids, sync=sync)
+    if not sync and scan_job_cancel_requested(job_id):
+        raise ScanCancelled("Scan annule")
+    summary["image_analysis"] = run_image_analysis_stage(
+        job_id,
+        options,
+        target_photo_ids,
+        sync=sync,
+    )
+    if not sync and scan_job_cancel_requested(job_id):
+        raise ScanCancelled("Scan annule")
+    face_job, face_summary = enqueue_scan_face_stage(
+        job_id,
+        options,
+        target_photo_ids,
+        sync=sync,
+    )
+    if face_job and not sync:
+        update_scan_status(
+            stage="faces",
+            face_job_id=face_job["id"],
+            face_job=face_job,
+            face_total=face_summary["total"] if face_summary else face_job["total"],
+            face_skipped=face_summary["skipped"] if face_summary else 0,
+            message="Reconnaissance faciale en attente",
+        )
         if scan_job_cancel_requested(job_id):
-            raise ScanCancelled("Scan annule")
-        analysis_summary = run_image_analysis_stage(job_id, options, processed_photo_ids)
-        summary["image_analysis"] = analysis_summary
-        if scan_job_cancel_requested(job_id):
-            raise ScanCancelled("Scan annule")
-        face_job = enqueue_scan_face_stage(job_id, options, processed_photo_ids)
+            request_face_job_cancel(face_job["id"])
+        face_job = wait_for_scan_face_job(job_id, face_job["id"])
+    if face_summary is not None:
         if face_job:
-            update_scan_status(
-                stage="faces",
-                face_job_id=face_job["id"],
-                face_job=face_job,
-                message="Reconnaissance faciale en attente",
-            )
-            if scan_job_cancel_requested(job_id):
-                request_face_job_cancel(face_job["id"])
-            wait_for_scan_face_job(job_id, face_job["id"])
-        if scan_job_cancel_requested(job_id):
-            raise ScanCancelled("Scan annule")
+            face_summary["processed"] = face_job["processed"]
+            face_summary["errors"] = face_job["errors_count"]
+        summary["faces"] = face_summary
+    if not sync and scan_job_cancel_requested(job_id):
+        raise ScanCancelled("Scan annule")
+    return summary
+
+
+def run_scan_job(job_id, options):
+    try:
+        summary = run_scan_pipeline(job_id, options)
+        analysis_processed = (
+            summary["metadata"]["processed"]
+            + summary["image_analysis"]["processed"]
+            + summary.get("faces", {}).get("processed", 0)
+        )
         update_scan_status(
             active=False,
             state="done",
             stage="done",
-            message=f"Scan termine: {summary['processed']} image(s) traitee(s), {summary['skipped']} ignoree(s)",
+            message=(
+                f"Scan termine: {summary['processed']} image(s) indexee(s), "
+                f"{analysis_processed} analyse(s) executee(s)"
+            ),
             finished_at=time.time(),
             summary=summary,
         )
@@ -1148,67 +1327,16 @@ def api_update_album(album_id):
 @app.post("/api/scan")
 def api_scan():
     payload = request.get_json(silent=True) or {}
-    album_name = payload.get("album")
-    if album_name is not None and (not isinstance(album_name, str) or not album_name):
-        return jsonify({"ok": False, "error": "album must be a non-empty string"}), 400
     try:
-        options = {
-            "album": album_name,
-            "rescan_existing": scan_payload_boolean(payload, "rescan_existing", True),
-            "metadata": scan_payload_boolean(payload, "metadata", False),
-            "face_recognition": scan_payload_boolean(payload, "face_recognition", False),
-            "force_face_rescan": scan_payload_boolean(payload, "force_face_rescan", False),
-            "image_analysis": scan_payload_boolean(payload, "image_analysis", False),
-        }
+        options = normalize_scan_options(payload)
+        validate_scan_selection(options)
         sync = scan_payload_boolean(payload, "sync", False)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    if not options["face_recognition"] or not options["rescan_existing"]:
-        options["force_face_rescan"] = False
 
     if sync:
         try:
-            summary = scan_albums(
-                DB_PATH,
-                IMAGES_ROOT,
-                THUMBNAIL_ROOT,
-                scan_metadata=options["metadata"],
-                rescan_existing=options["rescan_existing"],
-                album_name=album_name,
-            )
-            processed_photo_ids = summary.pop("processed_photo_ids", [])
-            summary["image_analysis"] = run_image_analysis_stage(
-                "sync",
-                options,
-                processed_photo_ids,
-                sync=True,
-            )
-            if options["face_recognition"]:
-                if options["rescan_existing"]:
-                    scope = "album" if album_name else "all"
-                    with connect_db(DB_PATH) as conn:
-                        photo_ids = photo_ids_for_face_scope(
-                            conn,
-                            scope,
-                            album_name=album_name,
-                            mode="detect",
-                        )
-                else:
-                    scope = "selection"
-                    photo_ids = processed_photo_ids
-                if photo_ids:
-                    enqueue_face_job(
-                        scope,
-                        photo_ids,
-                        mode="detect",
-                        params={
-                            "album_name": album_name,
-                            "force": options["force_face_rescan"],
-                        },
-                        sync=True,
-                    )
-            else:
-                enqueue_automatic_face_scan()
+            summary = run_scan_pipeline("sync", options, sync=True)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 404
         return jsonify({"ok": True, "summary": summary})
@@ -1223,8 +1351,14 @@ def api_scan():
                 "job_id": job_id,
                 "state": "running",
                 "stage": "scan",
-                "message": f"Scan de l'album {album_name} demarre" if album_name else "Scan de tous les albums demarre",
-                "album": album_name,
+                "message": (
+                    f"Scan de la selection ({len(options['photo_ids'])} images) demarre"
+                    if options["scope"] == "selection"
+                    else f"Scan de l'album {options['album']} demarre"
+                    if options["scope"] == "current"
+                    else "Scan de tous les albums demarre"
+                ),
+                "album": options["album"],
                 "file": None,
                 "photos": 0,
                 "album_photos": 0,
@@ -1235,10 +1369,16 @@ def api_scan():
                 "cancel_requested": False,
                 "face_job_id": None,
                 "face_job": None,
+                "metadata_total": 0,
+                "metadata_processed": 0,
+                "metadata_skipped": 0,
+                "metadata_errors": 0,
                 "analysis_total": 0,
                 "analysis_processed": 0,
                 "analysis_skipped": 0,
                 "analysis_errors": 0,
+                "face_total": 0,
+                "face_skipped": 0,
                 "started_at": time.time(),
                 "updated_at": time.time(),
                 "finished_at": None,

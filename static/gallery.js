@@ -188,6 +188,7 @@ function renderSelectionState() {
     if (actionsButton) {
         actionsButton.disabled = state.selectedPhotoIds.size === 0;
     }
+    updateScanScopeControls();
     $$("[data-gallery-photo-id]").forEach((item) => {
         const photoId = Number(item.dataset.galleryPhotoId);
         const selected = state.selectedPhotoIds.has(photoId);
@@ -2759,6 +2760,32 @@ function updateScanForceOptionVisibility() {
     }
 }
 
+function updateScanScopeControls() {
+    const scope = $("#scan-options-scope");
+    const selectionOption = $("#scan-options-selection-scope");
+    if (!scope || !selectionOption) {
+        return;
+    }
+    const selectionCount = state.selectedPhotoIds.size;
+    selectionOption.textContent = `S\u00e9lection (${selectionCount} image${selectionCount > 1 ? "s" : ""})`;
+    selectionOption.disabled = selectionCount === 0;
+    if (!selectionCount && scope.value === "selection") {
+        scope.value = state.selectedAlbum?.name ? "current" : "all";
+    }
+    const selectionScope = scope.value === "selection";
+    const incremental = $('[name="scan-existing-mode"][value="incremental"]');
+    if (incremental) {
+        incremental.disabled = selectionScope;
+        if (selectionScope && incremental.checked) {
+            const missing = $('[name="scan-existing-mode"][value="missing"]');
+            if (missing) {
+                missing.checked = true;
+            }
+        }
+    }
+    updateScanForceOptionVisibility();
+}
+
 function openScanOptionsModal() {
     const modal = $("#scan-options-modal");
     if (!modal || $("#scan-button")?.disabled) {
@@ -2767,8 +2794,15 @@ function openScanOptionsModal() {
     const saved = savedScanOptions();
     const scope = $("#scan-options-scope");
     const currentAvailable = Boolean(state.selectedAlbum?.name);
-    scope.value = saved.scope === "all" || !currentAvailable ? "all" : "current";
-    const mode = saved.rescan_existing ? "full" : "incremental";
+    const selectionAvailable = state.selectedPhotoIds.size > 0;
+    if (saved.scope === "selection" && selectionAvailable) {
+        scope.value = "selection";
+    } else {
+        scope.value = saved.scope === "all" || !currentAvailable ? "all" : "current";
+    }
+    const mode = ["incremental", "missing", "full"].includes(saved.scan_mode)
+        ? saved.scan_mode
+        : saved.rescan_existing ? "full" : "incremental";
     const modeInput = $(`[name="scan-existing-mode"][value="${mode}"]`);
     if (modeInput) {
         modeInput.checked = true;
@@ -2777,7 +2811,7 @@ function openScanOptionsModal() {
     $("#scan-options-faces").checked = Boolean(saved.face_recognition);
     $("#scan-options-force-faces").checked = Boolean(saved.force_face_rescan);
     $("#scan-options-image-analysis").checked = Boolean(saved.image_analysis);
-    updateScanForceOptionVisibility();
+    updateScanScopeControls();
     setScanOptionsStatus("");
     modal.classList.add("open");
     modal.setAttribute("aria-hidden", "false");
@@ -2791,15 +2825,18 @@ function closeScanOptionsModal() {
 }
 
 function scanOptionsFromForm() {
-    const rescanExisting = $('[name="scan-existing-mode"]:checked')?.value === "full";
+    const scanMode = $('[name="scan-existing-mode"]:checked')?.value || "incremental";
     const faceRecognition = $("#scan-options-faces").checked;
+    const scope = $("#scan-options-scope").value;
     return {
-        scope: $("#scan-options-scope").value,
-        album: $("#scan-options-scope").value === "current" ? state.selectedAlbum?.name || null : null,
-        rescan_existing: rescanExisting,
+        scope,
+        album: scope === "current" ? state.selectedAlbum?.name || null : null,
+        photo_ids: scope === "selection" ? selectedPhotoIds() : undefined,
+        scan_mode: scanMode,
+        rescan_existing: scanMode === "full",
         metadata: $("#scan-options-metadata").checked,
         face_recognition: faceRecognition,
-        force_face_rescan: Boolean(faceRecognition && rescanExisting && $("#scan-options-force-faces").checked),
+        force_face_rescan: Boolean(faceRecognition && scanMode === "full" && $("#scan-options-force-faces").checked),
         image_analysis: $("#scan-options-image-analysis").checked,
     };
 }
@@ -2882,6 +2919,7 @@ function renderScanStatus(job, options = {}) {
         : job.state === "cancelled" ? "Scan annulé"
         : job.state === "cancel_requested" ? "Arrêt du scan"
         : job.stage === "faces" ? "Reconnaissance faciale"
+        : job.stage === "metadata" ? "Scan JSON"
         : job.stage === "image_analysis" ? "Analyse d'image"
         : "Scan en cours";
     $("#scan-status-message").textContent = job.message || "Scan...";
@@ -2910,8 +2948,30 @@ function renderScanStatus(job, options = {}) {
             `analyse: ${job.analysis_processed || 0} traitée(s), ${job.analysis_skipped || 0} en cache, ${job.analysis_errors || 0} erreur(s)`
         );
     }
+    if (job.stage === "metadata" && job.metadata_total) {
+        details.push(
+            `JSON: ${job.metadata_processed || 0} traitee(s), ${job.metadata_skipped || 0} en cache, ${job.metadata_errors || 0} erreur(s)`
+        );
+    }
     if (job.face_job) {
-        details.push(`visages: ${job.face_job.processed || 0}/${job.face_job.total || 0}`);
+        details.push(
+            `visages: ${job.face_job.processed || 0}/${job.face_total || job.face_job.total || 0}`
+            + (job.face_skipped ? `, ${job.face_skipped} en cache` : "")
+        );
+    }
+    if (!job.active && job.summary) {
+        const metadata = job.summary.metadata;
+        const imageAnalysis = job.summary.image_analysis;
+        const faces = job.summary.faces;
+        if (metadata?.total) {
+            details.push(`JSON: ${metadata.processed} executee(s), ${metadata.skipped} en cache, ${metadata.errors} erreur(s)`);
+        }
+        if (imageAnalysis?.total) {
+            details.push(`IA: ${imageAnalysis.processed} executee(s), ${imageAnalysis.skipped} en cache, ${imageAnalysis.errors} erreur(s)`);
+        }
+        if (faces?.total) {
+            details.push(`visages: ${faces.processed} executee(s), ${faces.skipped} en cache, ${faces.errors} erreur(s)`);
+        }
     }
     if (job.errors && job.errors.length) {
         details.push(`erreurs: ${job.errors.length}`);
@@ -3003,6 +3063,7 @@ function bindEvents() {
     $("#scan-options-form")?.addEventListener("submit", submitScanOptions);
     $$("[data-close-scan-options]").forEach((button) => button.addEventListener("click", closeScanOptionsModal));
     $$('[name="scan-existing-mode"]').forEach((input) => input.addEventListener("change", updateScanForceOptionVisibility));
+    $("#scan-options-scope")?.addEventListener("change", updateScanScopeControls);
     $("#scan-options-faces")?.addEventListener("change", updateScanForceOptionVisibility);
     $("#scan-status-cancel")?.addEventListener("click", cancelScanJob);
     $("#scan-status-close")?.addEventListener("click", () => {

@@ -275,6 +275,55 @@ class FaceRecognitionTests(unittest.TestCase):
         self.assertEqual(forced.status_code, 200)
         self.assertEqual(self.engine.analyze_calls, 2)
 
+    def test_missing_selection_face_scan_skips_valid_cache_and_retries_obsolete_model(self):
+        create_png(self.images_root / "output" / "one.png")
+        create_png(self.images_root / "output" / "two.png", (60, 30, 90))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute("SELECT filename, photo_id FROM album_photos").fetchall()
+            }
+        client = app_module.app.test_client()
+
+        first = client.post(
+            "/api/scan",
+            json={
+                "scope": "selection",
+                "photo_ids": [photo_ids["one.png"]],
+                "scan_mode": "missing",
+                "face_recognition": True,
+                "sync": True,
+            },
+        )
+        mixed = client.post(
+            "/api/scan",
+            json={
+                "scope": "selection",
+                "photo_ids": [photo_ids["one.png"], photo_ids["two.png"]],
+                "scan_mode": "missing",
+                "face_recognition": True,
+                "sync": True,
+            },
+        )
+        self.engine.model_version = "buffalo_l-v2"
+        stale = client.post(
+            "/api/scan",
+            json={
+                "scope": "selection",
+                "photo_ids": [photo_ids["one.png"]],
+                "scan_mode": "missing",
+                "face_recognition": True,
+                "sync": True,
+            },
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(mixed.get_json()["summary"]["faces"]["skipped"], 1)
+        self.assertEqual(mixed.get_json()["summary"]["faces"]["processed"], 1)
+        self.assertEqual(stale.get_json()["summary"]["faces"]["processed"], 1)
+        self.assertEqual(self.engine.analyze_calls, 3)
+
     def test_cancelling_queued_face_job_finishes_it_immediately(self):
         create_png(self.images_root / "output" / "queued.png")
         scan_albums(self.db_path, self.images_root, self.thumbnails)

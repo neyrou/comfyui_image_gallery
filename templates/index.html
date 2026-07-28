@@ -180,6 +180,7 @@
                     <select id="scan-options-scope">
                         <option value="current" {% if not selected_album %}disabled{% endif %}>Album courant{% if selected_album %} : {{ selected_album.display_name }}{% endif %}</option>
                         <option value="all">Tous les albums</option>
+                        <option value="selection" id="scan-options-selection-scope" disabled>S&eacute;lection (0 image)</option>
                     </select>
                 </label>
                 <fieldset class="scan-option-group">
@@ -187,6 +188,10 @@
                     <label class="checkbox-field">
                         <input type="radio" name="scan-existing-mode" value="incremental" checked>
                         <span>Nouvelles images et images modifi&eacute;es uniquement</span>
+                    </label>
+                    <label class="checkbox-field">
+                        <input type="radio" name="scan-existing-mode" value="missing">
+                        <span>Analyses manquantes ou obsol&egrave;tes</span>
                     </label>
                     <label class="checkbox-field">
                         <input type="radio" name="scan-existing-mode" value="full">

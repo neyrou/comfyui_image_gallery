@@ -586,6 +586,8 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertIn('id="detail-faces"', html)
         self.assertIn('id="scan-options-modal"', html)
         self.assertIn('id="scan-options-scope"', html)
+        self.assertIn('id="scan-options-selection-scope"', html)
+        self.assertIn('name="scan-existing-mode" value="missing"', html)
         self.assertIn('id="scan-options-metadata"', html)
         self.assertIn('id="scan-options-faces"', html)
         self.assertIn('id="scan-options-force-faces"', html)
@@ -598,6 +600,54 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertIn('id="detail-image-analysis"', html)
         self.assertIn('id="rescan-image-analysis-button"', html)
         self.assertIn('id="scan-status-cancel"', html)
+
+    def test_selection_missing_scan_targets_only_selected_photos_and_validates_payload(self):
+        create_png(self.images_root / "output" / "one.png", prompt="prompt one")
+        create_png(self.images_root / "output" / "two.png", prompt="prompt two")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        with connect_db(self.db_path) as conn:
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute("SELECT filename, photo_id FROM album_photos").fetchall()
+            }
+        client = app_module.app.test_client()
+        payload = {
+            "scope": "selection",
+            "photo_ids": [photo_ids["one.png"], photo_ids["one.png"]],
+            "scan_mode": "missing",
+            "metadata": True,
+            "sync": True,
+        }
+
+        first = client.post("/api/scan", json=payload)
+        second = client.post("/api/scan", json=payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()["summary"]["targeted"], 1)
+        self.assertEqual(first.get_json()["summary"]["metadata"]["processed"], 1)
+        self.assertEqual(second.get_json()["summary"]["metadata"]["skipped"], 1)
+        with connect_db(self.db_path) as conn:
+            scanned = {
+                row["photo_id"]
+                for row in conn.execute("SELECT photo_id FROM photo_metadata").fetchall()
+            }
+        self.assertEqual(scanned, {photo_ids["one.png"]})
+
+        invalid_payloads = [
+            {"scope": "selection", "photo_ids": [], "scan_mode": "missing"},
+            {"scope": "selection", "photo_ids": [999999], "scan_mode": "missing"},
+            {"scope": "selection", "photo_ids": [photo_ids["one.png"]], "scan_mode": "incremental"},
+            {"scope": "all", "photo_ids": [photo_ids["one.png"]], "scan_mode": "missing"},
+            {"scope": "invalid", "scan_mode": "missing"},
+            {"scope": "selection", "photo_ids": list(range(1, 102)), "scan_mode": "missing"},
+        ]
+        for invalid_payload in invalid_payloads:
+            with self.subTest(payload=invalid_payload):
+                response = client.post("/api/scan", json={**invalid_payload, "sync": True})
+                self.assertEqual(response.status_code, 400)
 
     def test_incremental_scan_skips_unchanged_reprocesses_modified_and_marks_deleted(self):
         unchanged = self.images_root / "output" / "unchanged.png"
