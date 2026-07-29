@@ -253,64 +253,74 @@
                 </div>
                 <div class="linked-strip" id="linked-strip"></div>
             </div>
-            <aside class="details-panel">
-                <div class="panel-header">
-                    <h2 id="detail-title">Détails</h2>
-                    <div class="panel-actions">
-                        <button type="button" id="rescan-image-analysis-button"
-                                title="Réanalyser l'image localement">Image IA &#8635;</button>
-                        <button type="button" id="rescan-metadata-button">JSON &#128472;</button>
+            <aside class="details-panel" id="details-panel">
+                <button type="button" class="details-sheet-handle" id="details-sheet-handle"
+                        aria-controls="details-sheet-content" aria-expanded="false"
+                        aria-label="Afficher les détails">
+                    <span class="details-sheet-grip" aria-hidden="true"></span>
+                    <span class="details-sheet-chevron" aria-hidden="true"></span>
+                </button>
+                <div class="details-sheet-surface">
+                    <div class="panel-header details-sheet-header">
+                        <h2 id="detail-title">Détails</h2>
+                        <div class="panel-actions">
+                            <button type="button" id="rescan-image-analysis-button"
+                                    title="Réanalyser l'image localement">Image IA &#8635;</button>
+                            <button type="button" id="rescan-metadata-button">JSON &#128472;</button>
+                        </div>
+                    </div>
+                    <div class="details-sheet-content" id="details-sheet-content">
+                        <dl class="meta-list">
+                            <dt>Albums</dt>
+                            <dd id="detail-albums">-</dd>
+                            <dt>Seed</dt>
+                            <dd id="detail-seed">-</dd>
+                            <dt>Images sources</dt>
+                            <dd id="detail-used-images">-</dd>
+                            <dt>LoRA</dt>
+                            <dd id="detail-loras">-</dd>
+                        </dl>
+                        <section>
+                            <h3>Prompt</h3>
+                            <pre id="detail-prompt"></pre>
+                        </section>
+                        <section>
+                            <h3>Tags photo</h3>
+                            <div class="tag-row" id="detail-tags"></div>
+                            <div class="inline-form">
+                                <input id="photo-tags-input" type="text" placeholder="portrait, favori, a trier">
+                                <button id="save-photo-tags-button" type="button">Enregistrer</button>
+                            </div>
+                        </section>
+                        <details class="image-analysis-detail" id="detail-image-analysis">
+                            <summary>
+                                Analyse d'image
+                                <span class="sensitivity-badge" id="detail-effective-sensitivity">neutral</span>
+                            </summary>
+                            <div id="detail-image-analysis-content"></div>
+                        </details>
+                        <section class="face-detail-section">
+                            <div class="section-heading-row">
+                                <h3>Visages</h3>
+                                <button id="scan-photo-faces-button" type="button">Analyser</button>
+                            </div>
+                            <div id="detail-faces" class="face-detail-list"></div>
+                        </section>
+                        <section>
+                            <h3>Liens</h3>
+                            <div class="link-list" id="detail-links"></div>
+                            <div class="inline-form">
+                                <input id="link-search-input" type="search" placeholder="Chercher une photo">
+                                <select id="link-type-select">
+                                    {% for link_type in allowed_link_types %}
+                                        <option value="{{ link_type }}">{{ link_type }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="search-results" id="link-search-results"></div>
+                        </section>
                     </div>
                 </div>
-                <dl class="meta-list">
-                    <dt>Albums</dt>
-                    <dd id="detail-albums">-</dd>
-                    <dt>Seed</dt>
-                    <dd id="detail-seed">-</dd>
-                    <dt>Images sources</dt>
-                    <dd id="detail-used-images">-</dd>
-                    <dt>LoRA</dt>
-                    <dd id="detail-loras">-</dd>
-                </dl>
-                <section>
-                    <h3>Prompt</h3>
-                    <pre id="detail-prompt"></pre>
-                </section>
-                <section>
-                    <h3>Tags photo</h3>
-                    <div class="tag-row" id="detail-tags"></div>
-                    <div class="inline-form">
-                        <input id="photo-tags-input" type="text" placeholder="portrait, favori, a trier">
-                        <button id="save-photo-tags-button" type="button">Enregistrer</button>
-                    </div>
-                </section>
-                <details class="image-analysis-detail" id="detail-image-analysis">
-                    <summary>
-                        Analyse d'image
-                        <span class="sensitivity-badge" id="detail-effective-sensitivity">neutral</span>
-                    </summary>
-                    <div id="detail-image-analysis-content"></div>
-                </details>
-                <section class="face-detail-section">
-                    <div class="section-heading-row">
-                        <h3>Visages</h3>
-                        <button id="scan-photo-faces-button" type="button">Analyser</button>
-                    </div>
-                    <div id="detail-faces" class="face-detail-list"></div>
-                </section>
-                <section>
-                    <h3>Liens</h3>
-                    <div class="link-list" id="detail-links"></div>
-                    <div class="inline-form">
-                        <input id="link-search-input" type="search" placeholder="Chercher une photo">
-                        <select id="link-type-select">
-                            {% for link_type in allowed_link_types %}
-                                <option value="{{ link_type }}">{{ link_type }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="search-results" id="link-search-results"></div>
-                </section>
             </aside>
         </section>
     </div>

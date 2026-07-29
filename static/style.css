@@ -700,6 +700,15 @@ button:disabled {
     background: var(--surface);
 }
 
+.details-sheet-handle {
+    display: none;
+}
+
+.details-sheet-surface,
+.details-sheet-content {
+    display: contents;
+}
+
 .scan-options-panel {
     position: relative;
     width: min(560px, calc(100vw - 28px));
@@ -2053,8 +2062,7 @@ pre {
     }
 
     .photo-viewer {
-        grid-template-columns: 1fr;
-        grid-template-rows: minmax(0, 1fr);
+        display: block;
         width: 100vw;
         height: 100vh;
         margin: 0;
@@ -2063,8 +2071,14 @@ pre {
     }
 
     .photo-viewer.details-open {
-        grid-template-columns: 1fr;
-        grid-template-rows: minmax(0, 58vh) minmax(0, 42vh);
+        display: block;
+    }
+
+    .viewer-stage {
+        position: absolute;
+        inset: 0;
+        width: auto;
+        height: auto;
     }
 
     .viewer-actions > button,
@@ -2074,8 +2088,130 @@ pre {
         font-size: 30px;
     }
 
+    #details-toggle-button {
+        display: none;
+    }
+
+    .linked-strip {
+        left: 100px;
+        justify-content: flex-start;
+        overflow-x: auto;
+        scrollbar-width: none;
+    }
+
+    .linked-strip::-webkit-scrollbar {
+        display: none;
+    }
+
     .details-panel {
-        padding: 14px;
+        --details-sheet-handle-height: 58px;
+        position: absolute;
+        z-index: 6;
+        top: calc(100% - var(--details-sheet-handle-height));
+        top: calc(100% - var(--details-sheet-handle-height) - env(safe-area-inset-bottom));
+        right: 0;
+        bottom: auto;
+        left: 0;
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 85vh;
+        height: 85dvh;
+        max-height: 85vh;
+        max-height: 85dvh;
+        overflow: visible;
+        padding: 0;
+        background: transparent;
+        transition: top 220ms ease;
+        will-change: top;
+    }
+
+    .photo-viewer:not(.details-open) .details-panel {
+        display: flex;
+    }
+
+    .photo-viewer.details-open .details-panel {
+        top: 58vh;
+        top: 58dvh;
+    }
+
+    .photo-viewer.details-open.details-sheet-expanded .details-panel {
+        top: 15vh;
+        top: 15dvh;
+    }
+
+    .photo-viewer.details-sheet-dragging .details-panel {
+        transition: none;
+    }
+
+    .details-sheet-handle {
+        position: relative;
+        display: grid;
+        flex: 0 0 var(--details-sheet-handle-height);
+        place-content: center;
+        width: 76px;
+        min-height: var(--details-sheet-handle-height);
+        margin-left: 14px;
+        padding: 8px 18px 7px;
+        gap: 5px;
+        border: 1px solid var(--line);
+        border-bottom: 0;
+        border-radius: 12px 12px 0 0;
+        background: var(--surface);
+        box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.38);
+        touch-action: none;
+        user-select: none;
+    }
+
+    .details-sheet-grip {
+        width: 38px;
+        height: 5px;
+        border-radius: 999px;
+        background: var(--muted);
+    }
+
+    .details-sheet-chevron {
+        width: 9px;
+        height: 9px;
+        margin: 0 auto;
+        border-right: 2px solid currentColor;
+        border-bottom: 2px solid currentColor;
+        transform: rotate(225deg);
+        transition: transform 180ms ease;
+    }
+
+    .photo-viewer.details-sheet-expanded .details-sheet-chevron {
+        transform: rotate(45deg);
+    }
+
+    .details-sheet-surface {
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+        border-top: 1px solid var(--line);
+        border-radius: 0 12px 0 0;
+        background: var(--surface);
+        box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.42);
+    }
+
+    .details-sheet-header {
+        flex: 0 0 auto;
+        margin: 0;
+        padding: 12px 14px 10px;
+        touch-action: none;
+        user-select: none;
+    }
+
+    .details-sheet-content {
+        display: block;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding: 0 14px calc(14px + env(safe-area-inset-bottom));
+        -webkit-overflow-scrolling: touch;
     }
 
     .inline-form,
@@ -2213,5 +2349,12 @@ pre {
         min-height: 38px;
         padding: 3px;
         font-size: 11px;
+    }
+}
+
+@media (max-width: 760px) and (prefers-reduced-motion: reduce) {
+    .details-panel,
+    .details-sheet-chevron {
+        transition: none;
     }
 }

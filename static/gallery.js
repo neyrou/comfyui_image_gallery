@@ -8,6 +8,9 @@ const state = {
     scanJob: null,
     scanBusyDone: null,
     detailsVisible: window.localStorage.getItem("gallery.detailsVisible") === "true",
+    detailsSheetState: window.localStorage.getItem("gallery.detailsVisible") === "true" ? "compact" : "hidden",
+    detailsSheetDrag: null,
+    detailsSheetSuppressClick: false,
     comfyAvailable: false,
     comfyOptions: null,
     comfyReferences: [],
@@ -66,6 +69,10 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+const MOBILE_DETAILS_MEDIA = window.matchMedia("(max-width: 760px)");
+const DETAILS_SHEET_STATES = ["hidden", "compact", "expanded"];
+const DETAILS_SHEET_SNAP_DISTANCE = 56;
+const DETAILS_SHEET_SNAP_VELOCITY = 0.45;
 
 function tagsFromInput(value) {
     return value.split(",").map((tag) => tag.trim()).filter(Boolean);
@@ -396,6 +403,12 @@ function closePhotoModal(options = {}) {
     modal.classList.remove("open");
     modal.setAttribute("aria-hidden", "true");
     state.photoModalHistoryActive = false;
+    if (state.detailsSheetState === "expanded") {
+        setDetailsSheetState("compact", { persist: false });
+    }
+    state.detailsSheetDrag = null;
+    $("#details-panel")?.style.removeProperty("top");
+    $(".photo-viewer")?.classList.remove("details-sheet-dragging");
 }
 
 function renderPhotoDetail(photo) {
@@ -609,17 +622,200 @@ function renderGalleryItem(photo) {
 function applyDetailsVisibility() {
     const viewer = document.querySelector(".photo-viewer");
     const button = $("#details-toggle-button");
-    if (!viewer || !button) {
+    const handle = $("#details-sheet-handle");
+    const surface = $(".details-sheet-surface");
+    if (!viewer) {
         return;
     }
-    viewer.classList.toggle("details-open", state.detailsVisible);
-    button.setAttribute("aria-pressed", state.detailsVisible ? "true" : "false");
-    button.title = state.detailsVisible ? "Masquer les détails" : "Afficher les détails";
+
+    const mobile = MOBILE_DETAILS_MEDIA.matches;
+    const sheetState = mobile
+        ? state.detailsSheetState
+        : state.detailsVisible ? "compact" : "hidden";
+    const visible = sheetState !== "hidden";
+    const expanded = mobile && sheetState === "expanded";
+
+    viewer.classList.toggle("details-open", visible);
+    viewer.classList.toggle("details-sheet-expanded", expanded);
+    if (button) {
+        button.setAttribute("aria-pressed", visible ? "true" : "false");
+        button.title = visible ? "Masquer les détails" : "Afficher les détails";
+    }
+    if (handle) {
+        const labels = {
+            hidden: "Afficher les détails",
+            compact: "Masquer les détails. Balayer vers le haut pour agrandir",
+            expanded: "Masquer les détails. Balayer vers le bas pour réduire",
+        };
+        handle.dataset.sheetState = sheetState;
+        handle.setAttribute("aria-expanded", visible ? "true" : "false");
+        handle.setAttribute("aria-label", labels[sheetState]);
+        handle.title = labels[sheetState];
+    }
+    if (surface) {
+        const hiddenOnMobile = mobile && !visible;
+        surface.toggleAttribute("inert", hiddenOnMobile);
+        surface.setAttribute("aria-hidden", hiddenOnMobile ? "true" : "false");
+    }
+}
+
+function setDetailsSheetState(nextState, options = {}) {
+    if (!DETAILS_SHEET_STATES.includes(nextState)) {
+        return;
+    }
+    const visible = nextState !== "hidden";
+    state.detailsSheetState = nextState;
+    state.detailsVisible = visible;
+    if (options.persist !== false) {
+        window.localStorage.setItem("gallery.detailsVisible", visible ? "true" : "false");
+    }
+    applyDetailsVisibility();
 }
 
 function toggleDetailsPanel() {
+    if (MOBILE_DETAILS_MEDIA.matches) {
+        setDetailsSheetState(state.detailsSheetState === "hidden" ? "compact" : "hidden");
+        return;
+    }
     state.detailsVisible = !state.detailsVisible;
+    state.detailsSheetState = state.detailsVisible ? "compact" : "hidden";
     window.localStorage.setItem("gallery.detailsVisible", state.detailsVisible ? "true" : "false");
+    applyDetailsVisibility();
+}
+
+function stepDetailsSheet(direction) {
+    if (!MOBILE_DETAILS_MEDIA.matches) {
+        return;
+    }
+    const currentIndex = DETAILS_SHEET_STATES.indexOf(state.detailsSheetState);
+    const nextIndex = Math.max(0, Math.min(DETAILS_SHEET_STATES.length - 1, currentIndex + direction));
+    setDetailsSheetState(DETAILS_SHEET_STATES[nextIndex]);
+}
+
+function detailsSheetOffsets() {
+    const viewportHeight = $(".photo-viewer")?.clientHeight
+        || window.visualViewport?.height
+        || window.innerHeight;
+    const handleHeight = $("#details-sheet-handle")?.offsetHeight || 58;
+    return {
+        expanded: viewportHeight * 0.15,
+        compact: viewportHeight * 0.58,
+        hidden: Math.max(0, viewportHeight - handleHeight),
+    };
+}
+
+function handleDetailsSheetPointerDown(event) {
+    if (
+        !MOBILE_DETAILS_MEDIA.matches
+        || !$("#photo-modal")?.classList.contains("open")
+        || event.button !== 0
+        || (event.currentTarget.matches(".details-sheet-header")
+            && event.target.closest("button, input, select, textarea, a"))
+    ) {
+        return;
+    }
+
+    const panel = $("#details-panel");
+    const viewer = $(".photo-viewer");
+    if (!panel || !viewer) {
+        return;
+    }
+
+    state.detailsSheetDrag = {
+        pointerId: event.pointerId,
+        owner: event.currentTarget,
+        startY: event.clientY,
+        startAt: Date.now(),
+        startOffset: panel.offsetTop,
+        offsets: detailsSheetOffsets(),
+        dragged: false,
+    };
+    state.detailsSheetSuppressClick = false;
+    viewer.classList.add("details-sheet-dragging");
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+}
+
+function handleDetailsSheetPointerMove(event) {
+    const drag = state.detailsSheetDrag;
+    const panel = $("#details-panel");
+    if (!drag || drag.pointerId !== event.pointerId || !panel) {
+        return;
+    }
+
+    const deltaY = event.clientY - drag.startY;
+    if (Math.abs(deltaY) > 4) {
+        drag.dragged = true;
+    }
+    const offset = Math.max(
+        drag.offsets.expanded,
+        Math.min(drag.offsets.hidden, drag.startOffset + deltaY),
+    );
+    panel.style.top = `${offset}px`;
+    event.preventDefault();
+}
+
+function finishDetailsSheetPointer(event, cancelled = false) {
+    const drag = state.detailsSheetDrag;
+    if (!drag || drag.pointerId !== event.pointerId) {
+        return;
+    }
+
+    const panel = $("#details-panel");
+    const viewer = $(".photo-viewer");
+    const deltaY = event.clientY - drag.startY;
+    const elapsed = Math.max(1, Date.now() - drag.startAt);
+    const velocity = deltaY / elapsed;
+    let direction = 0;
+    if (!cancelled && (
+        Math.abs(deltaY) >= DETAILS_SHEET_SNAP_DISTANCE
+        || Math.abs(velocity) >= DETAILS_SHEET_SNAP_VELOCITY
+    )) {
+        direction = deltaY < 0 ? 1 : -1;
+    }
+
+    state.detailsSheetSuppressClick = drag.dragged && drag.owner.matches(".details-sheet-handle");
+    try {
+        drag.owner.releasePointerCapture?.(drag.pointerId);
+    } catch (_error) {
+        // The pointer may already have been released by the browser.
+    }
+    state.detailsSheetDrag = null;
+
+    const currentIndex = DETAILS_SHEET_STATES.indexOf(state.detailsSheetState);
+    const nextIndex = Math.max(0, Math.min(DETAILS_SHEET_STATES.length - 1, currentIndex + direction));
+    setDetailsSheetState(DETAILS_SHEET_STATES[nextIndex]);
+    viewer?.classList.remove("details-sheet-dragging");
+    window.requestAnimationFrame(() => panel?.style.removeProperty("top"));
+}
+
+function handleDetailsSheetClick(event) {
+    if (state.detailsSheetSuppressClick) {
+        state.detailsSheetSuppressClick = false;
+        event.preventDefault();
+        return;
+    }
+    toggleDetailsPanel();
+}
+
+function handleDetailsSheetKeydown(event) {
+    if (event.key === "ArrowUp") {
+        event.preventDefault();
+        stepDetailsSheet(1);
+    } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        stepDetailsSheet(-1);
+    }
+}
+
+function handleDetailsSheetBreakpointChange(event) {
+    state.detailsSheetDrag = null;
+    $("#details-panel")?.style.removeProperty("top");
+    $(".photo-viewer")?.classList.remove("details-sheet-dragging");
+    if (event.matches) {
+        state.detailsSheetState = state.detailsVisible ? "compact" : "hidden";
+    } else if (state.detailsSheetState === "expanded") {
+        state.detailsSheetState = "compact";
+    }
     applyDetailsVisibility();
 }
 
@@ -3171,6 +3367,15 @@ function bindEvents() {
     $("#next-button")?.addEventListener("click", () => navigate(1));
     $("#play-button")?.addEventListener("click", toggleSlideshow);
     $("#details-toggle-button")?.addEventListener("click", toggleDetailsPanel);
+    $("#details-sheet-handle")?.addEventListener("click", handleDetailsSheetClick);
+    $("#details-sheet-handle")?.addEventListener("keydown", handleDetailsSheetKeydown);
+    $$("#details-sheet-handle, .details-sheet-header").forEach((dragTarget) => {
+        dragTarget.addEventListener("pointerdown", handleDetailsSheetPointerDown);
+    });
+    document.addEventListener("pointermove", handleDetailsSheetPointerMove, { passive: false });
+    document.addEventListener("pointerup", (event) => finishDetailsSheetPointer(event));
+    document.addEventListener("pointercancel", (event) => finishDetailsSheetPointer(event, true));
+    MOBILE_DETAILS_MEDIA.addEventListener("change", handleDetailsSheetBreakpointChange);
     const viewerStage = $(".viewer-stage");
     viewerStage?.addEventListener("pointerenter", showLinkedStripTemporarily);
     viewerStage?.addEventListener("pointermove", showLinkedStripTemporarily);
