@@ -15,6 +15,7 @@ const state = {
     comfyOptions: null,
     comfyReferences: [],
     comfyReferenceTarget: null,
+    comfyReferenceAddOpen: false,
     comfyReferenceDragIndex: null,
     comfyReferencePointerId: null,
     comfyLoraCatalog: [],
@@ -1239,6 +1240,11 @@ async function reopenComfyJob() {
 function closeComfyModal() {
     $("#comfy-modal").classList.remove("open");
     $("#comfy-modal").setAttribute("aria-hidden", "true");
+    const closeOnFinish = $("#comfy-close-on-finish");
+    if (closeOnFinish) {
+        closeOnFinish.checked = true;
+    }
+    setComfyReferenceAddOpen(false);
 }
 
 function setComfyStatus(message, isError = false) {
@@ -1280,6 +1286,8 @@ function renderComfyOptions(options) {
     };
     state.comfyPreviewVersion = null;
     state.comfyLoraCatalog = options.lora_catalog || [];
+    state.comfyReferenceAddOpen = false;
+    state.comfyReferenceTarget = null;
     state.comfyReferences = (options.references || []).map((reference) => ({
         ...reference,
         input_name: reference.image_name,
@@ -1288,6 +1296,11 @@ function renderComfyOptions(options) {
     }));
     renderComfyLoras(options.loras || [], state.comfyLoraCatalog);
     renderComfyReferences();
+}
+
+function formatComfyLoraStrength(value) {
+    const strength = Number(value);
+    return Number.isFinite(strength) ? strength.toFixed(2) : "0.00";
 }
 
 function renderComfyLoras(loras, catalog) {
@@ -1300,13 +1313,13 @@ function renderComfyLoras(loras, catalog) {
         return `
             <div class="comfy-row comfy-lora-row" data-node-id="${escapeHtml(lora.node_id || "")}" data-new-lora="${lora.new ? "true" : "false"}">
                 <label class="checkbox-field">
-                    <input type="checkbox" data-comfy-lora-enabled ${lora.enabled ? "checked" : ""}>
-                    <span>${lora.new ? "Nouveau" : escapeHtml(lora.node_id)}</span>
+                    <input type="checkbox" data-comfy-lora-enabled aria-label="Activer le LoRA ${escapeHtml(lora.new ? "nouveau" : lora.node_id)}" ${lora.enabled ? "checked" : ""}>
+                    <span>${lora.new ? "New" : escapeHtml(lora.node_id)}</span>
                 </label>
                 <select data-comfy-lora-name>
                     ${names.map((name) => `<option value="${escapeHtml(name)}" ${name === lora.lora_name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}
                 </select>
-                <input type="number" data-comfy-lora-strength step="0.05" value="${escapeHtml(lora.strength_model ?? 1)}" aria-label="Force LoRA">
+                <input type="number" data-comfy-lora-strength step="0.01" inputmode="decimal" value="${escapeHtml(formatComfyLoraStrength(lora.strength_model ?? 1))}" aria-label="Force LoRA">
                 ${lora.new ? '<button type="button" class="comfy-row-remove" data-remove-comfy-lora title="Retirer">&times;</button>' : ""}
             </div>
         `;
@@ -1351,11 +1364,13 @@ function renderComfyReferences() {
         </article>
     `).join("");
     container.innerHTML = `
-        <div class="comfy-reference-strip" data-comfy-reference-strip>${cards || '<span class="muted">Aucune référence Qwen détectée</span>'}</div>
-        <div class="comfy-reference-add">
+        <div class="comfy-reference-strip" data-comfy-reference-strip>
+            ${cards || '<span class="muted">Aucune référence Qwen détectée</span>'}
+            <button type="button" class="comfy-reference-add-button" data-comfy-ref-add aria-label="Ajouter une référence" aria-controls="comfy-reference-add-panel" aria-expanded="${state.comfyReferenceAddOpen ? "true" : "false"}">+</button>
+        </div>
+        <div class="comfy-reference-add" id="comfy-reference-add-panel" ${state.comfyReferenceAddOpen ? "" : "hidden"}>
             <div class="comfy-reference-add-header">
                 <strong data-comfy-ref-add-title>Ajouter une référence</strong>
-                <button type="button" data-comfy-ref-add>Nouvelle</button>
             </div>
             <input type="search" data-comfy-ref-search placeholder="Nom d’une image dans les galeries">
             <label class="comfy-reference-upload">
@@ -1366,6 +1381,23 @@ function renderComfyReferences() {
         </div>
     `;
     updateComfyReferenceAddTitle();
+}
+
+function setComfyReferenceAddOpen(open, target = null) {
+    state.comfyReferenceAddOpen = Boolean(open);
+    state.comfyReferenceTarget = state.comfyReferenceAddOpen ? target : null;
+    const panel = $("#comfy-reference-add-panel");
+    const button = $("#comfy-references [data-comfy-ref-add]");
+    if (panel) {
+        panel.hidden = !state.comfyReferenceAddOpen;
+    }
+    if (button) {
+        button.setAttribute("aria-expanded", state.comfyReferenceAddOpen ? "true" : "false");
+    }
+    updateComfyReferenceAddTitle();
+    if (state.comfyReferenceAddOpen) {
+        $("#comfy-references [data-comfy-ref-search]")?.focus();
+    }
 }
 
 async function searchComfyReferences(event) {
@@ -1405,6 +1437,7 @@ function selectComfyReference(button) {
         const current = state.comfyReferences[state.comfyReferenceTarget];
         state.comfyReferences[state.comfyReferenceTarget] = { ...current, ...replacement, reference_id: current.reference_id, is_new: current.is_new };
     }
+    state.comfyReferenceAddOpen = false;
     state.comfyReferenceTarget = null;
     renderComfyReferences();
 }
@@ -1444,6 +1477,7 @@ async function uploadComfyReference(input) {
         const current = state.comfyReferences[state.comfyReferenceTarget];
         state.comfyReferences[state.comfyReferenceTarget] = { ...current, ...replacement, reference_id: current.reference_id, is_new: current.is_new };
     }
+    state.comfyReferenceAddOpen = false;
     state.comfyReferenceTarget = null;
     setComfyStatus("");
     renderComfyReferences();
@@ -1455,6 +1489,8 @@ function moveComfyReference(from, to) {
     }
     const [reference] = state.comfyReferences.splice(from, 1);
     state.comfyReferences.splice(to, 0, reference);
+    state.comfyReferenceAddOpen = false;
+    state.comfyReferenceTarget = null;
     renderComfyReferences();
 }
 
@@ -1530,8 +1566,10 @@ function pollComfyJob(jobId, delay) {
                 refreshComfyStatus();
                 if (data.job.state === "done" && data.job.photo) {
                     addPhotoToCurrentGallery(data.job.photo);
-                    closeComfyModal();
-                    await openPhoto(data.job.photo.id);
+                    if ($("#comfy-close-on-finish")?.checked !== false) {
+                        closeComfyModal();
+                        await openPhoto(data.job.photo.id);
+                    }
                 }
                 return;
             }
@@ -3313,6 +3351,11 @@ function bindEvents() {
     });
     $("#album-action-form")?.addEventListener("submit", submitAlbumAction);
     $("#comfy-form")?.addEventListener("submit", submitComfyGeneration);
+    $("#comfy-loras")?.addEventListener("focusout", (event) => {
+        if (event.target.matches("[data-comfy-lora-strength]")) {
+            event.target.value = formatComfyLoraStrength(event.target.value);
+        }
+    });
     $("#comfy-references")?.addEventListener("input", (event) => {
         if (event.target.matches("[data-comfy-ref-search]")) {
             debouncedComfyReferenceSearch(event);
@@ -3452,21 +3495,20 @@ function bindEvents() {
         }
         const addReference = event.target.closest("[data-comfy-ref-add]");
         if (addReference) {
-            state.comfyReferenceTarget = null;
-            updateComfyReferenceAddTitle();
-            $("#comfy-references [data-comfy-ref-search]")?.focus();
+            const shouldOpen = !state.comfyReferenceAddOpen || state.comfyReferenceTarget !== null;
+            setComfyReferenceAddOpen(shouldOpen);
         }
         const changeReference = event.target.closest("[data-comfy-ref-change]");
         if (changeReference) {
             const card = changeReference.closest("[data-comfy-reference-index]");
-            state.comfyReferenceTarget = Number(card.dataset.comfyReferenceIndex);
-            updateComfyReferenceAddTitle();
-            $("#comfy-references [data-comfy-ref-search]")?.focus();
+            setComfyReferenceAddOpen(true, Number(card.dataset.comfyReferenceIndex));
         }
         const removeReference = event.target.closest("[data-comfy-ref-remove]");
         if (removeReference) {
             const card = removeReference.closest("[data-comfy-reference-index]");
             state.comfyReferences.splice(Number(card.dataset.comfyReferenceIndex), 1);
+            state.comfyReferenceAddOpen = false;
+            state.comfyReferenceTarget = null;
             renderComfyReferences();
         }
         if (event.target.closest("[data-add-comfy-lora]")) {

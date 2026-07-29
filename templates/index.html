@@ -265,8 +265,8 @@
                         <h2 id="detail-title">Détails</h2>
                         <div class="panel-actions">
                             <button type="button" id="rescan-image-analysis-button"
-                                    title="Réanalyser l'image localement">Image IA &#8635;</button>
-                            <button type="button" id="rescan-metadata-button">JSON &#128472;</button>
+                                    title="Réanalyser l'image localement">IA &#8635;</button>
+                            <button type="button" id="rescan-metadata-button">JSON &#8635;</button>
                         </div>
                     </div>
                     <div class="details-sheet-content" id="details-sheet-content">
@@ -412,6 +412,10 @@
                 </div>
                 <div class="comfy-status" id="comfy-status"></div>
                 <div class="panel-footer">
+                    <label class="checkbox-field comfy-close-on-finish">
+                        <input type="checkbox" id="comfy-close-on-finish" checked>
+                        <span>Fermer le modal &agrave; la fin</span>
+                    </label>
                     <button type="button" id="comfy-cancel-button" class="danger-button" hidden>Annuler la g&eacute;n&eacute;ration</button>
                     <button type="submit" id="comfy-submit-button">Lancer</button>
                 </div>

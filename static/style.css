@@ -1533,8 +1533,13 @@ pre {
 }
 
 .comfy-row {
-    grid-template-columns: 92px minmax(0, 1fr) 100px auto;
+    grid-template-columns: 92px minmax(0, 1fr) 70px auto;
     align-items: center;
+}
+
+.comfy-row [data-comfy-lora-strength] {
+    width: 70px;
+    min-width: 0;
 }
 
 [data-comfy-lora-rows] {
@@ -1566,10 +1571,23 @@ pre {
 
 .comfy-reference-strip {
     display: flex;
+    align-items: center;
     gap: 10px;
     padding: 4px 2px 10px;
     overflow-x: auto;
     overscroll-behavior-inline: contain;
+}
+
+.comfy-reference-add-button {
+    display: grid;
+    flex: 0 0 42px;
+    place-items: center;
+    width: 42px;
+    min-height: 42px;
+    padding: 0;
+    border-radius: 50%;
+    font-size: 24px;
+    line-height: 1;
 }
 
 .comfy-reference-thumb {
@@ -1654,6 +1672,10 @@ pre {
     border-radius: 8px;
 }
 
+.comfy-reference-add[hidden] {
+    display: none;
+}
+
 .comfy-reference-add-header {
     display: flex;
     align-items: center;
@@ -1677,6 +1699,12 @@ pre {
 .danger-button {
     border-color: var(--danger);
     color: var(--danger);
+}
+
+.comfy-close-on-finish {
+    margin-right: auto;
+    color: var(--muted);
+    font-size: 12px;
 }
 
 .comfy-preview {
@@ -2215,11 +2243,28 @@ pre {
     }
 
     .inline-form,
-    .album-admin-card,
-    .comfy-grid,
-    .comfy-row {
+    .album-admin-card {
         grid-template-columns: 1fr;
         display: grid;
+    }
+
+    .comfy-grid {
+        grid-template-columns: minmax(0, 1fr) 92px;
+    }
+
+    .comfy-row {
+        grid-template-columns: auto minmax(0, 1fr) 64px auto;
+        gap: 6px;
+        padding: 8px;
+    }
+
+    .comfy-row [data-comfy-lora-strength] {
+        width: 68px;
+    }
+
+    .comfy-row .checkbox-field {
+        gap: 4px;
+        white-space: nowrap;
     }
 
     .admin-panel,
@@ -2356,5 +2401,11 @@ pre {
     .details-panel,
     .details-sheet-chevron {
         transition: none;
+    }
+}
+
+@media (max-width: 380px) {
+    .comfy-row .checkbox-field span {
+        display: none;
     }
 }
