@@ -1257,7 +1257,11 @@ function updateComfyFormJobControls(job) {
     const active = Boolean(job?.active);
     const cancelRequested = job?.state === "cancel_requested";
     $$("#comfy-form input, #comfy-form textarea, #comfy-form select, #comfy-form button").forEach((control) => {
-        if (control.id !== "comfy-submit-button" && control.id !== "comfy-cancel-button") {
+        if (
+            control.id !== "comfy-submit-button"
+            && control.id !== "comfy-cancel-button"
+            && control.id !== "comfy-close-on-finish"
+        ) {
             control.disabled = active;
         }
     });

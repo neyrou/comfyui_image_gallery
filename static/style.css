@@ -662,9 +662,9 @@ button:disabled {
 }
 
 .linked-strip button {
-    width: 56px;
-    height: 56px;
-    min-height: 56px;
+    width: 64px;
+    height: 64px;
+    min-height: 64px;
     padding: 0;
     overflow: hidden;
     border-color: rgba(255, 255, 255, 0.35);
@@ -2104,9 +2104,18 @@ pre {
 
     .viewer-stage {
         position: absolute;
+        isolation: auto;
         inset: 0;
         width: auto;
         height: auto;
+    }
+
+    .viewer-loading {
+        z-index: 5;
+    }
+
+    .viewer-actions {
+        z-index: 7;
     }
 
     .viewer-actions > button,
@@ -2150,6 +2159,7 @@ pre {
         overflow: visible;
         padding: 0;
         background: transparent;
+        pointer-events: none;
         transition: top 220ms ease;
         will-change: top;
     }
@@ -2187,6 +2197,7 @@ pre {
         border-radius: 12px 12px 0 0;
         background: var(--surface);
         box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.38);
+        pointer-events: auto;
         touch-action: none;
         user-select: none;
     }
@@ -2222,6 +2233,7 @@ pre {
         border-radius: 0 12px 0 0;
         background: var(--surface);
         box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.42);
+        pointer-events: auto;
     }
 
     .details-sheet-header {
