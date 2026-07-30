@@ -1326,6 +1326,32 @@ def api_album_tag_facets(album_id):
     return jsonify({"ok": True, **facets})
 
 
+@app.get("/api/albums/<int:album_id>/slideshow-photos")
+def api_album_slideshow_photos(album_id):
+    ensure_ready()
+    max_sensitivity = request.args.get("max_sensitivity") or "neutral"
+    if max_sensitivity not in SENSITIVITY_LEVELS:
+        return jsonify({"ok": False, "error": "Invalid sensitivity"}), 400
+    include_tags = normalized_query_tag_names(request.args.getlist("include_tag"))
+    exclude_tags = normalized_query_tag_names(request.args.getlist("exclude_tag"))
+    with connect_db(DB_PATH) as conn:
+        album = conn.execute(
+            "SELECT name FROM albums WHERE id=?",
+            (album_id,),
+        ).fetchone()
+        if not album:
+            return jsonify({"ok": False, "error": "Album not found"}), 404
+        _, photos, total = list_gallery_photos(
+            conn,
+            album["name"],
+            per_page=None,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            max_sensitivity=max_sensitivity,
+        )
+    return jsonify({"ok": True, "photos": photos, "total": total})
+
+
 @app.patch("/api/albums/<int:album_id>")
 def api_update_album(album_id):
     payload = request.get_json(silent=True) or {}

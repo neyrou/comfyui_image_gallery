@@ -1134,7 +1134,13 @@ def list_gallery_photos(
         """,
         (album["id"], *filter_params, max_sensitivity_rank),
     ).fetchone()["total"]
-    offset = max(page - 1, 0) * per_page
+    if per_page is None:
+        pagination_sql = ""
+        pagination_params = ()
+    else:
+        offset = max(page - 1, 0) * per_page
+        pagination_sql = "LIMIT ? OFFSET ?"
+        pagination_params = (per_page, offset)
     rows = conn.execute(
         f"""
         SELECT p.*, ap.relative_path, ap.filename, ap.mtime, ap.file_size AS album_file_size,
@@ -1163,9 +1169,9 @@ def list_gallery_photos(
         WHERE ap.album_id=? AND ap.is_missing=0{filter_clause}{sensitivity_clause}
         GROUP BY p.id, ap.relative_path
         ORDER BY ap.mtime DESC
-        LIMIT ? OFFSET ?
+        {pagination_sql}
         """,
-        (album["id"], *filter_params, max_sensitivity_rank, per_page, offset),
+        (album["id"], *filter_params, max_sensitivity_rank, *pagination_params),
     ).fetchall()
     return dict(album), [serialize_gallery_photo(row) for row in rows], total
 

@@ -1178,6 +1178,58 @@ class GalleryBackendTests(unittest.TestCase):
             app_module.IMAGES_ROOT = previous_images_root
             app_module.THUMBNAIL_ROOT = previous_thumbnail_root
 
+    def test_slideshow_photos_endpoint_returns_complete_filtered_album(self):
+        for index, filename in enumerate(("one.png", "two.png", "three.png")):
+            path = self.images_root / "output" / filename
+            create_png(path, color=(20 + index * 10, 30, 40))
+            os.utime(path, (100 + index, 100 + index))
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            album = get_album_by_name(conn, "output")
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute(
+                    "SELECT filename, photo_id FROM album_photos WHERE album_id=?",
+                    (album["id"],),
+                ).fetchall()
+            }
+            set_photo_tags(conn, photo_ids["one.png"], ["portrait"])
+            set_photo_tags(conn, photo_ids["two.png"], ["portrait"])
+            set_photo_tags(conn, photo_ids["three.png"], ["blocked"])
+
+        previous_db_path = app_module.DB_PATH
+        previous_images_root = app_module.IMAGES_ROOT
+        previous_thumbnail_root = app_module.THUMBNAIL_ROOT
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        try:
+            response = app_module.app.test_client().get(
+                f"/api/albums/{album['id']}/slideshow-photos"
+                "?include_tag=portrait&exclude_tag=blocked&max_sensitivity=neutral"
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertEqual(data["total"], 2)
+            self.assertEqual(
+                [photo["filename"] for photo in data["photos"]],
+                ["two.png", "one.png"],
+            )
+
+            invalid = app_module.app.test_client().get(
+                f"/api/albums/{album['id']}/slideshow-photos?max_sensitivity=invalid"
+            )
+            self.assertEqual(invalid.status_code, 400)
+
+            missing = app_module.app.test_client().get(
+                "/api/albums/999999/slideshow-photos"
+            )
+            self.assertEqual(missing.status_code, 404)
+        finally:
+            app_module.DB_PATH = previous_db_path
+            app_module.IMAGES_ROOT = previous_images_root
+            app_module.THUMBNAIL_ROOT = previous_thumbnail_root
+
 
 if __name__ == "__main__":
     unittest.main()

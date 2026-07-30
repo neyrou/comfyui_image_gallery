@@ -453,6 +453,8 @@
                     <button class="config-nav-button" type="button" role="tab" aria-selected="false"
                             aria-controls="config-section-lora-tags" data-config-section="lora-tags">Lora Tags</button>
                     <button class="config-nav-button" type="button" role="tab" aria-selected="false"
+                            aria-controls="config-section-slideshow" data-config-section="slideshow">Diaporama</button>
+                    <button class="config-nav-button" type="button" role="tab" aria-selected="false"
                             aria-controls="config-section-faces" data-config-section="faces">Reconnaissance faciale</button>
                 </nav>
                 <div class="config-content">
@@ -489,6 +491,31 @@
                         </form>
                         <div class="comfy-status" id="lora-tag-mapping-status" role="status" aria-live="polite"></div>
                         <div class="lora-tag-mapping-list" id="lora-tag-mapping-list"></div>
+                    </section>
+
+                    <section class="config-section" id="config-section-slideshow" role="tabpanel"
+                             data-config-panel="slideshow" hidden>
+                        <h3>Diaporama</h3>
+                        <p class="config-section-intro">
+                            R&eacute;glez le rythme et l&rsquo;ordre de lecture des photos de l&rsquo;album filtr&eacute;.
+                        </p>
+                        <form id="slideshow-settings-form" class="slideshow-settings-form">
+                            <label class="form-field">
+                                <span>Dur&eacute;e entre chaque photo (secondes)</span>
+                                <input id="slideshow-interval" name="interval" type="number"
+                                       min="0.5" max="3600" step="0.5" inputmode="decimal" required>
+                            </label>
+                            <label class="form-field">
+                                <span>Ordre</span>
+                                <select id="slideshow-order" name="order">
+                                    <option value="displayed">Tel qu&rsquo;affich&eacute; dans l&rsquo;album</option>
+                                    <option value="random">Al&eacute;atoire</option>
+                                </select>
+                            </label>
+                            <small class="slideshow-settings-note">
+                                Les r&eacute;glages sont enregistr&eacute;s automatiquement dans ce navigateur.
+                            </small>
+                        </form>
                     </section>
 
                     <section class="config-section" id="config-section-faces" role="tabpanel" data-config-panel="faces" hidden>

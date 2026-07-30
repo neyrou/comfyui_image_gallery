@@ -1134,6 +1134,16 @@ pre {
     min-width: 0;
 }
 
+.slideshow-settings-form {
+    display: grid;
+    gap: 18px;
+    width: min(520px, 100%);
+}
+
+.slideshow-settings-note {
+    color: var(--muted);
+}
+
 .tag-sensitivity-search {
     margin-bottom: 12px;
 }
