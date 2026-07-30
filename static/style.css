@@ -2233,6 +2233,7 @@ pre {
         display: block;
         width: 100vw;
         height: 100vh;
+        height: 100dvh;
         margin: 0;
         border: 0;
         border-radius: 0;
@@ -2271,15 +2272,17 @@ pre {
 
     .linked-strip {
         left: 100px;
+        bottom: calc(12px + env(safe-area-inset-bottom, 0px));
         justify-content: flex-start;
     }
 
     .details-panel {
         --details-sheet-handle-height: 58px;
+        --details-sheet-bottom-inset: env(safe-area-inset-bottom, 0px);
         position: absolute;
         z-index: 6;
         top: calc(100% - var(--details-sheet-handle-height));
-        top: calc(100% - var(--details-sheet-handle-height) - env(safe-area-inset-bottom));
+        top: calc(100% - var(--details-sheet-handle-height) - var(--details-sheet-bottom-inset));
         right: 0;
         bottom: auto;
         left: 0;
@@ -2384,7 +2387,7 @@ pre {
         min-height: 0;
         overflow-y: auto;
         overscroll-behavior: contain;
-        padding: 0 14px calc(14px + env(safe-area-inset-bottom));
+        padding: 0 14px calc(14px + env(safe-area-inset-bottom, 0px));
         -webkit-overflow-scrolling: touch;
     }
 
@@ -2424,6 +2427,11 @@ pre {
         max-height: 100vh;
         margin: 0;
         border-radius: 0;
+    }
+
+    .comfy-panel {
+        max-height: 100dvh;
+        padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
     }
 
     .config-panel {

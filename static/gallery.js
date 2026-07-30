@@ -959,14 +959,19 @@ function stepDetailsSheet(direction) {
 }
 
 function detailsSheetOffsets() {
-    const viewportHeight = $(".photo-viewer")?.clientHeight
+    const viewer = $(".photo-viewer");
+    const panel = $("#details-panel");
+    const viewportHeight = viewer?.clientHeight
         || window.visualViewport?.height
         || window.innerHeight;
     const handleHeight = $("#details-sheet-handle")?.offsetHeight || 58;
+    const bottomInset = panel
+        ? parseFloat(getComputedStyle(panel).getPropertyValue("--details-sheet-bottom-inset")) || 0
+        : 0;
     return {
         expanded: viewportHeight * 0.15,
         compact: viewportHeight * 0.58,
-        hidden: Math.max(0, viewportHeight - handleHeight),
+        hidden: Math.max(0, viewportHeight - handleHeight - bottomInset),
     };
 }
 
