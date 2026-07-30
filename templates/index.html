@@ -70,6 +70,7 @@
                 <div class="selection-actions-dropdown" id="selection-actions-menu" hidden>
                     <button type="button" data-batch-action="album">Ajouter &agrave; l'album</button>
                     <button type="button" data-batch-action="scan">Scan JSON</button>
+                    <button type="button" data-batch-action="image-analysis">Scan IA</button>
                     <button type="button" data-batch-action="faces">Reconnaissance faciale</button>
                     <button type="button" data-batch-action="tags">Edit tag</button>
                     <button type="button" data-batch-action="clear">Unselect all</button>
@@ -230,9 +231,16 @@
         <div class="modal-backdrop" data-close-modal></div>
         <section class="photo-viewer" role="dialog" aria-modal="true" aria-label="Photo">
             <div class="viewer-stage">
-                <img id="viewer-image" alt="">
+                <img id="viewer-thumbnail-image" class="viewer-image-layer viewer-thumbnail-layer" alt="">
+                <img id="viewer-preview-image" class="viewer-image-layer" alt="">
+                <img id="viewer-image" class="viewer-image-layer" alt="">
                 <div class="viewer-loading" id="viewer-loading" role="status" aria-label="Chargement de l'image" hidden>
                     <span class="viewer-spinner" aria-hidden="true"></span>
+                    <span id="viewer-loading-label">Chargement de l'aper&ccedil;u&hellip;</span>
+                </div>
+                <div class="viewer-load-error" id="viewer-load-error" role="alert" hidden>
+                    <span id="viewer-load-error-message">Impossible de charger l'image HD.</span>
+                    <button type="button" id="viewer-retry-button">R&eacute;essayer la HD</button>
                 </div>
                 <div class="viewer-actions">
                     <button type="button" id="prev-button" title="Précédente">‹</button>
@@ -254,6 +262,9 @@
                 <div class="linked-strip" id="linked-strip"></div>
             </div>
             <aside class="details-panel" id="details-panel">
+                <div class="details-loading" id="details-loading" role="status" hidden>
+                    Chargement des d&eacute;tails&hellip;
+                </div>
                 <button type="button" class="details-sheet-handle" id="details-sheet-handle"
                         aria-controls="details-sheet-content" aria-expanded="false"
                         aria-label="Afficher les détails">
@@ -273,10 +284,10 @@
                         <dl class="meta-list">
                             <dt>Albums</dt>
                             <dd id="detail-albums">-</dd>
+                            <dt>Model</dt>
+                            <dd id="detail-unet-name">-</dd>
                             <dt>Seed</dt>
                             <dd id="detail-seed">-</dd>
-                            <dt>Images sources</dt>
-                            <dd id="detail-used-images">-</dd>
                             <dt>LoRA</dt>
                             <dd id="detail-loras">-</dd>
                         </dl>

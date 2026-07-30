@@ -24,6 +24,7 @@ class MetadataExtractorTests(unittest.TestCase):
         metadata = extract_from_prompt_json(prompt, workflow)
 
         self.assertIn("keep same face", metadata.prompt)
+        self.assertEqual(metadata.unet_name, "qwen_image_edit_2511_bf16.safetensors")
         self.assertEqual(metadata.seed, 209282242741374)
         self.assertEqual(
             metadata.loras,

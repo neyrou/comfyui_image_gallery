@@ -1,28 +1,36 @@
 import io
+import json
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 import app as app_module
-from face_recognition import FaceDetection, classify_identity, select_onnx_providers
+from face_recognition import FaceDetection, InsightFaceEngine, classify_identity, select_onnx_providers
 from gallery_db import (
     add_gallery_face_reference,
     connect_db,
     create_face_identity,
     create_face_scan_job,
+    create_lora_tag_mapping,
     decide_face_match,
     get_photo_detail,
     init_db,
     photo_face_cache_valid,
     rematch_photo_faces,
+    replace_photo_image_analysis,
     replace_photo_faces,
+    rescan_metadata,
     scan_albums,
+    set_photo_tags,
     set_face_setting,
+    update_face_identity,
     update_photo_tags,
 )
 
@@ -114,6 +122,29 @@ class FaceRecognitionTests(unittest.TestCase):
         )
         self.assertEqual(select_onnx_providers(["CPUExecutionProvider"]), ["CPUExecutionProvider"])
 
+    def test_insightface_maps_gender_to_detected_sex(self):
+        engine = InsightFaceEngine(model_root=self.root / "models")
+
+        class FakeApplication:
+            def __init__(self, gender):
+                self.gender = gender
+
+            def get(self, _image):
+                return [
+                    SimpleNamespace(
+                        bbox=(1, 2, 20, 22),
+                        det_score=0.99,
+                        normed_embedding=(1.0, 0.0),
+                        sex="M" if self.gender == 1 else "F" if self.gender == 0 else None,
+                    )
+                ]
+
+        for gender, expected in ((1, "M"), (0, "F"), (None, "ND")):
+            with self.subTest(gender=gender), patch.object(
+                engine, "_load", return_value=FakeApplication(gender)
+            ):
+                self.assertEqual(engine.analyze_array(None)[0].detected_sex, expected)
+
     def test_existing_photo_tags_are_migrated_as_manual(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -136,6 +167,352 @@ class FaceRecognitionTests(unittest.TestCase):
         with connect_db(self.db_path) as conn:
             row = conn.execute("SELECT source FROM photo_tags WHERE photo_id=1 AND tag_id=1").fetchone()
             self.assertEqual(row["source"], "manual")
+
+    def test_existing_face_schema_migrates_sex_and_attribute_cache_version(self):
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE photos (id INTEGER PRIMARY KEY, checksum TEXT NOT NULL UNIQUE);
+                CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+                CREATE TABLE face_identities (
+                    id INTEGER PRIMARY KEY,
+                    tag_id INTEGER NOT NULL UNIQUE,
+                    review_threshold REAL NOT NULL DEFAULT 0.40,
+                    automatic_threshold REAL NOT NULL DEFAULT 0.55,
+                    margin_threshold REAL NOT NULL DEFAULT 0.08,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE face_photo_scans (
+                    photo_id INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    provider TEXT,
+                    faces_count INTEGER NOT NULL DEFAULT 0,
+                    scanned_at TEXT
+                );
+                CREATE TABLE photo_faces (
+                    id INTEGER PRIMARY KEY,
+                    photo_id INTEGER NOT NULL,
+                    face_index INTEGER NOT NULL,
+                    bbox_json TEXT NOT NULL,
+                    detection_score REAL NOT NULL,
+                    embedding BLOB NOT NULL,
+                    embedding_dimensions INTEGER NOT NULL,
+                    model_name TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    UNIQUE(photo_id, model_name, model_version, face_index)
+                );
+                INSERT INTO photos(id, checksum) VALUES (1, 'legacy-checksum');
+                INSERT INTO tags(id, name) VALUES (1, 'Legacy');
+                INSERT INTO face_identities(id, tag_id) VALUES (1, 1);
+                INSERT INTO face_photo_scans(
+                    photo_id, checksum, model_name, model_version, faces_count
+                ) VALUES (1, 'legacy-checksum', 'buffalo_l', 'buffalo_l-v1', 0);
+                """
+            )
+            conn.commit()
+
+        init_db(self.db_path)
+
+        with connect_db(self.db_path) as conn:
+            identity = conn.execute("SELECT sex FROM face_identities WHERE id=1").fetchone()
+            scan = conn.execute(
+                "SELECT attributes_version FROM face_photo_scans WHERE photo_id=1"
+            ).fetchone()
+            face_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(photo_faces)").fetchall()
+            }
+            self.assertEqual(identity["sex"], "ND")
+            self.assertEqual(scan["attributes_version"], 1)
+            self.assertIn("detected_sex", face_columns)
+            self.assertFalse(
+                photo_face_cache_valid(
+                    conn, 1, "legacy-checksum", "buffalo_l", "buffalo_l-v1"
+                )
+            )
+
+    def test_face_identity_api_round_trips_and_validates_sex(self):
+        init_db(self.db_path)
+        client = app_module.app.test_client()
+
+        created = client.post(
+            "/api/face/identities",
+            json={"tag_name": "Alex", "sex": "M"},
+        )
+        identity = created.get_json()["identity"]
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(identity["sex"], "M")
+
+        with patch("app.enqueue_rematch_all", return_value=None):
+            updated = client.patch(
+                f"/api/face/identities/{identity['id']}",
+                json={"sex": "F"},
+            )
+            invalid = client.patch(
+                f"/api/face/identities/{identity['id']}",
+                json={"sex": "X"},
+            )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.get_json()["identity"]["sex"], "F")
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_legacy_crossdress_system_tag_is_renamed(self):
+        create_png(self.images_root / "output" / "subject.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            cursor = conn.execute(
+                "INSERT INTO tags(name, machine_key) VALUES ('crossdress', 'rule:crossdress')"
+            )
+            conn.execute(
+                "INSERT INTO photo_tags(photo_id, tag_id, source) VALUES (?, ?, 'rule_auto')",
+                (photo_id, cursor.lastrowid),
+            )
+
+            set_photo_tags(conn, photo_id, [])
+
+            renamed = conn.execute(
+                "SELECT name, machine_key FROM tags WHERE id=?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            self.assertEqual(
+                dict(renamed),
+                {"name": "crossdressing", "machine_key": "rule:crossdressing"},
+            )
+
+    def test_crossdress_rule_uses_identity_then_prediction_and_requires_one_face(self):
+        create_png(self.images_root / "output" / "subject.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            checksum = conn.execute(
+                "SELECT checksum FROM photos WHERE id=?", (photo_id,)
+            ).fetchone()["checksum"]
+            face_id = replace_photo_faces(
+                conn,
+                photo_id,
+                checksum,
+                [FaceDetection((1, 1, 20, 20), 0.99, (1.0, 0.0), "M")],
+                "buffalo_l",
+                "buffalo_l-v1",
+            )[0]
+
+            set_photo_tags(conn, photo_id, ["large breasts", "pleated skirt"])
+            crossdress = conn.execute(
+                """
+                SELECT pt.source
+                FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                WHERE pt.photo_id=? AND t.name='crossdressing'
+                """,
+                (photo_id,),
+            ).fetchone()
+            self.assertEqual(crossdress["source"], "rule_auto")
+
+            identity = create_face_identity(conn, "Explicit female", sex="F")
+            decide_face_match(conn, face_id, identity["id"], "confirmed")
+            self.assertIsNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+
+            update_face_identity(conn, identity["id"], sex="ND")
+            rematch_photo_faces(conn, photo_id)
+            self.assertIsNotNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+
+            replace_photo_faces(
+                conn,
+                photo_id,
+                checksum,
+                [FaceDetection((1, 1, 20, 20), 0.99, (1.0, 0.0), "F")],
+                "buffalo_l",
+                "buffalo_l-v1",
+            )
+            new_face_id = conn.execute(
+                "SELECT id FROM photo_faces WHERE photo_id=?", (photo_id,)
+            ).fetchone()["id"]
+            update_face_identity(conn, identity["id"], sex="M")
+            decide_face_match(conn, new_face_id, identity["id"], "confirmed")
+            self.assertIsNotNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+
+            replace_photo_faces(
+                conn,
+                photo_id,
+                checksum,
+                [
+                    FaceDetection((1, 1, 15, 20), 0.99, (1.0, 0.0), "M"),
+                    FaceDetection((16, 1, 30, 20), 0.98, (0.0, 1.0), "F"),
+                ],
+                "buffalo_l",
+                "buffalo_l-v1",
+            )
+            rematch_photo_faces(conn, photo_id)
+            self.assertIsNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+
+            set_photo_tags(conn, photo_id, ["crossdressing"])
+            manual = conn.execute(
+                """
+                SELECT pt.source FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                WHERE pt.photo_id=? AND t.name='crossdressing'
+                """,
+                (photo_id,),
+            ).fetchone()
+            self.assertEqual(manual["source"], "manual")
+
+    def test_crossdress_requires_two_distinct_feminine_families(self):
+        create_png(self.images_root / "output" / "subject.png")
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            checksum = conn.execute(
+                "SELECT checksum FROM photos WHERE id=?", (photo_id,)
+            ).fetchone()["checksum"]
+            replace_photo_faces(
+                conn,
+                photo_id,
+                checksum,
+                [FaceDetection((1, 1, 20, 20), 0.99, (1.0, 0.0), "M")],
+                "buffalo_l",
+                "buffalo_l-v1",
+            )
+
+            set_photo_tags(conn, photo_id, ["large breasts", "small breasts"])
+            self.assertIsNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+            set_photo_tags(conn, photo_id, ["large_breasts", "high-heels"])
+            self.assertIsNotNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+
+    def test_crossdress_recalculates_after_image_and_json_scans(self):
+        prompt = {
+            "1": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "feminine.safetensors", "strength_model": 1.0},
+            }
+        }
+        pnginfo = PngInfo()
+        pnginfo.add_text("prompt", json.dumps(prompt))
+        image_path = self.images_root / "output" / "subject.png"
+        Image.new("RGB", (32, 32), (20, 40, 60)).save(image_path, pnginfo=pnginfo)
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            checksum = conn.execute(
+                "SELECT checksum FROM photos WHERE id=?", (photo_id,)
+            ).fetchone()["checksum"]
+            replace_photo_faces(
+                conn,
+                photo_id,
+                checksum,
+                [FaceDetection((1, 1, 20, 20), 0.99, (1.0, 0.0), "M")],
+                "buffalo_l",
+                "buffalo_l-v1",
+            )
+            replace_photo_image_analysis(
+                conn,
+                photo_id,
+                checksum,
+                "test-v1",
+                {
+                    "analysis_level": "neutral",
+                    "freepik_level": "neutral",
+                    "automatic_tags": [
+                        {"name": "large_breasts", "display_name": "large breasts"},
+                        {"name": "pleated_skirt", "display_name": "pleated skirt"},
+                    ],
+                },
+            )
+            self.assertIsNotNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+
+            replace_photo_image_analysis(
+                conn,
+                photo_id,
+                checksum,
+                "test-v2",
+                {
+                    "analysis_level": "neutral",
+                    "freepik_level": "neutral",
+                    "automatic_tags": [],
+                },
+            )
+            self.assertIsNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
+
+            create_lora_tag_mapping(
+                conn,
+                "feminine.safetensors",
+                ["large breasts", "pleated skirt"],
+            )
+            rescan_metadata(conn, photo_id, image_path)
+            self.assertIsNotNone(
+                conn.execute(
+                    """
+                    SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                    WHERE pt.photo_id=? AND t.name='crossdressing'
+                    """,
+                    (photo_id,),
+                ).fetchone()
+            )
 
     def test_face_crop_applies_exif_orientation_before_bounding_box(self):
         image_path = self.images_root / "output" / "oriented.jpg"

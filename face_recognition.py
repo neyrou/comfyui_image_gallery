@@ -7,6 +7,7 @@ from pathlib import Path
 
 MODEL_NAME = "buffalo_l"
 MODEL_VERSION = "buffalo_l-v1"
+FACE_ATTRIBUTES_VERSION = 2
 DEFAULT_DETECTION_SIZE = (640, 640)
 
 
@@ -23,6 +24,12 @@ class FaceDetection:
     bbox: tuple[float, float, float, float]
     detection_score: float
     embedding: tuple[float, ...]
+    detected_sex: str = "ND"
+
+
+def normalize_detected_sex(value):
+    normalized = str(value or "ND").upper()
+    return normalized if normalized in {"M", "F"} else "ND"
 
 
 def normalized_embedding(values):
@@ -130,6 +137,7 @@ class InsightFaceEngine:
             "model_root": str(self.model_root),
             "model_directory": str(model_directory),
             "model_present": len(onnx_files) >= 2,
+            "gender_model_present": any(path.name.lower() == "genderage.onnx" for path in onnx_files),
             "dependencies_present": dependencies_present,
             "configured": len(onnx_files) >= 2 and dependencies_present,
             "provider": self.provider,
@@ -158,7 +166,7 @@ class InsightFaceEngine:
             application = FaceAnalysis(
                 name=self.model_name,
                 root=str(self.model_root),
-                allowed_modules=["detection", "recognition"],
+                allowed_modules=["detection", "recognition", "genderage"],
                 providers=providers,
             )
             application.prepare(ctx_id=0 if providers[0] == "CUDAExecutionProvider" else -1, det_size=self.detection_size)
@@ -195,6 +203,7 @@ class InsightFaceEngine:
                     bbox=bbox,
                     detection_score=float(getattr(face, "det_score", 0.0)),
                     embedding=normalized_embedding(embedding),
+                    detected_sex=normalize_detected_sex(getattr(face, "sex", None)),
                 )
             )
         return detections

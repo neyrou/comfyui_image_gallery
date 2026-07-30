@@ -28,6 +28,9 @@ const state = {
     swipeStartY: null,
     swipeStartAt: 0,
     viewerLoadId: 0,
+    viewerPhoto: null,
+    viewerOriginalPending: false,
+    viewerOriginalLoaded: false,
     zoomScale: 1,
     zoomTranslateX: 0,
     zoomTranslateY: 0,
@@ -66,6 +69,8 @@ const state = {
     tagSensitivities: [],
     tagSensitivityQuery: "",
     linkedStripIdleTimer: null,
+    linkedStripExpanded: false,
+    linkedStripResizeObserver: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -132,6 +137,26 @@ function sensitivitySelectorHtml(selected, attributes = "") {
     `;
 }
 
+function faceSexSelectorHtml(selected = "ND") {
+    const values = ["ND", "M", "F"];
+    return `
+        <label class="face-sex-field" title="Sexe du visage">
+            <span class="sr-only">Sexe du visage</span>
+            <input type="hidden" name="sex" value="${selected}">
+            <span class="sensitivity-selector face-sex-selector"
+                  role="radiogroup" aria-label="Sexe du visage">
+                ${values.map((value) => `
+                    <button type="button" role="radio"
+                            class="sensitivity-step face-sex-${value.toLowerCase()}${selected === value ? " is-selected" : ""}"
+                            data-face-sex-value="${value}"
+                            aria-checked="${selected === value}"
+                            title="${value}">${value}</button>
+                `).join("")}
+            </span>
+        </label>
+    `;
+}
+
 function escapeHtml(value) {
     return String(value ?? "")
         .replace(/&/g, "&amp;")
@@ -142,7 +167,8 @@ function escapeHtml(value) {
 
 const LONG_PRESS_DELAY = 500;
 const LONG_PRESS_MOVE_TOLERANCE = 10;
-const LINKED_STRIP_IDLE_DELAY = 3000;
+const LINKED_STRIP_IDLE_DELAY = 6000;
+const LINKED_STRIP_FADE_DELAY = 220;
 const SCAN_OPTIONS_STORAGE_KEY = "gallery.scanOptions.v1";
 
 function selectedPhotoIds() {
@@ -326,63 +352,238 @@ function setBusy(button, busyText, options = {}) {
     };
 }
 
+function viewerPhotoSummary(photoId) {
+    const galleryPhoto = state.photos.find((photo) => photo.id === photoId);
+    if (galleryPhoto) {
+        return galleryPhoto;
+    }
+    if (state.currentPhoto?.id === photoId) {
+        return state.currentPhoto;
+    }
+    const linkedPhoto = state.currentPhoto?.links?.find(
+        (photo) => photo.linked_photo_id === photoId,
+    );
+    if (!linkedPhoto) {
+        return null;
+    }
+    return {
+        id: linkedPhoto.linked_photo_id,
+        checksum: linkedPhoto.checksum,
+        filename: linkedPhoto.filename,
+        thumbnail_url: linkedPhoto.thumbnail_url,
+        preview_url: linkedPhoto.preview_url,
+        original_url: linkedPhoto.original_url,
+    };
+}
+
+function setDetailsLoading(loading, message = "Chargement des détails…") {
+    const indicator = $("#details-loading");
+    if (!indicator) {
+        return;
+    }
+    indicator.textContent = message;
+    indicator.hidden = !loading;
+    $("#details-panel")?.setAttribute("aria-busy", String(Boolean(loading)));
+}
+
+function setViewerLoading(phase = null) {
+    const indicator = $("#viewer-loading");
+    const label = $("#viewer-loading-label");
+    if (!indicator) {
+        return;
+    }
+    indicator.hidden = !phase;
+    indicator.classList.toggle("is-hd", phase === "hd");
+    const text = phase === "hd" ? "Chargement HD…" : "Chargement de l’aperçu…";
+    if (label) {
+        label.textContent = text;
+    }
+    indicator.setAttribute("aria-label", text);
+}
+
+function setViewerLoadError(message = "", retryable = false) {
+    const box = $("#viewer-load-error");
+    if (!box) {
+        return;
+    }
+    box.hidden = !message;
+    $("#viewer-load-error-message").textContent = message;
+    $("#viewer-retry-button").hidden = !retryable;
+}
+
+function resetViewerImageElement(image) {
+    if (!image) {
+        return;
+    }
+    image.onload = null;
+    image.onerror = null;
+    image.removeAttribute("src");
+    image.classList.remove("is-visible");
+}
+
+function clearViewerImageLoads() {
+    resetViewerImageElement($("#viewer-thumbnail-image"));
+    resetViewerImageElement($("#viewer-preview-image"));
+    resetViewerImageElement($("#viewer-image"));
+    state.viewerPhoto = null;
+    state.viewerOriginalPending = false;
+    state.viewerOriginalLoaded = false;
+    setViewerLoading(null);
+    setViewerLoadError();
+}
+
+function startViewerOriginalLoad(loadId, options = {}) {
+    const photo = state.viewerPhoto;
+    if (
+        !photo
+        || loadId !== state.viewerLoadId
+        || state.viewerOriginalLoaded
+        || !photo.original_url
+    ) {
+        setViewerLoading(null);
+        return;
+    }
+    if (state.playTimer && !options.force) {
+        state.viewerOriginalPending = true;
+        setViewerLoading(null);
+        return;
+    }
+
+    state.viewerOriginalPending = false;
+    setViewerLoadError();
+    setViewerLoading("hd");
+    const original = $("#viewer-image");
+    resetViewerImageElement(original);
+    original.alt = photo.filename || photo.checksum || "";
+    original.decoding = "async";
+    original.fetchPriority = "low";
+    original.onload = () => {
+        if (loadId !== state.viewerLoadId) {
+            return;
+        }
+        state.viewerOriginalLoaded = true;
+        original.classList.add("is-visible");
+        setViewerLoading(null);
+        window.setTimeout(() => {
+            if (loadId !== state.viewerLoadId || !state.viewerOriginalLoaded) {
+                return;
+            }
+            resetViewerImageElement($("#viewer-thumbnail-image"));
+            resetViewerImageElement($("#viewer-preview-image"));
+        }, 220);
+    };
+    original.onerror = () => {
+        if (loadId !== state.viewerLoadId) {
+            return;
+        }
+        setViewerLoading(null);
+        setViewerLoadError("La HD n’a pas pu être chargée.", true);
+    };
+    original.src = photo.original_url;
+}
+
+function startProgressiveViewerLoad(photo, loadId) {
+    clearViewerImageLoads();
+    state.viewerPhoto = photo;
+    resetViewerZoom();
+    const alt = photo.filename || photo.checksum || "";
+
+    const thumbnail = $("#viewer-thumbnail-image");
+    thumbnail.alt = alt;
+    if (photo.thumbnail_url) {
+        thumbnail.src = photo.thumbnail_url;
+        thumbnail.classList.add("is-visible");
+    }
+
+    const preview = $("#viewer-preview-image");
+    preview.alt = alt;
+    if (!photo.preview_url) {
+        startViewerOriginalLoad(loadId);
+        return;
+    }
+
+    setViewerLoading("preview");
+    preview.decoding = "async";
+    preview.fetchPriority = "high";
+    preview.onload = () => {
+        if (loadId !== state.viewerLoadId) {
+            return;
+        }
+        preview.classList.add("is-visible");
+        startViewerOriginalLoad(loadId);
+    };
+    preview.onerror = () => {
+        if (loadId !== state.viewerLoadId) {
+            return;
+        }
+        startViewerOriginalLoad(loadId);
+        if (!photo.original_url) {
+            setViewerLoadError("L’image n’a pas pu être chargée.");
+        }
+    };
+    preview.src = photo.preview_url;
+}
+
+function retryViewerOriginalLoad() {
+    if (!state.viewerPhoto || state.viewerOriginalLoaded) {
+        return;
+    }
+    startViewerOriginalLoad(state.viewerLoadId, { force: true });
+}
+
 async function openPhoto(photoId, options = {}) {
     const modal = $("#photo-modal");
     const wasOpen = modal.classList.contains("open");
     const loadId = ++state.viewerLoadId;
-    resetViewerZoom();
-    setViewerLoading(true);
+    const summary = options.photo || viewerPhotoSummary(photoId);
+    state.currentPhoto = null;
+    state.currentIndex = state.photos.findIndex((photo) => photo.id === photoId);
+    setDetailsLoading(true);
+    setViewerLoadError();
+    if (summary) {
+        startProgressiveViewerLoad(summary, loadId);
+    } else {
+        clearViewerImageLoads();
+        setViewerLoading("preview");
+    }
+
+    applyDetailsVisibility();
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+    updateLinkedStripLayout();
+    if (!wasOpen && !options.skipHistory && !state.photoModalHistoryActive) {
+        window.history.pushState({ ...(window.history.state || {}), photoModal: true }, "", window.location.href);
+        state.photoModalHistoryActive = true;
+    }
+
     let data;
     try {
         data = await fetchJson(`/api/photos/${photoId}`);
     } catch (error) {
         if (loadId === state.viewerLoadId) {
-            setViewerLoading(false);
+            setDetailsLoading(true, `Détails indisponibles : ${error.message}`);
+            if (!summary) {
+                setViewerLoading(null);
+                setViewerLoadError("La photo n’a pas pu être chargée.");
+            }
         }
-        throw error;
+        return null;
     }
     if (loadId !== state.viewerLoadId) {
-        return;
+        return null;
     }
+
     state.currentPhoto = data.photo;
     state.currentIndex = state.photos.findIndex((photo) => photo.id === photoId);
+    if (summary) {
+        state.viewerPhoto = { ...summary, ...data.photo };
+    } else {
+        startProgressiveViewerLoad(data.photo, loadId);
+    }
     renderPhotoDetail(data.photo);
-    applyDetailsVisibility();
-    modal.classList.add("open");
-    modal.setAttribute("aria-hidden", "false");
-    if (!wasOpen && !options.skipHistory && !state.photoModalHistoryActive) {
-        window.history.pushState({ ...(window.history.state || {}), photoModal: true }, "", window.location.href);
-        state.photoModalHistoryActive = true;
-    }
-    await loadViewerImage(data.photo.original_url || data.photo.thumbnail_url, loadId);
-}
-
-function setViewerLoading(loading) {
-    const indicator = $("#viewer-loading");
-    if (indicator) {
-        indicator.hidden = !loading;
-    }
-}
-
-function loadViewerImage(url, loadId) {
-    return new Promise((resolve) => {
-        const preload = new Image();
-        preload.onload = () => {
-            if (loadId === state.viewerLoadId) {
-                resetViewerZoom();
-                $("#viewer-image").src = url;
-                setViewerLoading(false);
-            }
-            resolve();
-        };
-        preload.onerror = () => {
-            if (loadId === state.viewerLoadId) {
-                setViewerLoading(false);
-            }
-            resolve();
-        };
-        preload.src = url;
-    });
+    setDetailsLoading(false);
+    updateLinkedStripLayout();
+    return data.photo;
 }
 
 function closePhotoModal(options = {}) {
@@ -395,12 +596,16 @@ function closePhotoModal(options = {}) {
         window.history.back();
         return;
     }
-    stopSlideshow();
+    stopSlideshow({ resumeHd: false });
+    state.viewerLoadId += 1;
+    clearViewerImageLoads();
+    setDetailsLoading(false);
     closePhotoActionsMenu();
     closeComfyModal();
     closeAlbumActionModal();
     clearLinkedStripIdleTimer();
-    $("#linked-strip")?.classList.remove("is-hidden");
+    state.linkedStripExpanded = false;
+    $("#linked-strip")?.classList.remove("is-hidden", "is-expanded");
     modal.classList.remove("open");
     modal.setAttribute("aria-hidden", "true");
     state.photoModalHistoryActive = false;
@@ -413,7 +618,10 @@ function closePhotoModal(options = {}) {
 }
 
 function renderPhotoDetail(photo) {
-    $("#viewer-image").alt = photo.memberships[0]?.filename || photo.checksum;
+    const viewerAlt = photo.memberships[0]?.filename || photo.checksum;
+    $$(".viewer-image-layer").forEach((image) => {
+        image.alt = viewerAlt;
+    });
     $("#detail-title").textContent = photo.memberships[0]?.filename || photo.checksum.slice(0, 12);
     $("#detail-albums").innerHTML = photo.memberships
         .map((membership) => `
@@ -425,10 +633,10 @@ function renderPhotoDetail(photo) {
         `)
         .join("");
     const metadata = photo.metadata || {};
+    $("#detail-unet-name").textContent = metadata.unet_name
+        ? metadata.unet_name.replace(/\.safetensors?$/i, "")
+        : "-";
     $("#detail-seed").textContent = metadata.seed_noise || metadata.seed || "-";
-    $("#detail-used-images").innerHTML = photo.used_images.length
-        ? photo.used_images.map((name) => `<div>${escapeHtml(name)}</div>`).join("")
-        : '<span class="muted">Aucune</span>';
     $("#detail-loras").innerHTML = photo.loras.length
         ? photo.loras.map((lora) => `<div>${escapeHtml(lora.lora_name)} <span class="muted">${escapeHtml(lora.strength_model ?? "")}</span></div>`).join("")
         : '<span class="muted">Aucun</span>';
@@ -565,6 +773,7 @@ function galleryPhotoFromDetail(photo) {
         album_count: photo.memberships.length,
         user_album_count: photo.memberships.filter((item) => item.type === "user").length,
         original_url: photo.original_url,
+        preview_url: photo.preview_url,
         thumbnail_url: photo.thumbnail_url,
     };
 }
@@ -839,20 +1048,80 @@ function renderLinks(links) {
 
 function renderLinkedStrip(links) {
     const strip = $("#linked-strip");
+    state.linkedStripExpanded = false;
     if (!links.length) {
         clearLinkedStripIdleTimer();
-        strip.classList.remove("is-hidden");
+        strip.classList.remove("is-hidden", "is-expanded");
         strip.innerHTML = "";
         return;
     }
-    strip.innerHTML = links.map((link) => `
+    strip.classList.remove("is-expanded");
+    strip.innerHTML = `
+        ${links.map((link) => `
         <button type="button"
-                class="linked-image--${link.type === "original" ? "origin" : "variant"}"
+                class="linked-strip-thumbnail linked-image--${link.type === "original" ? "origin" : "variant"}"
                 data-open-linked="${link.linked_photo_id}"
                 title="${escapeHtml(link.type)}">
             <img src="${link.thumbnail_url}" alt="${escapeHtml(link.filename)}">
         </button>
-    `).join("");
+        `).join("")}
+        <button type="button"
+                class="linked-strip-toggle"
+                data-linked-strip-toggle
+                aria-expanded="false"
+                aria-label="Afficher toutes les images liées"
+                title="Afficher toutes les images liées"
+                hidden>…</button>
+    `;
+    updateLinkedStripLayout();
+    showLinkedStripTemporarily();
+}
+
+function updateLinkedStripLayout() {
+    const strip = $("#linked-strip");
+    const toggle = strip?.querySelector("[data-linked-strip-toggle]");
+    const thumbnails = strip ? Array.from(strip.querySelectorAll(".linked-strip-thumbnail")) : [];
+    if (!strip || !toggle || !thumbnails.length) {
+        return;
+    }
+
+    const styles = window.getComputedStyle(strip);
+    const paddingWidth = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
+    const gap = parseFloat(styles.columnGap || styles.gap) || 0;
+    const thumbnailWidth = thumbnails[0].getBoundingClientRect().width || 64;
+    const contentWidth = Math.max(0, strip.clientWidth - paddingWidth);
+    const rowCapacity = Math.max(1, Math.floor((contentWidth + gap) / (thumbnailWidth + gap)));
+    const hasOverflow = thumbnails.length > rowCapacity;
+
+    if (!hasOverflow) {
+        state.linkedStripExpanded = false;
+    }
+    strip.classList.toggle("is-expanded", state.linkedStripExpanded && hasOverflow);
+    toggle.hidden = !hasOverflow || state.linkedStripExpanded;
+    toggle.setAttribute("aria-expanded", String(state.linkedStripExpanded && hasOverflow));
+    const toggleLabel = state.linkedStripExpanded && hasOverflow
+        ? "Réduire les images liées"
+        : `Afficher les ${thumbnails.length} images liées`;
+    toggle.setAttribute("aria-label", toggleLabel);
+    toggle.title = toggleLabel;
+
+    const visibleThumbnailCount = hasOverflow && !state.linkedStripExpanded
+        ? Math.max(0, rowCapacity - 1)
+        : thumbnails.length;
+    thumbnails.forEach((thumbnail, index) => {
+        thumbnail.hidden = index >= visibleThumbnailCount;
+    });
+}
+
+function setLinkedStripExpanded(expanded) {
+    const strip = $("#linked-strip");
+    const toggle = strip?.querySelector("[data-linked-strip-toggle]");
+    if (!strip || !toggle || (expanded && toggle.hidden)) {
+        return;
+    }
+    state.linkedStripExpanded = Boolean(expanded);
+    updateLinkedStripLayout();
+    strip.classList.remove("is-hidden");
     showLinkedStripTemporarily();
 }
 
@@ -869,10 +1138,20 @@ function showLinkedStripTemporarily() {
     if (!strip || !strip.children.length) {
         return;
     }
+    if (strip.classList.contains("is-hidden") && state.linkedStripExpanded) {
+        state.linkedStripExpanded = false;
+        updateLinkedStripLayout();
+    }
     strip.classList.remove("is-hidden");
     state.linkedStripIdleTimer = window.setTimeout(() => {
         strip.classList.add("is-hidden");
         state.linkedStripIdleTimer = null;
+        window.setTimeout(() => {
+            if (strip.classList.contains("is-hidden")) {
+                state.linkedStripExpanded = false;
+                updateLinkedStripLayout();
+            }
+        }, LINKED_STRIP_FADE_DELAY);
     }, LINKED_STRIP_IDLE_DELAY);
 }
 
@@ -1716,6 +1995,46 @@ async function scanSelectedMetadata() {
     }
 }
 
+async function scanSelectedImageAnalysis() {
+    const photoIds = selectedPhotoIds();
+    if (!photoIds.length) {
+        return;
+    }
+    closeSelectionActionsMenu();
+    const done = setBusy($("#selection-actions-button"), "Scan IA...");
+    setSelectionStatus(`Scan IA de ${photoIds.length} photo(s)...`);
+    try {
+        state.scanStatusClosed = false;
+        const data = await fetchJson("/api/scan", {
+            method: "POST",
+            body: JSON.stringify({
+                scope: "selection",
+                photo_ids: photoIds,
+                scan_mode: "full",
+                rescan_existing: true,
+                metadata: false,
+                face_recognition: false,
+                force_face_rescan: false,
+                image_analysis: true,
+            }),
+        });
+        state.scanJob = data.job;
+        renderScanStatus(data.job, { force: true });
+        startScanPolling();
+        setSelectionStatus(
+            data.already_running
+                ? "Un scan est déjà en cours."
+                : `Scan IA lancé sur ${photoIds.length} photo(s).`,
+            Boolean(data.already_running),
+        );
+    } catch (error) {
+        setSelectionStatus(error.message, true);
+    } finally {
+        done();
+        renderSelectionState();
+    }
+}
+
 async function scanSelectedFaces() {
     const photoIds = selectedPhotoIds();
     if (!photoIds.length) {
@@ -1840,6 +2159,8 @@ function handleBatchAction(action) {
         openBatchAlbumActionModal();
     } else if (action === "scan") {
         scanSelectedMetadata();
+    } else if (action === "image-analysis") {
+        scanSelectedImageAnalysis();
     } else if (action === "faces") {
         scanSelectedFaces();
     } else if (action === "tags") {
@@ -1913,13 +2234,20 @@ function resetViewerZoom() {
 }
 
 function applyViewerTransform() {
-    $("#viewer-image").style.transform = `translate3d(${state.zoomTranslateX}px, ${state.zoomTranslateY}px, 0) scale(${state.zoomScale})`;
+    const transform = `translate3d(${state.zoomTranslateX}px, ${state.zoomTranslateY}px, 0) scale(${state.zoomScale})`;
+    $$(".viewer-image-layer").forEach((image) => {
+        image.style.transform = transform;
+    });
 }
 
 function clampViewerTranslation() {
-    const image = $("#viewer-image");
+    const image = [
+        $("#viewer-image"),
+        $("#viewer-preview-image"),
+        $("#viewer-thumbnail-image"),
+    ].find((candidate) => candidate?.naturalWidth);
     const stage = $(".viewer-stage");
-    if (!image.naturalWidth || !image.naturalHeight || !stage.clientWidth || !stage.clientHeight) {
+    if (!image || !stage.clientWidth || !stage.clientHeight) {
         return;
     }
     const fitScale = Math.min(stage.clientWidth / image.naturalWidth, stage.clientHeight / image.naturalHeight);
@@ -2040,12 +2368,22 @@ function toggleSlideshow() {
     }
     $("#play-button").textContent = "Ⅱ";
     state.playTimer = window.setInterval(() => navigate(1), 3500);
+    if (!state.viewerOriginalLoaded && state.viewerPhoto?.original_url) {
+        state.viewerOriginalPending = true;
+        resetViewerImageElement($("#viewer-image"));
+        setViewerLoading(null);
+        setViewerLoadError();
+    }
 }
 
-function stopSlideshow() {
+function stopSlideshow(options = {}) {
+    const resumeHd = options.resumeHd !== false;
     if (state.playTimer) {
         window.clearInterval(state.playTimer);
         state.playTimer = null;
+    }
+    if (resumeHd && state.viewerOriginalPending) {
+        startViewerOriginalLoad(state.viewerLoadId, { force: true });
     }
     $("#play-button").textContent = "▶";
 }
@@ -2292,8 +2630,9 @@ async function refreshFaceStatus() {
     const engine = data.engine || {};
     const engineStatus = $("#face-engine-status");
     if (engineStatus) {
+        const sexStatus = engine.gender_model_present ? "sexe M/F" : "sexe indisponible (ND)";
         engineStatus.textContent = engine.configured
-            ? `${engine.model_name} · ${engine.provider || "provider choisi au chargement"} · local`
+            ? `${engine.model_name} · ${engine.provider || "provider choisi au chargement"} · ${sexStatus} · local`
             : !engine.model_present
                 ? `Modele absent : ${engine.model_directory}`
                 : "Dependances absentes : installez InsightFace et ONNX Runtime";
@@ -2452,6 +2791,7 @@ function renderFaceIdentities() {
         <form class="face-identity-card" data-face-identity-id="${identity.id}">
             <div class="face-identity-title">
                 <input name="tag_name" value="${escapeHtml(identity.tag_name)}" aria-label="Tag de l'identite">
+                ${faceSexSelectorHtml(identity.sex || "ND")}
                 <label class="checkbox-field"><input name="enabled" type="checkbox" ${identity.enabled ? "checked" : ""}> Active</label>
             </div>
             <div class="face-threshold-grid">
@@ -2500,6 +2840,7 @@ async function saveFaceIdentity(event) {
         method: "PATCH",
         body: JSON.stringify({
             tag_name: data.get("tag_name"),
+            sex: data.get("sex"),
             enabled: data.get("enabled") === "on",
             review_threshold: Number(data.get("review_threshold")),
             automatic_threshold: Number(data.get("automatic_threshold")),
@@ -3413,6 +3754,7 @@ function bindEvents() {
     $("#prev-button")?.addEventListener("click", () => navigate(-1));
     $("#next-button")?.addEventListener("click", () => navigate(1));
     $("#play-button")?.addEventListener("click", toggleSlideshow);
+    $("#viewer-retry-button")?.addEventListener("click", retryViewerOriginalLoad);
     $("#details-toggle-button")?.addEventListener("click", toggleDetailsPanel);
     $("#details-sheet-handle")?.addEventListener("click", handleDetailsSheetClick);
     $("#details-sheet-handle")?.addEventListener("keydown", handleDetailsSheetKeydown);
@@ -3427,6 +3769,12 @@ function bindEvents() {
     viewerStage?.addEventListener("pointerenter", showLinkedStripTemporarily);
     viewerStage?.addEventListener("pointermove", showLinkedStripTemporarily);
     viewerStage?.addEventListener("pointerdown", showLinkedStripTemporarily);
+    if (window.ResizeObserver && $("#linked-strip")) {
+        state.linkedStripResizeObserver = new ResizeObserver(updateLinkedStripLayout);
+        state.linkedStripResizeObserver.observe($("#linked-strip"));
+    } else {
+        window.addEventListener("resize", updateLinkedStripLayout);
+    }
     viewerStage?.addEventListener("touchstart", handleViewerTouchStart, { passive: true });
     viewerStage?.addEventListener("touchmove", handleViewerTouchMove, { passive: false });
     viewerStage?.addEventListener("touchend", handleViewerTouchEnd, { passive: true });
@@ -3484,6 +3832,10 @@ function bindEvents() {
         const linked = event.target.closest("[data-open-linked]");
         if (linked) {
             openPhoto(Number(linked.dataset.openLinked)).catch((error) => alert(error.message));
+        }
+        const linkedStripToggle = event.target.closest("[data-linked-strip-toggle]");
+        if (linkedStripToggle) {
+            setLinkedStripExpanded(!state.linkedStripExpanded);
         }
         const deleteButton = event.target.closest("[data-delete-link]");
         if (deleteButton) {
@@ -3629,6 +3981,19 @@ function bindEvents() {
             saveFaceIdentity(event).catch((error) => alert(error.message));
         }
     });
+    $("#face-identity-list")?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-face-sex-value]");
+        if (!button) {
+            return;
+        }
+        const selector = button.closest(".face-sex-field");
+        selector.querySelector('input[name="sex"]').value = button.dataset.faceSexValue;
+        selector.querySelectorAll("[data-face-sex-value]").forEach((option) => {
+            const selected = option === button;
+            option.classList.toggle("is-selected", selected);
+            option.setAttribute("aria-checked", String(selected));
+        });
+    });
 
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
@@ -3650,6 +4015,10 @@ function bindEvents() {
             }
             if (state.selectionMode) {
                 exitSelectionMode();
+                return;
+            }
+            if (state.linkedStripExpanded && $("#photo-modal")?.classList.contains("open")) {
+                setLinkedStripExpanded(false);
                 return;
             }
             closePhotoActionsMenu();

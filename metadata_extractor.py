@@ -14,6 +14,7 @@ LORA_BLACKLIST_CONTAINS = ("lightning",)
 @dataclass
 class ExtractedMetadata:
     prompt: str | None = None
+    unet_name: str | None = None
     seed_noise: int | str | None = None
     seed: int | str | None = None
     used_images: list[str] = field(default_factory=list)
@@ -52,6 +53,7 @@ def extract_from_comfy_payloads(prompt_payload, workflow_payload=None) -> Extrac
 
     metadata = ExtractedMetadata(raw_prompt=prompt, raw_workflow=workflow)
     metadata.prompt = _extract_prompt(active_prompt_nodes)
+    metadata.unet_name = _extract_unet_name(active_prompt_nodes)
     metadata.seed_noise, metadata.seed = _extract_seed(active_prompt_nodes)
     metadata.loras = _extract_loras(active_prompt_nodes)
     metadata.used_images = _extract_used_images(active_prompt_nodes, workflow_nodes, workflow_links, bypassed_ids)
@@ -150,6 +152,19 @@ def _extract_seed(nodes):
             if isinstance(changed, list) and changed:
                 seed = changed[0]
     return seed_noise, seed
+
+
+def _extract_unet_name(nodes):
+    for node in nodes.values():
+        inputs = node.get("inputs", {})
+        unet_name = inputs.get("unet_name")
+        if unet_name is not None and not isinstance(unet_name, list):
+            return str(unet_name)
+        if node.get("class_type") == "UNETLoader":
+            widgets_values = node.get("widgets_values")
+            if isinstance(widgets_values, list) and widgets_values:
+                return str(widgets_values[0])
+    return None
 
 
 def _extract_loras(nodes):

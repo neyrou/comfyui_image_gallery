@@ -38,6 +38,7 @@ from gallery_db import (
     delete_photo,
     delete_lora_tag_mapping,
     discover_albums,
+    ensure_preview,
     ensure_thumbnail,
     find_photo_file,
     find_photo_file_in_album,
@@ -92,6 +93,7 @@ from image_analysis import ImageAnalysisError, ImageAnalysisUnavailable, LocalIm
 BASE_DIR = Path(__file__).resolve().parent
 IMAGES_ROOT = BASE_DIR / "static" / "images"
 THUMBNAIL_ROOT = BASE_DIR / "static" / "thumbnails"
+PREVIEW_ROOT = BASE_DIR / "static" / "previews"
 DB_PATH = BASE_DIR / "instance" / "gallery.sqlite3"
 FACE_REFERENCE_ROOT = BASE_DIR / "instance" / "face_references"
 PER_PAGE = 100
@@ -111,6 +113,8 @@ FACE_ENGINE_INSTANCE = None
 IMAGE_ANALYSIS_ENGINE_INSTANCE = None
 IMAGE_ANALYSIS_ENGINE_LOCK = threading.Lock()
 IMAGE_ANALYSIS_RUN_LOCK = threading.Lock()
+PREVIEW_LOCKS_GUARD = threading.Lock()
+PREVIEW_LOCKS = {}
 FACE_RECOVERED_DATABASES = set()
 SCAN_STATUS = {
     "active": False,
@@ -171,6 +175,22 @@ def get_image_analysis_engine():
         if IMAGE_ANALYSIS_ENGINE_INSTANCE is None:
             IMAGE_ANALYSIS_ENGINE_INSTANCE = IMAGE_ANALYSIS_ENGINE_FACTORY()
         return IMAGE_ANALYSIS_ENGINE_INSTANCE
+
+
+def get_preview_lock(checksum):
+    with PREVIEW_LOCKS_GUARD:
+        return PREVIEW_LOCKS.setdefault(checksum, threading.Lock())
+
+
+@app.after_request
+def apply_gallery_image_cache_headers(response):
+    cacheable_status = response.status_code in {200, 206, 304}
+    if cacheable_status and request.path.startswith("/static/images/"):
+        response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    elif cacheable_status and request.path.startswith("/static/thumbnails/"):
+        # Thumbnails can be refreshed manually without changing the source checksum.
+        response.headers["Cache-Control"] = "private, max-age=3600"
+    return response
 
 
 def recover_face_jobs():
@@ -1425,6 +1445,41 @@ def api_photo_detail(photo_id):
     return jsonify({"ok": True, "photo": detail})
 
 
+@app.get("/api/photos/<int:photo_id>/preview")
+def api_photo_preview(photo_id):
+    ensure_ready()
+    with connect_db(DB_PATH) as conn:
+        photo = conn.execute(
+            "SELECT checksum FROM photos WHERE id=?",
+            (photo_id,),
+        ).fetchone()
+        image_path = find_photo_file(conn, photo_id) if photo else None
+    if not photo:
+        return jsonify({"ok": False, "error": "Photo not found"}), 404
+    if not image_path:
+        return jsonify({"ok": False, "error": "No file found for this photo"}), 404
+
+    try:
+        with get_preview_lock(photo["checksum"]):
+            preview_path = ensure_preview(
+                image_path,
+                PREVIEW_ROOT,
+                photo["checksum"],
+            )
+    except (OSError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 422
+
+    response = send_file(
+        preview_path,
+        mimetype="image/jpeg",
+        conditional=True,
+        etag=photo["checksum"],
+        max_age=31536000,
+    )
+    response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    return response
+
+
 @app.post("/api/photos/<int:photo_id>/image-analysis/rescan")
 def api_rescan_photo_image_analysis(photo_id):
     ensure_ready()
@@ -1791,7 +1846,7 @@ def api_delete_photo(photo_id):
     ensure_ready()
     with connect_db(DB_PATH) as conn:
         try:
-            result = delete_photo(conn, photo_id, THUMBNAIL_ROOT)
+            result = delete_photo(conn, photo_id, THUMBNAIL_ROOT, PREVIEW_ROOT)
         except OSError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         if not result:
@@ -1816,7 +1871,12 @@ def api_delete_photos_batch():
             return jsonify({"ok": False, "error": f"Photos not found: {', '.join(map(str, missing))}"}), 404
         for photo_id in photo_ids:
             try:
-                deleted = delete_photo(conn, photo_id, THUMBNAIL_ROOT)
+                deleted = delete_photo(
+                    conn,
+                    photo_id,
+                    THUMBNAIL_ROOT,
+                    PREVIEW_ROOT,
+                )
                 results.append({"photo_id": photo_id, "status": "deleted", "deleted_files": deleted["deleted_files"]})
             except OSError as exc:
                 results.append({"photo_id": photo_id, "status": "failed", "error": str(exc)})
@@ -2047,6 +2107,7 @@ def api_create_face_identity():
                 payload.get("automatic_threshold", 0.55),
                 payload.get("margin_threshold", 0.08),
                 payload.get("enabled", True),
+                payload.get("sex", "ND"),
             )
         return jsonify({"ok": True, "identity": identity}), 201
     except (TypeError, ValueError) as exc:
@@ -2057,7 +2118,7 @@ def api_create_face_identity():
 def api_update_face_identity(identity_id):
     ensure_ready()
     payload = request.get_json(silent=True) or {}
-    allowed = {"tag_name", "review_threshold", "automatic_threshold", "margin_threshold", "enabled"}
+    allowed = {"tag_name", "sex", "review_threshold", "automatic_threshold", "margin_threshold", "enabled"}
     try:
         with connect_db(DB_PATH) as conn:
             identity = update_face_identity(conn, identity_id, **{key: value for key, value in payload.items() if key in allowed})

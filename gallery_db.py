@@ -1,14 +1,17 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import struct
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote
 
 from PIL import Image, ImageOps
 
+from face_recognition import FACE_ATTRIBUTES_VERSION
 from metadata_extractor import extract_from_image
 
 
@@ -18,6 +21,22 @@ ALLOWED_LINK_TYPES = {"variant", "original"}
 SENSITIVITY_LEVELS = ("neutral", "low", "medium", "high")
 SENSITIVITY_RANKS = {level: index for index, level in enumerate(SENSITIVITY_LEVELS)}
 TAG_CATEGORIES = ("clothing", "person", "constraint")
+CROSSDRESSING_TAG_NAME = "crossdressing"
+CROSSDRESSING_MACHINE_KEY = "rule:crossdressing"
+LEGACY_CROSSDRESS_TAG_NAME = "crossdress"
+LEGACY_CROSSDRESS_MACHINE_KEY = "rule:crossdress"
+FEMININE_TAG_FAMILY_PATTERNS = {
+    "breast": re.compile(r"\bbreasts?\b"),
+    "cleavage": re.compile(r"\bcleavage\b"),
+    "bra": re.compile(r"\b(?:bras?|braless)\b"),
+    "lingerie": re.compile(r"\blingerie\b"),
+    "dress": re.compile(r"\b(?:dress|dresses|sundress|sundresses)\b"),
+    "skirt": re.compile(r"\b(?:skirts?|mini ?skirts?|micro ?skirts?)\b"),
+    "pantyhose": re.compile(r"\bpantyhose\b"),
+    "stockings": re.compile(r"\bstockings?\b"),
+    "thighhighs": re.compile(r"\b(?:thigh ?highs?|thighhighs?)\b"),
+    "high heels": re.compile(r"\b(?:high ?heels?|stilettos?)\b"),
+}
 ALBUM_PATH_RETRY_DELAYS = (0.15, 0.35)
 ALBUM_PATH_UNAVAILABLE_PREFIX = "Album path is unavailable:"
 
@@ -123,6 +142,7 @@ def init_db(db_path):
             CREATE TABLE IF NOT EXISTS photo_metadata (
                 photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
                 prompt TEXT,
+                unet_name TEXT,
                 seed_noise TEXT,
                 seed TEXT,
                 raw_prompt_json TEXT,
@@ -163,6 +183,7 @@ def init_db(db_path):
             CREATE TABLE IF NOT EXISTS face_identities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tag_id INTEGER NOT NULL UNIQUE REFERENCES tags(id) ON DELETE CASCADE,
+                sex TEXT NOT NULL DEFAULT 'ND' CHECK(sex IN ('ND', 'M', 'F')),
                 review_threshold REAL NOT NULL DEFAULT 0.40,
                 automatic_threshold REAL NOT NULL DEFAULT 0.55,
                 margin_threshold REAL NOT NULL DEFAULT 0.08,
@@ -178,6 +199,7 @@ def init_db(db_path):
                 model_version TEXT NOT NULL,
                 provider TEXT,
                 faces_count INTEGER NOT NULL DEFAULT 0,
+                attributes_version INTEGER NOT NULL DEFAULT 1,
                 scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -191,6 +213,7 @@ def init_db(db_path):
                 embedding_dimensions INTEGER NOT NULL,
                 model_name TEXT NOT NULL,
                 model_version TEXT NOT NULL,
+                detected_sex TEXT CHECK(detected_sex IS NULL OR detected_sex IN ('ND', 'M', 'F')),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(photo_id, model_name, model_version, face_index)
             );
@@ -291,6 +314,25 @@ def init_db(db_path):
             """
         )
         _ensure_column(conn, "photo_tags", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        _ensure_column(conn, "photo_metadata", "unet_name", "TEXT")
+        _ensure_column(
+            conn,
+            "face_identities",
+            "sex",
+            "TEXT NOT NULL DEFAULT 'ND' CHECK(sex IN ('ND', 'M', 'F'))",
+        )
+        _ensure_column(
+            conn,
+            "photo_faces",
+            "detected_sex",
+            "TEXT CHECK(detected_sex IS NULL OR detected_sex IN ('ND', 'M', 'F'))",
+        )
+        _ensure_column(
+            conn,
+            "face_photo_scans",
+            "attributes_version",
+            "INTEGER NOT NULL DEFAULT 1",
+        )
         _ensure_column(
             conn,
             "tags",
@@ -752,16 +794,63 @@ def ensure_thumbnail(image_path, thumbnail_root, checksum, force=False):
     return thumbnail_path
 
 
+def ensure_preview(
+    image_path,
+    preview_root,
+    checksum,
+    force=False,
+    max_size=(1600, 1600),
+    quality=82,
+):
+    preview_root = Path(preview_root)
+    preview_root.mkdir(parents=True, exist_ok=True)
+    preview_path = preview_root / f"{checksum}.jpg"
+    if preview_path.exists() and not force:
+        return preview_path
+
+    with tempfile.NamedTemporaryFile(
+        dir=preview_root,
+        prefix=f".{checksum}.",
+        suffix=".jpg",
+        delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+
+    try:
+        with Image.open(image_path) as image:
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail(max_size, Image.LANCZOS)
+            if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (5, 5, 5))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            image.save(
+                temporary_path,
+                "JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=True,
+            )
+        os.replace(temporary_path, preview_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return preview_path
+
+
 def rescan_metadata(conn, photo_id, image_path):
     extracted = extract_from_image(image_path)
     conn.execute("DELETE FROM photo_loras WHERE photo_id=?", (photo_id,))
     conn.execute("DELETE FROM photo_used_images WHERE photo_id=?", (photo_id,))
     conn.execute(
         """
-        INSERT INTO photo_metadata(photo_id, prompt, seed_noise, seed, raw_prompt_json, raw_workflow_json, scanned_at)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO photo_metadata(photo_id, prompt, unet_name, seed_noise, seed, raw_prompt_json, raw_workflow_json, scanned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(photo_id) DO UPDATE SET
             prompt=excluded.prompt,
+            unet_name=excluded.unet_name,
             seed_noise=excluded.seed_noise,
             seed=excluded.seed,
             raw_prompt_json=excluded.raw_prompt_json,
@@ -771,6 +860,7 @@ def rescan_metadata(conn, photo_id, image_path):
         (
             photo_id,
             extracted.prompt,
+            extracted.unet_name,
             _string_or_none(extracted.seed_noise),
             _string_or_none(extracted.seed),
             _json_or_none(extracted.raw_prompt),
@@ -799,6 +889,7 @@ def rescan_metadata(conn, photo_id, image_path):
                 """,
                 (photo_id, source_photo_id),
             )
+    sync_crossdress_tag(conn, photo_id)
     return extracted
 
 
@@ -1179,6 +1270,17 @@ def list_album_tag_stats(
     )["tags"]
 
 
+def original_photo_url(album_name, relative_path, checksum):
+    return (
+        f"/static/images/{quote(album_name)}/{quote(relative_path)}"
+        f"?v={quote(checksum)}"
+    )
+
+
+def preview_photo_url(photo_id, checksum):
+    return f"/api/photos/{photo_id}/preview?v={quote(checksum)}"
+
+
 def serialize_gallery_photo(row):
     data = dict(row)
     album_name = data["album_name"]
@@ -1199,7 +1301,8 @@ def serialize_gallery_photo(row):
         "favorite": bool(data["has_output"] and data["has_user"]),
         "album_count": data["album_count"],
         "user_album_count": data["user_album_count"],
-        "original_url": f"/static/images/{quote(album_name)}/{quote(relative_path)}",
+        "original_url": original_photo_url(album_name, relative_path, checksum),
+        "preview_url": preview_photo_url(data["id"], checksum),
         "thumbnail_url": f"/static/thumbnails/{checksum}.jpg",
     }
 
@@ -1256,7 +1359,11 @@ def get_photo_detail(conn, photo_id):
             available = False
         membership["available"] = available
         membership["original_url"] = (
-            f"/static/images/{quote(membership['album_name'])}/{quote(membership['relative_path'])}"
+            original_photo_url(
+                membership["album_name"],
+                membership["relative_path"],
+                photo["checksum"],
+            )
             if available
             else None
         )
@@ -1280,6 +1387,7 @@ def get_photo_detail(conn, photo_id):
         "width": photo["width"],
         "height": photo["height"],
         "thumbnail_url": f"/static/thumbnails/{photo['checksum']}.jpg",
+        "preview_url": preview_photo_url(photo["id"], photo["checksum"]),
         "original_url": first_available["original_url"] if first_available else None,
         "memberships": serialized_memberships,
         "tags": [dict(row) for row in tags],
@@ -1300,14 +1408,20 @@ def list_photo_links(conn, photo_id):
         """
         SELECT pl.id, pl.type, pl.source_photo_id, pl.target_photo_id,
                p.id AS linked_photo_id, p.checksum,
-               ap.filename, ap.relative_path, a.name AS album_name
+               ap.filename, ap.relative_path, a.name AS album_name,
+               MAX(ap.mtime) AS linked_mtime,
+               p.created_at AS linked_created_at
         FROM photo_links pl
         JOIN photos p ON p.id = CASE WHEN pl.source_photo_id=? THEN pl.target_photo_id ELSE pl.source_photo_id END
         LEFT JOIN album_photos ap ON ap.photo_id = p.id AND ap.is_missing=0
         LEFT JOIN albums a ON a.id = ap.album_id
         WHERE pl.source_photo_id=? OR pl.target_photo_id=?
         GROUP BY pl.id
-        ORDER BY pl.type, ap.mtime DESC
+        ORDER BY CASE pl.type WHEN 'original' THEN 0 ELSE 1 END,
+                 linked_mtime IS NULL,
+                 linked_mtime DESC,
+                 linked_created_at DESC,
+                 p.id DESC
         """,
         (photo_id, photo_id, photo_id),
     ).fetchall()
@@ -1321,9 +1435,22 @@ def list_photo_links(conn, photo_id):
                 "source_photo_id": data["source_photo_id"],
                 "target_photo_id": data["target_photo_id"],
                 "linked_photo_id": data["linked_photo_id"],
+                "checksum": data["checksum"],
                 "filename": data["filename"] or data["checksum"][:12],
                 "thumbnail_url": f"/static/thumbnails/{data['checksum']}.jpg",
-                "original_url": f"/static/images/{quote(data['album_name'])}/{quote(data['relative_path'])}" if data["album_name"] else None,
+                "preview_url": preview_photo_url(
+                    data["linked_photo_id"],
+                    data["checksum"],
+                ),
+                "original_url": (
+                    original_photo_url(
+                        data["album_name"],
+                        data["relative_path"],
+                        data["checksum"],
+                    )
+                    if data["album_name"]
+                    else None
+                ),
             }
         )
     return links
@@ -1376,7 +1503,7 @@ def find_photo_file_in_album(conn, photo_id, album_name=None):
     return None
 
 
-def delete_photo(conn, photo_id, thumbnail_root):
+def delete_photo(conn, photo_id, thumbnail_root, preview_root=None):
     photo = conn.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
     if not photo:
         return None
@@ -1405,6 +1532,11 @@ def delete_photo(conn, photo_id, thumbnail_root):
     if thumbnail_path.exists():
         thumbnail_path.unlink()
         deleted_files.append(str(thumbnail_path))
+    if preview_root is not None:
+        preview_path = Path(preview_root) / f"{photo['checksum']}.jpg"
+        if preview_path.exists():
+            preview_path.unlink()
+            deleted_files.append(str(preview_path))
     conn.execute("DELETE FROM photos WHERE id=?", (photo_id,))
     return {"photo_id": photo_id, "checksum": photo["checksum"], "deleted_files": deleted_files}
 
@@ -1555,6 +1687,151 @@ def upsert_machine_tag(conn, machine_key, display_name):
     return conn.execute("SELECT * FROM tags WHERE machine_key=?", (machine_key,)).fetchone()
 
 
+def feminine_tag_families(tag_names):
+    families = set()
+    for tag_name in tag_names:
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(tag_name or "").lower()).strip()
+        if not normalized:
+            continue
+        for family, pattern in FEMININE_TAG_FAMILY_PATTERNS.items():
+            if pattern.search(normalized):
+                families.add(family)
+    return families
+
+
+def resolved_single_face_sex(conn, photo_id):
+    faces = conn.execute(
+        "SELECT id, detected_sex FROM photo_faces WHERE photo_id=? ORDER BY face_index",
+        (photo_id,),
+    ).fetchall()
+    if len(faces) != 1:
+        return "ND"
+    face = faces[0]
+    match = conn.execute(
+        """
+        SELECT fi.sex
+        FROM face_matches fm
+        JOIN face_identities fi ON fi.id=fm.identity_id
+        WHERE fm.face_id=? AND fm.state IN ('confirmed', 'automatic')
+        ORDER BY CASE fm.state WHEN 'confirmed' THEN 0 ELSE 1 END, fm.score DESC
+        LIMIT 1
+        """,
+        (face["id"],),
+    ).fetchone()
+    if match and match["sex"] in {"M", "F"}:
+        return match["sex"]
+    return face["detected_sex"] if face["detected_sex"] in {"M", "F"} else "ND"
+
+
+def _get_crossdressing_tag(conn):
+    target = conn.execute(
+        """
+        SELECT * FROM tags
+        WHERE machine_key=? OR name=?
+        ORDER BY machine_key=? DESC
+        LIMIT 1
+        """,
+        (
+            CROSSDRESSING_MACHINE_KEY,
+            CROSSDRESSING_TAG_NAME,
+            CROSSDRESSING_MACHINE_KEY,
+        ),
+    ).fetchone()
+    legacy = conn.execute(
+        """
+        SELECT * FROM tags
+        WHERE machine_key=? OR name=?
+        ORDER BY machine_key=? DESC
+        LIMIT 1
+        """,
+        (
+            LEGACY_CROSSDRESS_MACHINE_KEY,
+            LEGACY_CROSSDRESS_TAG_NAME,
+            LEGACY_CROSSDRESS_MACHINE_KEY,
+        ),
+    ).fetchone()
+    if not legacy:
+        return target
+    if not target:
+        conn.execute(
+            "UPDATE tags SET name=?, machine_key=? WHERE id=?",
+            (CROSSDRESSING_TAG_NAME, CROSSDRESSING_MACHINE_KEY, legacy["id"]),
+        )
+        return conn.execute("SELECT * FROM tags WHERE id=?", (legacy["id"],)).fetchone()
+    if legacy["id"] != target["id"]:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO photo_tags(photo_id, tag_id, source)
+            SELECT photo_id, ?, source FROM photo_tags WHERE tag_id=?
+            """,
+            (target["id"], legacy["id"]),
+        )
+        conn.execute("DELETE FROM photo_tags WHERE tag_id=?", (legacy["id"],))
+        if legacy["machine_key"] == LEGACY_CROSSDRESS_MACHINE_KEY:
+            conn.execute("UPDATE tags SET machine_key=NULL WHERE id=?", (legacy["id"],))
+        if not target["machine_key"]:
+            conn.execute(
+                "UPDATE tags SET machine_key=? WHERE id=?",
+                (CROSSDRESSING_MACHINE_KEY, target["id"]),
+            )
+            target = conn.execute("SELECT * FROM tags WHERE id=?", (target["id"],)).fetchone()
+    return target
+
+
+def sync_crossdress_tag(conn, photo_id):
+    should_apply = False
+    if resolved_single_face_sex(conn, photo_id) == "M":
+        tag_names = [
+            row["name"]
+            for row in conn.execute(
+                """
+                SELECT t.name
+                FROM photo_tags pt
+                JOIN tags t ON t.id=pt.tag_id
+                WHERE pt.photo_id=?
+                  AND COALESCE(t.machine_key, '') NOT IN (?, ?)
+                  AND t.name NOT IN (?, ?)
+                """,
+                (
+                    photo_id,
+                    CROSSDRESSING_MACHINE_KEY,
+                    LEGACY_CROSSDRESS_MACHINE_KEY,
+                    CROSSDRESSING_TAG_NAME,
+                    LEGACY_CROSSDRESS_TAG_NAME,
+                ),
+            ).fetchall()
+        ]
+        should_apply = len(feminine_tag_families(tag_names)) >= 2
+
+    crossdress = _get_crossdressing_tag(conn)
+    if should_apply:
+        crossdress = crossdress or upsert_machine_tag(
+            conn,
+            CROSSDRESSING_MACHINE_KEY,
+            CROSSDRESSING_TAG_NAME,
+        )
+        conn.execute(
+            """
+            INSERT INTO photo_tags(photo_id, tag_id, source)
+            VALUES (?, ?, 'rule_auto')
+            ON CONFLICT(photo_id, tag_id) DO UPDATE SET
+                source=CASE
+                    WHEN photo_tags.source='rule_auto' THEN excluded.source
+                    ELSE photo_tags.source
+                END
+            """,
+            (photo_id, crossdress["id"]),
+        )
+        return True
+
+    if crossdress:
+        conn.execute(
+            "DELETE FROM photo_tags WHERE photo_id=? AND tag_id=? AND source='rule_auto'",
+            (photo_id, crossdress["id"]),
+        )
+    return False
+
+
 def set_photo_tags(conn, photo_id, tag_names):
     conn.execute("DELETE FROM photo_tags WHERE photo_id=? AND source='manual'", (photo_id,))
     for name in tag_names:
@@ -1566,6 +1843,7 @@ def set_photo_tags(conn, photo_id, tag_names):
             """,
             (photo_id, tag["id"]),
         )
+    sync_crossdress_tag(conn, photo_id)
 
 
 def update_photo_tags(conn, photo_ids, tag_names, operation):
@@ -1580,6 +1858,8 @@ def update_photo_tags(conn, photo_ids, tag_names, operation):
             """,
             ((photo_id, tag_id) for photo_id in photo_ids for tag_id in tag_ids),
         )
+        for photo_id in photo_ids:
+            sync_crossdress_tag(conn, photo_id)
         return
 
     placeholders = ",".join("?" for _ in tag_names)
@@ -1598,6 +1878,8 @@ def update_photo_tags(conn, photo_ids, tag_names, operation):
         f"DELETE FROM photo_tags WHERE photo_id IN ({photo_placeholders}) AND tag_id IN ({tag_placeholders})",
         (*photo_ids, *tag_ids),
     )
+    for photo_id in photo_ids:
+        sync_crossdress_tag(conn, photo_id)
 
 
 def set_album_tags(conn, album_id, tag_names):
@@ -1754,6 +2036,7 @@ def replace_photo_image_analysis(conn, photo_id, checksum, analysis_signature, r
             result.get("provider"),
         ),
     )
+    sync_crossdress_tag(conn, photo_id)
 
 
 def list_lora_tag_mappings(conn):
@@ -1896,6 +2179,13 @@ def _validate_face_thresholds(review_threshold, automatic_threshold, margin_thre
     return review, automatic, margin
 
 
+def normalize_face_sex(value):
+    normalized = str(value or "ND").strip().upper()
+    if normalized not in {"ND", "M", "F"}:
+        raise ValueError("Face sex must be ND, M or F")
+    return normalized
+
+
 def create_face_identity(
     conn,
     tag_name,
@@ -1903,10 +2193,12 @@ def create_face_identity(
     automatic_threshold=0.55,
     margin_threshold=0.08,
     enabled=True,
+    sex="ND",
 ):
     review, automatic, margin = _validate_face_thresholds(
         review_threshold, automatic_threshold, margin_threshold
     )
+    sex = normalize_face_sex(sex)
     tag = upsert_tag(conn, tag_name)
     conn.execute(
         "UPDATE tags SET category='person' WHERE id=?",
@@ -1917,10 +2209,10 @@ def create_face_identity(
         raise ValueError("This tag already has a face identity")
     cursor = conn.execute(
         """
-        INSERT INTO face_identities(tag_id, review_threshold, automatic_threshold, margin_threshold, enabled)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO face_identities(tag_id, sex, review_threshold, automatic_threshold, margin_threshold, enabled)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (tag["id"], review, automatic, margin, int(bool(enabled))),
+        (tag["id"], sex, review, automatic, margin, int(bool(enabled))),
     )
     return get_face_identity(conn, cursor.lastrowid)
 
@@ -2007,14 +2299,15 @@ def update_face_identity(conn, identity_id, **updates):
         (tag_id,),
     )
     enabled = int(bool(updates.get("enabled", current["enabled"])))
+    sex = normalize_face_sex(updates.get("sex", current["sex"]))
     conn.execute(
         """
         UPDATE face_identities
-        SET tag_id=?, review_threshold=?, automatic_threshold=?, margin_threshold=?, enabled=?,
+        SET tag_id=?, sex=?, review_threshold=?, automatic_threshold=?, margin_threshold=?, enabled=?,
             updated_at=CURRENT_TIMESTAMP
         WHERE id=?
         """,
-        (tag_id, review, automatic, margin, enabled, identity_id),
+        (tag_id, sex, review, automatic, margin, enabled, identity_id),
     )
     return get_face_identity(conn, identity_id)
 
@@ -2044,8 +2337,8 @@ def replace_photo_faces(conn, photo_id, checksum, detections, model_name, model_
             """
             INSERT INTO photo_faces(
                 photo_id, face_index, bbox_json, detection_score, embedding, embedding_dimensions,
-                model_name, model_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                model_name, model_version, detected_sex
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 photo_id,
@@ -2056,35 +2349,53 @@ def replace_photo_faces(conn, photo_id, checksum, detections, model_name, model_
                 dimensions,
                 model_name,
                 model_version,
+                normalize_face_sex(getattr(detection, "detected_sex", "ND")),
             ),
         )
         face_ids.append(cursor.lastrowid)
     conn.execute(
         """
-        INSERT INTO face_photo_scans(photo_id, checksum, model_name, model_version, provider, faces_count, scanned_at)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO face_photo_scans(
+            photo_id, checksum, model_name, model_version, provider, faces_count,
+            attributes_version, scanned_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(photo_id) DO UPDATE SET
             checksum=excluded.checksum,
             model_name=excluded.model_name,
             model_version=excluded.model_version,
             provider=excluded.provider,
             faces_count=excluded.faces_count,
+            attributes_version=excluded.attributes_version,
             scanned_at=CURRENT_TIMESTAMP
         """,
-        (photo_id, checksum, model_name, model_version, provider, len(face_ids)),
+        (
+            photo_id,
+            checksum,
+            model_name,
+            model_version,
+            provider,
+            len(face_ids),
+            FACE_ATTRIBUTES_VERSION,
+        ),
     )
     return face_ids
 
 
 def photo_face_cache_valid(conn, photo_id, checksum, model_name, model_version):
     row = conn.execute(
-        "SELECT checksum, model_name, model_version FROM face_photo_scans WHERE photo_id=?", (photo_id,)
+        """
+        SELECT checksum, model_name, model_version, attributes_version
+        FROM face_photo_scans WHERE photo_id=?
+        """,
+        (photo_id,),
     ).fetchone()
     return bool(
         row
         and row["checksum"] == checksum
         and row["model_name"] == model_name
         and row["model_version"] == model_version
+        and row["attributes_version"] == FACE_ATTRIBUTES_VERSION
     )
 
 
@@ -2157,6 +2468,7 @@ def rematch_photo_faces(conn, photo_id):
         else:
             pending_count += 1
     _synchronize_face_tags(conn, photo_id, recognized_identity_ids, confirmed_identity_ids)
+    sync_crossdress_tag(conn, photo_id)
     return {"recognized": len(recognized_identity_ids | confirmed_identity_ids), "pending": pending_count}
 
 
@@ -2222,6 +2534,7 @@ def list_photo_faces(conn, photo_id):
                 "detection_score": face["detection_score"],
                 "model_name": face["model_name"],
                 "model_version": face["model_version"],
+                "detected_sex": face["detected_sex"] or "ND",
                 "crop_url": f"/api/photo-faces/{face['id']}/crop",
                 "match": dict(match) if match else None,
             }

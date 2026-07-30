@@ -13,6 +13,7 @@ from gallery_db import (
     ScanCancelled,
     connect_db,
     create_face_identity,
+    ensure_preview,
     find_photo_file,
     get_album_by_name,
     get_photo_detail,
@@ -49,7 +50,9 @@ class GalleryBackendTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.images_root = self.root / "static" / "images"
         self.thumbnails = self.root / "static" / "thumbnails"
+        self.previews = self.root / "static" / "previews"
         self.db_path = self.root / "instance" / "gallery.sqlite3"
+        app_module.PREVIEW_ROOT = self.previews
         (self.images_root / "output").mkdir(parents=True)
         (self.images_root / "Celine").mkdir(parents=True)
 
@@ -124,6 +127,93 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertRegex(response.get_json()["photo"]["thumbnail_url"], r"\.jpg\?v=\d+$")
         with Image.open(thumbnail_path) as thumbnail:
             self.assertEqual(thumbnail.size, (20, 40))
+
+    def test_preview_applies_orientation_and_composites_transparency(self):
+        oriented_path = self.images_root / "output" / "oriented-preview.jpg"
+        transparent_path = self.images_root / "output" / "transparent.png"
+        create_oriented_jpeg(oriented_path)
+        Image.new("RGBA", (32, 16), (255, 0, 0, 0)).save(transparent_path)
+
+        oriented_preview = ensure_preview(
+            oriented_path,
+            self.previews,
+            "oriented",
+        )
+        transparent_preview = ensure_preview(
+            transparent_path,
+            self.previews,
+            "transparent",
+        )
+
+        with Image.open(oriented_preview) as preview:
+            self.assertEqual(preview.size, (20, 40))
+        with Image.open(transparent_preview) as preview:
+            red, green, blue = preview.convert("RGB").getpixel((16, 8))
+            self.assertLess(max(abs(red - 5), abs(green - 5), abs(blue - 5)), 4)
+
+    def test_preview_endpoint_generates_resizes_caches_and_deletes_preview(self):
+        image_path = self.images_root / "output" / "large.png"
+        Image.new("RGB", (2000, 1000), (20, 40, 60)).save(image_path)
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+
+        with connect_db(self.db_path) as conn:
+            photo = conn.execute("SELECT id, checksum FROM photos").fetchone()
+            detail = get_photo_detail(conn, photo["id"])
+
+        self.assertEqual(
+            detail["preview_url"],
+            f'/api/photos/{photo["id"]}/preview?v={photo["checksum"]}',
+        )
+        self.assertTrue(detail["original_url"].endswith(f'?v={photo["checksum"]}'))
+
+        client = app_module.app.test_client()
+        response = client.get(detail["preview_url"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content_type, "image/jpeg")
+        self.assertIn("max-age=31536000", response.headers["Cache-Control"])
+        self.assertIn("immutable", response.headers["Cache-Control"])
+        preview_path = self.previews / f'{photo["checksum"]}.jpg'
+        with Image.open(preview_path) as preview:
+            self.assertEqual(preview.size, (1600, 800))
+
+        modified_at = preview_path.stat().st_mtime_ns
+        etag = response.headers["ETag"]
+        response.close()
+        cached = client.get(
+            detail["preview_url"],
+            headers={"If-None-Match": etag},
+        )
+        self.assertEqual(cached.status_code, 304)
+        self.assertEqual(preview_path.stat().st_mtime_ns, modified_at)
+        cached.close()
+
+        deleted = client.delete(f'/api/photos/{photo["id"]}')
+        self.assertEqual(deleted.status_code, 200)
+        self.assertFalse(preview_path.exists())
+
+    def test_gallery_image_cache_headers_only_cache_successful_responses(self):
+        with app_module.app.test_request_context("/static/images/output/photo.png"):
+            original = app_module.apply_gallery_image_cache_headers(
+                app_module.Response(status=200)
+            )
+            missing = app_module.apply_gallery_image_cache_headers(
+                app_module.Response(status=404)
+            )
+        with app_module.app.test_request_context("/static/thumbnails/checksum.jpg"):
+            thumbnail = app_module.apply_gallery_image_cache_headers(
+                app_module.Response(status=200)
+            )
+
+        self.assertIn("immutable", original.headers["Cache-Control"])
+        self.assertNotIn("Cache-Control", missing.headers)
+        self.assertEqual(
+            thumbnail.headers["Cache-Control"],
+            "private, max-age=3600",
+        )
 
     def test_photo_uses_available_album_when_another_membership_is_offline(self):
         offline_album = self.images_root / "A-offline"
@@ -295,10 +385,55 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertEqual(rescanned_photo["metadata"]["prompt"], "prompt from png")
         original_links = [link for link in rescanned_photo["links"] if link["type"] == "original"]
         self.assertEqual(original_links[0]["linked_photo_id"], ref_id)
+        self.assertIn("checksum", original_links[0])
+        self.assertIn("/preview?v=", original_links[0]["preview_url"])
+        self.assertIn("?v=", original_links[0]["original_url"])
 
         link = client.post(f"/api/photos/{source_id}/links", json={"target_photo_id": target_id, "type": "variant"})
         self.assertEqual(link.status_code, 200)
         self.assertIn("variant", [item["type"] for item in link.get_json()["photo"]["links"]])
+
+    def test_photo_links_prioritize_sources_then_sort_by_latest_file_mtime(self):
+        paths = {
+            "source.png": self.images_root / "output" / "source.png",
+            "old-original.png": self.images_root / "output" / "old-original.png",
+            "middle-variant.png": self.images_root / "output" / "middle-variant.png",
+            "new-original.png": self.images_root / "output" / "new-original.png",
+        }
+        for index, path in enumerate(paths.values()):
+            create_png(path, color=(20 + index * 20, 40, 60))
+        for index, filename in enumerate(("old-original.png", "middle-variant.png", "new-original.png")):
+            timestamp = 1_700_000_000 + index * 100
+            os.utime(paths[filename], (timestamp, timestamp))
+
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        app_module.DB_PATH = self.db_path
+        with connect_db(self.db_path) as conn:
+            photo_ids = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute(
+                    "SELECT filename, photo_id FROM album_photos WHERE is_missing=0"
+                ).fetchall()
+            }
+            conn.executemany(
+                """
+                INSERT INTO photo_links(source_photo_id, target_photo_id, type)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    (photo_ids["source.png"], photo_ids["old-original.png"], "original"),
+                    (photo_ids["source.png"], photo_ids["middle-variant.png"], "variant"),
+                    (photo_ids["source.png"], photo_ids["new-original.png"], "original"),
+                ),
+            )
+
+        response = app_module.app.test_client().get(f'/api/photos/{photo_ids["source.png"]}')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [link["filename"] for link in response.get_json()["photo"]["links"]],
+            ["new-original.png", "old-original.png", "middle-variant.png"],
+        )
 
     def test_batch_tags_add_remove_and_validate_atomically(self):
         create_png(self.images_root / "output" / "one.png")
@@ -579,6 +714,7 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertIn('id="config-section-tags"', html)
         self.assertIn('id="config-section-lora-tags"', html)
         self.assertIn('id="config-section-faces"', html)
+        self.assertIn('data-batch-action="image-analysis"', html)
         self.assertIn('data-batch-action="faces"', html)
         self.assertIn('class="danger-menu-item" data-batch-action="delete"', html)
         self.assertNotIn('id="face-admin-modal"', html)
