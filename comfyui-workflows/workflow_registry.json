@@ -1,0 +1,49 @@
+{
+  "workflows": {
+    "T2I_FluxDev_Emma": {
+      "id": "T2I_FluxDev_Emma",
+      "filename": "T2I_FluxDev_Emma.json",
+      "mode": "t2i",
+      "prompt": "6",
+      "input_image": null,
+      "preview": ["13"],
+      "output": "9",
+      "preview_policy": "latest_preview_observed",
+      "remote_defaults": {
+        "size": "1024x1536",
+        "aspect_ratio": "2:3"
+      }
+    },
+    "I2I_Qwen": {
+      "id": "I2I_Qwen",
+      "filename": "I2I_Qwen.json",
+      "mode": "i2i",
+      "prompt": "8",
+      "input_image": "13",
+      "preview": ["21", "43"],
+      "output": "42",
+      "preview_policy": "latest_preview_observed",
+      "remote_defaults": {
+        "size": "auto",
+        "aspect_ratio": "auto"
+      }
+    },
+    "I2V_Wan2.2": {
+      "id": "I2V_Wan2.2",
+      "filename": "I2V_Wan2.2.json",
+      "mode": "i2v",
+      "prompt": "116:93",
+      "input_image": "97",
+      "dimension_nodes": ["116:120", "116:117"],
+      "target_min_dimension": 480,
+      "round_larger_dimension_to": 16,
+      "rounding_mode": "nearest",
+      "preview": ["116:116"],
+      "output": "108",
+      "seed": "122",
+      "preview_policy": "latest_preview_observed",
+      "output_kind": "video",
+      "remote_defaults": {}
+    }
+  }
+}

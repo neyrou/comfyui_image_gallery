@@ -12,10 +12,16 @@ from PIL import Image, PngImagePlugin
 
 import app as app_module
 from comfy_generation import (
+    I2V_IDLE_PROMPT_SUFFIX,
     ComfyClient,
     ComfyGenerationCancelled,
     build_edit_options,
+    build_registered_edit_options,
     comfy_node_title,
+    extract_history_filenames,
+    i2v_dimensions,
+    list_registered_workflows,
+    load_workflow_registry,
     list_lora_catalog,
     patch_prompt_and_workflow,
 )
@@ -183,6 +189,7 @@ class CapturingComfyClient(ComfyClient):
 
 class FakeComfyClient:
     output_root = None
+    input_root = None
     available = True
     queued_prompt = None
     queued_workflow = None
@@ -193,6 +200,10 @@ class FakeComfyClient:
 
     def upload_image(self, image_path):
         self.uploaded_paths.append(Path(image_path).name)
+        if self.input_root is not None:
+            destination = Path(self.input_root) / "uploaded" / Path(image_path).name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(Path(image_path).read_bytes())
         return f"uploaded/{Path(image_path).name}"
 
     def get_input_image(self, image_name):
@@ -285,6 +296,8 @@ class ComfyGenerationTests(unittest.TestCase):
         self.thumbnails = self.root / "static" / "thumbnails"
         self.db_path = self.root / "instance" / "gallery.sqlite3"
         (self.images_root / "output").mkdir(parents=True)
+        (self.images_root / "input").mkdir(parents=True)
+        FakeComfyClient.input_root = None
         init_db(self.db_path)
 
     def tearDown(self):
@@ -364,6 +377,65 @@ class ComfyGenerationTests(unittest.TestCase):
         self.assertEqual(patched_workflow["nodes"][4]["widgets_values"][0], "uploaded/ref.png")
         self.assertEqual(patched_workflow["nodes"][6]["mode"], 4)
         self.assertEqual(patched_workflow["nodes"][6]["widgets_values"], ["kept.safetensors", 0.0])
+
+    def test_registered_workflows_and_i2v_options_use_source_prompt_suffix(self):
+        workflows = list_registered_workflows(app_module.COMFY_WORKFLOW_ROOT)
+        self.assertEqual(workflows[0]["id"], "current")
+        self.assertIn("I2V_Wan2.2", [item["id"] for item in workflows])
+
+        options = build_registered_edit_options(
+            {"metadata": {"prompt": "portrait waiting"}},
+            [],
+            "I2V_Wan2.2",
+            app_module.COMFY_WORKFLOW_ROOT,
+        )
+        self.assertEqual(options["mode"], "i2v")
+        self.assertEqual(options["output_kind"], "video")
+        self.assertTrue(options["prompt"].startswith("portrait waiting"))
+        self.assertEqual(options["prompt"].count(I2V_IDLE_PROMPT_SUFFIX), 1)
+        self.assertFalse(options["capabilities"]["references"])
+
+    def test_i2v_registered_patch_injects_source_dimensions_prompt_and_filename(self):
+        detail = {"width": 1000, "height": 1501, "metadata": {"prompt": "portrait"}}
+        prompt, workflow, info = patch_prompt_and_workflow(
+            detail,
+            {"workflow_id": "I2V_Wan2.2", "prompt": f"portrait, {I2V_IDLE_PROMPT_SUFFIX}", "seed_mode": "keep"},
+            source_image_name="uploaded/portrait.png",
+            source_filename="portrait.png",
+            workflow_root=app_module.COMFY_WORKFLOW_ROOT,
+        )
+        self.assertIsNone(workflow)
+        self.assertEqual(prompt["97"]["inputs"]["image"], "uploaded/portrait.png")
+        self.assertEqual(prompt["116:93"]["inputs"]["text"].count(I2V_IDLE_PROMPT_SUFFIX), 1)
+        self.assertEqual((prompt["116:120"]["inputs"]["width"], prompt["116:120"]["inputs"]["height"]), (480, 720))
+        self.assertEqual((prompt["116:117"]["inputs"]["width"], prompt["116:117"]["inputs"]["height"]), (480, 720))
+        self.assertEqual(prompt["108"]["inputs"]["filename_prefix"], "video/portrait_i2v")
+        self.assertEqual(info["output_node"], "108")
+        self.assertEqual(info["output_kind"], "video")
+        self.assertEqual(i2v_dimensions(1501, 1000, {"target_min_dimension": 480, "round_larger_dimension_to": 16}), (720, 480))
+        self.assertEqual(i2v_dimensions(512, 512, {"target_min_dimension": 480}), (480, 480))
+
+    def test_extract_history_filenames_can_target_video_output_node(self):
+        history = {
+            "outputs": {
+                "116:116": {"images": [{"filename": "preview.png", "subfolder": ""}]},
+                "108": {"videos": [{"filename": "portrait_i2v_00001.mp4", "subfolder": "video"}]},
+            }
+        }
+        self.assertEqual(
+            extract_history_filenames(history, output_node="108", output_kind="video"),
+            ["video/portrait_i2v_00001.mp4"],
+        )
+
+    def test_workflow_registry_rejects_unsafe_template_path(self):
+        registry_root = self.root / "unsafe-workflows"
+        registry_root.mkdir()
+        (registry_root / "workflow_registry.json").write_text(
+            json.dumps({"workflows": {"unsafe": {"id": "unsafe", "filename": "../outside.json", "mode": "t2i", "prompt": "1", "output": "2"}}}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "Fichier de workflow invalide"):
+            load_workflow_registry(registry_root)
 
     def test_queue_prompt_sends_workflow_as_extra_pnginfo(self):
         client = CapturingComfyClient()
@@ -549,19 +621,40 @@ class ComfyGenerationTests(unittest.TestCase):
         previous_factory = app_module.COMFY_CLIENT_FACTORY
         app_module.COMFY_CLIENT_FACTORY = FakeComfyClient
         FakeComfyClient.uploaded_paths = []
+        FakeComfyClient.input_root = self.images_root / "input"
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
         try:
             client = app_module.app.test_client()
             image_data = tempfile.SpooledTemporaryFile()
             Image.new("RGB", (8, 8), (10, 20, 30)).save(image_data, format="PNG")
             image_data.seek(0)
-            uploaded = client.post(
-                "/api/comfy/references/upload",
-                data={"file": (image_data, "reference.png")},
-                content_type="multipart/form-data",
-            )
+            queued_job = {"job_id": "queued-reference", "state": "queued", "origin": "comfy_reference"}
+            scan_status = {"job_id": "active-scan", "active": True, "queued_count": 1}
+            with patch("app.enqueue_scan_job", return_value=(queued_job, scan_status)) as enqueue:
+                uploaded = client.post(
+                    "/api/comfy/references/upload",
+                    data={"file": (image_data, "reference.png")},
+                    content_type="multipart/form-data",
+                )
             self.assertEqual(uploaded.status_code, 201)
             self.assertEqual(uploaded.get_json()["input_name"], "uploaded/reference.png")
             self.assertEqual(FakeComfyClient.uploaded_paths, ["reference.png"])
+            self.assertEqual(uploaded.get_json()["scan_job"], queued_job)
+            self.assertEqual(uploaded.get_json()["scan_status"], scan_status)
+            photo = uploaded.get_json()["photo"]
+            self.assertEqual(photo["memberships"][0]["album_name"], "input")
+            self.assertEqual(photo["memberships"][0]["relative_path"], "uploaded/reference.png")
+            self.assertIsNone(photo["metadata"])
+            self.assertTrue((self.thumbnails / f"{photo['checksum']}.jpg").is_file())
+            scan_options = enqueue.call_args.args[0]
+            self.assertEqual(scan_options["photo_ids"], [photo["id"]])
+            self.assertEqual(scan_options["scan_mode"], "missing")
+            self.assertTrue(scan_options["metadata"])
+            self.assertTrue(scan_options["image_analysis"])
+            self.assertTrue(scan_options["skip_automatic_face_scan"])
+            self.assertEqual(enqueue.call_args.kwargs, {"origin": "comfy_reference", "queue_if_busy": True})
 
             preview = client.get("/api/comfy/input-preview?filename=uploaded%2Freference.png")
             self.assertEqual(preview.status_code, 200)
@@ -574,7 +667,149 @@ class ComfyGenerationTests(unittest.TestCase):
             )
             self.assertEqual(invalid.status_code, 400)
         finally:
+            FakeComfyClient.input_root = None
             app_module.COMFY_CLIENT_FACTORY = previous_factory
+
+    def test_automatic_reference_scan_runs_json_before_ai_without_faces(self):
+        options = {
+            "scope": "selection",
+            "album": None,
+            "photo_ids": [42],
+            "scan_mode": "missing",
+            "rescan_existing": False,
+            "metadata": True,
+            "image_analysis": True,
+            "face_recognition": False,
+            "force_face_rescan": False,
+            "skip_automatic_face_scan": True,
+        }
+        stages = []
+        with patch("app.run_metadata_stage", side_effect=lambda *_args, **_kwargs: stages.append("json") or {"processed": 1}), \
+             patch("app.run_image_analysis_stage", side_effect=lambda *_args, **_kwargs: stages.append("ia") or {"processed": 1}), \
+             patch("app.enqueue_automatic_face_scan") as automatic_faces:
+            summary = app_module.run_scan_pipeline("reference", options, sync=True)
+
+        self.assertEqual(stages, ["json", "ia"])
+        self.assertEqual(summary["targeted"], 1)
+        automatic_faces.assert_not_called()
+
+    def test_reference_upload_reports_missing_input_file_without_queueing_scan(self):
+        previous_factory = app_module.COMFY_CLIENT_FACTORY
+        app_module.COMFY_CLIENT_FACTORY = FakeComfyClient
+        FakeComfyClient.input_root = None
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        try:
+            client = app_module.app.test_client()
+            image_data = io.BytesIO()
+            Image.new("RGB", (8, 8), (10, 20, 30)).save(image_data, format="PNG")
+            image_data.seek(0)
+            with patch("app.enqueue_scan_job") as enqueue:
+                response = client.post(
+                    "/api/comfy/references/upload",
+                    data={"file": (image_data, "missing.png")},
+                    content_type="multipart/form-data",
+                )
+            self.assertEqual(response.status_code, 500)
+            self.assertIn("Image ComfyUI input introuvable", response.get_json()["error"])
+            enqueue.assert_not_called()
+        finally:
+            app_module.COMFY_CLIENT_FACTORY = previous_factory
+
+    def test_input_import_keeps_album_alias_path_for_relative_membership(self):
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        app_module.ensure_ready()
+        (self.images_root / "nested").mkdir()
+        input_path = self.images_root / "input" / "reference.png"
+        create_png(input_path)
+        aliased_input_root = self.images_root / "nested" / ".." / "input"
+
+        with connect_db(self.db_path) as conn:
+            conn.execute("UPDATE albums SET path=? WHERE name='input'", (str(aliased_input_root),))
+        with connect_db(self.db_path) as conn:
+            album, gallery_path = app_module.validated_comfy_input_path(conn, "reference.png")
+            self.assertEqual(gallery_path, aliased_input_root / "reference.png")
+            photo_id = app_module.import_photo_into_album(
+                conn,
+                gallery_path.resolve(),
+                album,
+                self.thumbnails,
+                scan_metadata=False,
+            )
+            detail = app_module.get_photo_detail(conn, photo_id)
+
+        self.assertEqual(detail["memberships"][0]["relative_path"], "reference.png")
+
+    def test_automatic_reference_scans_queue_fifo_and_promote_after_completion(self):
+        with app_module.SCAN_LOCK:
+            original_status = dict(app_module.SCAN_STATUS)
+            original_queue = list(app_module.SCAN_QUEUE)
+            app_module.SCAN_QUEUE.clear()
+            app_module.SCAN_STATUS.update(
+                active=True,
+                job_id="manual-current",
+                state="running",
+                origin="manual",
+                cancel_requested=False,
+            )
+        options = {
+            "scope": "selection",
+            "album": None,
+            "photo_ids": [1],
+            "scan_mode": "missing",
+            "rescan_existing": False,
+            "metadata": True,
+            "image_analysis": True,
+            "face_recognition": False,
+            "force_face_rescan": False,
+            "skip_automatic_face_scan": True,
+        }
+        try:
+            with patch("app.start_scan_job_thread") as start_thread:
+                first, current = app_module.enqueue_scan_job(
+                    options,
+                    origin="comfy_reference",
+                    queue_if_busy=True,
+                )
+                second, current = app_module.enqueue_scan_job(
+                    options | {"photo_ids": [2]},
+                    origin="comfy_reference",
+                    queue_if_busy=True,
+                )
+                self.assertEqual(first["state"], "queued")
+                self.assertEqual(second["queue_position"], 2)
+                self.assertEqual(current["queued_count"], 2)
+
+                promoted = app_module.finish_scan_job_and_promote(
+                    "manual-current",
+                    state="done",
+                    stage="done",
+                    message="done",
+                    summary={},
+                )
+                self.assertEqual(promoted["job_id"], first["job_id"])
+                self.assertEqual(promoted["queued_count"], 1)
+                self.assertEqual(start_thread.call_args.args[0]["job_id"], first["job_id"])
+
+                promoted = app_module.finish_scan_job_and_promote(
+                    first["job_id"],
+                    state="error",
+                    stage="error",
+                    message="failed",
+                    summary=None,
+                )
+                self.assertEqual(promoted["job_id"], second["job_id"])
+                self.assertEqual(promoted["queued_count"], 0)
+                self.assertEqual(start_thread.call_args.args[0]["job_id"], second["job_id"])
+        finally:
+            with app_module.SCAN_LOCK:
+                app_module.SCAN_QUEUE.clear()
+                app_module.SCAN_QUEUE.extend(original_queue)
+                app_module.SCAN_STATUS.clear()
+                app_module.SCAN_STATUS.update(original_status)
 
     def test_edit_options_rescans_missing_prompt_metadata(self):
         client, source_id = self.scan_source_photo(
@@ -608,6 +843,22 @@ class ComfyGenerationTests(unittest.TestCase):
             "Cette image ne contient pas de prompt ComfyUI exploitable",
         )
         self.assertEqual(rescan.call_count, 1)
+
+    def test_registered_edit_options_work_without_embedded_comfy_prompt(self):
+        client, source_id = self.scan_source_photo(scan_metadata=False)
+        listed = client.get("/api/comfy/workflows")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.get_json()["workflows"][0]["id"], "current")
+
+        response = client.get(
+            f"/api/photos/{source_id}/comfy/edit-options?workflow_id=I2V_Wan2.2"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["options"]["prompt"], I2V_IDLE_PROMPT_SUFFIX)
+        unknown = client.get(
+            f"/api/photos/{source_id}/comfy/edit-options?workflow_id=unknown"
+        )
+        self.assertEqual(unknown.status_code, 400)
 
     def test_edit_options_rescans_invalid_prompt_metadata(self):
         client, source_id = self.scan_source_photo(

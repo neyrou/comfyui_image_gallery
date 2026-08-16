@@ -124,6 +124,11 @@
                     <li class="gallery-item" data-gallery-photo-id="{{ photo.id }}">
                         <button class="thumbnail" type="button" data-photo-id="{{ photo.id }}">
                             <img src="{{ photo.thumbnail_url }}" alt="{{ photo.filename }}" loading="lazy">
+                            {% if photo.media_type == 'video' %}
+                                <span class="video-badge" title="Vid&eacute;o" aria-label="Vid&eacute;o">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6.5v11l9-5.5-9-5.5Z"></path></svg>
+                                </span>
+                            {% endif %}
                             {% if photo.favorite %}
                                 <span class="favorite-badge" title="Présent dans output et dans un album user">
                                     ★{% if photo.user_album_count > 1 %}<small>{{ photo.user_album_count }}</small>{% endif %}
@@ -234,6 +239,7 @@
                 <img id="viewer-thumbnail-image" class="viewer-image-layer viewer-thumbnail-layer" alt="">
                 <img id="viewer-preview-image" class="viewer-image-layer" alt="">
                 <img id="viewer-image" class="viewer-image-layer" alt="">
+                <video id="viewer-video" class="viewer-video" controls autoplay muted loop playsinline preload="metadata" hidden></video>
                 <div class="viewer-loading" id="viewer-loading" role="status" aria-label="Chargement de l'image" hidden>
                     <span class="viewer-spinner" aria-hidden="true"></span>
                     <span id="viewer-loading-label">Chargement de l'aper&ccedil;u&hellip;</span>
@@ -310,7 +316,7 @@
                             </summary>
                             <div id="detail-image-analysis-content"></div>
                         </details>
-                        <section class="face-detail-section">
+                        <section class="face-detail-section" id="detail-face-section">
                             <div class="section-heading-row">
                                 <h3>Visages</h3>
                                 <button id="scan-photo-faces-button" type="button">Analyser</button>
@@ -394,27 +400,33 @@
             </div>
             <form id="comfy-form">
                 <label class="form-field">
+                    <span>Workflow</span>
+                    <select id="comfy-workflow-select">
+                        <option value="current">Workflow de l'image actuelle</option>
+                    </select>
+                </label>
+                <label class="form-field">
                     <span>Prompt</span>
                     <textarea id="comfy-prompt" rows="7"></textarea>
                 </label>
                 <div class="comfy-grid">
-                    <label class="form-field">
+                    <label class="form-field" id="comfy-seed-field">
                         <span>Seed</span>
                         <select id="comfy-seed-mode">
                             <option value="keep">Garder</option>
                             <option value="random">Nouveau</option>
                         </select>
                     </label>
-                    <label class="form-field">
+                    <label class="form-field" id="comfy-steps-field">
                         <span>Steps</span>
                         <input id="comfy-steps" type="number" min="1" step="1">
                     </label>
                 </div>
-                <section>
+                <section id="comfy-loras-section">
                     <h3>LoRA</h3>
                     <div class="comfy-list" id="comfy-loras"></div>
                 </section>
-                <section>
+                <section id="comfy-references-section">
                     <h3>R&eacute;f&eacute;rences Qwen</h3>
                     <div class="comfy-list" id="comfy-references"></div>
                 </section>

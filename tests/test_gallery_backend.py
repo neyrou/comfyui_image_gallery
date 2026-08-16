@@ -12,6 +12,7 @@ import gallery_db as gallery_db_module
 from gallery_db import (
     ScanCancelled,
     connect_db,
+    create_photo_link,
     create_face_identity,
     ensure_preview,
     find_photo_file,
@@ -127,6 +128,44 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertRegex(response.get_json()["photo"]["thumbnail_url"], r"\.jpg\?v=\d+$")
         with Image.open(thumbnail_path) as thumbnail:
             self.assertEqual(thumbnail.size, (20, 40))
+
+    def test_video_scan_thumbnail_serialization_link_order_and_slideshow_exclusion(self):
+        image_path = self.images_root / "output" / "portrait.png"
+        video_path = self.images_root / "output" / "portrait_i2v.mp4"
+        create_png(image_path)
+        video_path.write_bytes(b"fake-video")
+
+        def fake_video_thumbnail(_video_path, thumbnail_path):
+            Image.new("RGB", (64, 96), (10, 20, 30)).save(thumbnail_path, format="JPEG")
+            return thumbnail_path
+
+        with patch("gallery_db.video_size", return_value=(480, 720)) as probe, patch(
+            "gallery_db.ensure_video_thumbnail", side_effect=fake_video_thumbnail
+        ) as thumbnail:
+            scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(thumbnail.call_count, 1)
+        with connect_db(self.db_path) as conn:
+            rows = {
+                row["filename"]: row["photo_id"]
+                for row in conn.execute("SELECT filename, photo_id FROM album_photos")
+            }
+            create_photo_link(conn, rows["portrait.png"], rows["portrait_i2v.mp4"], "variant")
+            detail = get_photo_detail(conn, rows["portrait.png"])
+            album = get_album_by_name(conn, "output")
+        self.assertEqual(detail["links"][0]["media_type"], "video")
+        self.assertIsNone(detail["links"][0]["preview_url"])
+        self.assertTrue((self.thumbnails / f'{detail["links"][0]["checksum"]}.jpg').exists())
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+        page = client.get("/?album=output")
+        self.assertIn('class="video-badge"', page.get_data(as_text=True))
+        slideshow = client.get(f'/api/albums/{album["id"]}/slideshow-photos').get_json()
+        self.assertEqual([photo["filename"] for photo in slideshow["photos"]], ["portrait.png"])
 
     def test_preview_applies_orientation_and_composites_transparency(self):
         oriented_path = self.images_root / "output" / "oriented-preview.jpg"

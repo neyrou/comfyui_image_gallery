@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import struct
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -16,6 +17,8 @@ from metadata_extractor import extract_from_image
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv"}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 ALLOWED_ALBUM_TYPES = {"input", "output", "user"}
 ALLOWED_LINK_TYPES = {"variant", "original"}
 SENSITIVITY_LEVELS = ("neutral", "low", "medium", "high")
@@ -86,6 +89,7 @@ def init_db(db_path):
             CREATE TABLE IF NOT EXISTS photos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 checksum TEXT NOT NULL UNIQUE,
+                media_type TEXT NOT NULL DEFAULT 'image' CHECK(media_type IN ('image', 'video')),
                 width INTEGER,
                 height INTEGER,
                 file_size INTEGER,
@@ -314,6 +318,12 @@ def init_db(db_path):
             """
         )
         _ensure_column(conn, "photo_tags", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        _ensure_column(
+            conn,
+            "photos",
+            "media_type",
+            "TEXT NOT NULL DEFAULT 'image' CHECK(media_type IN ('image', 'video'))",
+        )
         _ensure_column(conn, "photo_metadata", "unet_name", "TEXT")
         _ensure_column(
             conn,
@@ -611,8 +621,9 @@ def scan_album(
                         )
                     continue
                 checksum = checksum_file(image_path)
-                width, height = image_size(image_path)
-                photo_id = upsert_photo(conn, checksum, width, height, stat.st_size)
+                media_type = media_type_for_path(image_path)
+                width, height = media_size(image_path, media_type)
+                photo_id = upsert_photo(conn, checksum, width, height, stat.st_size, media_type)
                 conn.execute(
                     """
                     INSERT INTO album_photos(album_id, photo_id, relative_path, filename, mtime, file_size, is_missing)
@@ -628,7 +639,7 @@ def scan_album(
                 )
                 seen_keys.add((photo_id, relative_path))
                 ensure_thumbnail(image_path, thumbnail_root, checksum)
-                if scan_metadata:
+                if scan_metadata and media_type == "image":
                     rescan_metadata(conn, photo_id, image_path)
                 count += 1
                 processed += 1
@@ -743,7 +754,7 @@ def _iter_image_files(root):
     for dirpath, _, filenames in os.walk(root, onerror=raise_walk_error):
         for filename in filenames:
             path = Path(dirpath) / filename
-            if path.suffix.lower() in IMAGE_EXTENSIONS:
+            if path.suffix.lower() in MEDIA_EXTENSIONS:
                 yield path
 
 
@@ -763,18 +774,61 @@ def image_size(path):
         return None, None
 
 
-def upsert_photo(conn, checksum, width, height, file_size):
+def media_type_for_path(path):
+    suffix = Path(path).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        return "video"
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    raise ValueError(f"Format de media non supporte: {suffix or 'sans extension'}")
+
+
+def media_size(path, media_type=None):
+    media_type = media_type or media_type_for_path(path)
+    return video_size(path) if media_type == "video" else image_size(path)
+
+
+def video_size(path):
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        streams = json.loads(result.stdout or "{}").get("streams") or []
+        if not streams:
+            return None, None
+        return int(streams[0]["width"]), int(streams[0]["height"])
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise OSError(f"Impossible de lire la video avec ffprobe: {exc}") from exc
+
+
+def upsert_photo(conn, checksum, width, height, file_size, media_type="image"):
     conn.execute(
         """
-        INSERT INTO photos(checksum, width, height, file_size)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO photos(checksum, width, height, file_size, media_type)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(checksum) DO UPDATE SET
+            media_type=excluded.media_type,
             width=COALESCE(excluded.width, photos.width),
             height=COALESCE(excluded.height, photos.height),
             file_size=excluded.file_size,
             updated_at=CURRENT_TIMESTAMP
         """,
-        (checksum, width, height, file_size),
+        (checksum, width, height, file_size, media_type),
     )
     return conn.execute("SELECT id FROM photos WHERE checksum=?", (checksum,)).fetchone()["id"]
 
@@ -785,12 +839,44 @@ def ensure_thumbnail(image_path, thumbnail_root, checksum, force=False):
     thumbnail_path = thumbnail_root / f"{checksum}.jpg"
     if thumbnail_path.exists() and not force:
         return thumbnail_path
+    if media_type_for_path(image_path) == "video":
+        return ensure_video_thumbnail(image_path, thumbnail_path)
     with Image.open(image_path) as image:
         image = ImageOps.exif_transpose(image)
         image.thumbnail((260, 260), Image.LANCZOS)
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
         image.save(thumbnail_path, "JPEG", quality=88)
+    return thumbnail_path
+
+
+def ensure_video_thumbnail(video_path, thumbnail_path):
+    temporary_path = thumbnail_path.with_suffix(".tmp.jpg")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                "0",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=260:260:force_original_aspect_ratio=decrease",
+                "-q:v",
+                "3",
+                str(temporary_path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        temporary_path.replace(thumbnail_path)
+    except (OSError, subprocess.SubprocessError) as exc:
+        temporary_path.unlink(missing_ok=True)
+        raise OSError(f"Impossible de creer la miniature video avec ffmpeg: {exc}") from exc
     return thumbnail_path
 
 
@@ -1295,6 +1381,7 @@ def serialize_gallery_photo(row):
     return {
         "id": data["id"],
         "checksum": checksum,
+        "media_type": data.get("media_type") or "image",
         "filename": data["filename"],
         "relative_path": relative_path,
         "album_name": album_name,
@@ -1308,7 +1395,11 @@ def serialize_gallery_photo(row):
         "album_count": data["album_count"],
         "user_album_count": data["user_album_count"],
         "original_url": original_photo_url(album_name, relative_path, checksum),
-        "preview_url": preview_photo_url(data["id"], checksum),
+        "preview_url": (
+            preview_photo_url(data["id"], checksum)
+            if (data.get("media_type") or "image") == "image"
+            else None
+        ),
         "thumbnail_url": f"/static/thumbnails/{checksum}.jpg",
     }
 
@@ -1390,10 +1481,15 @@ def get_photo_detail(conn, photo_id):
     return {
         "id": photo["id"],
         "checksum": photo["checksum"],
+        "media_type": photo["media_type"] or "image",
         "width": photo["width"],
         "height": photo["height"],
         "thumbnail_url": f"/static/thumbnails/{photo['checksum']}.jpg",
-        "preview_url": preview_photo_url(photo["id"], photo["checksum"]),
+        "preview_url": (
+            preview_photo_url(photo["id"], photo["checksum"])
+            if (photo["media_type"] or "image") == "image"
+            else None
+        ),
         "original_url": first_available["original_url"] if first_available else None,
         "memberships": serialized_memberships,
         "tags": [dict(row) for row in tags],
@@ -1413,7 +1509,7 @@ def list_photo_links(conn, photo_id):
     rows = conn.execute(
         """
         SELECT pl.id, pl.type, pl.source_photo_id, pl.target_photo_id,
-               p.id AS linked_photo_id, p.checksum,
+               p.id AS linked_photo_id, p.checksum, p.media_type,
                ap.filename, ap.relative_path, a.name AS album_name,
                MAX(ap.mtime) AS linked_mtime,
                p.created_at AS linked_created_at
@@ -1423,7 +1519,8 @@ def list_photo_links(conn, photo_id):
         LEFT JOIN albums a ON a.id = ap.album_id
         WHERE pl.source_photo_id=? OR pl.target_photo_id=?
         GROUP BY pl.id
-        ORDER BY CASE pl.type WHEN 'original' THEN 0 ELSE 1 END,
+        ORDER BY CASE p.media_type WHEN 'video' THEN 0 ELSE 1 END,
+                 CASE pl.type WHEN 'original' THEN 0 ELSE 1 END,
                  linked_mtime IS NULL,
                  linked_mtime DESC,
                  linked_created_at DESC,
@@ -1442,11 +1539,13 @@ def list_photo_links(conn, photo_id):
                 "target_photo_id": data["target_photo_id"],
                 "linked_photo_id": data["linked_photo_id"],
                 "checksum": data["checksum"],
+                "media_type": data.get("media_type") or "image",
                 "filename": data["filename"] or data["checksum"][:12],
                 "thumbnail_url": f"/static/thumbnails/{data['checksum']}.jpg",
-                "preview_url": preview_photo_url(
-                    data["linked_photo_id"],
-                    data["checksum"],
+                "preview_url": (
+                    preview_photo_url(data["linked_photo_id"], data["checksum"])
+                    if (data.get("media_type") or "image") == "image"
+                    else None
                 ),
                 "original_url": (
                     original_photo_url(
@@ -1597,13 +1696,18 @@ def import_output_photo(conn, image_path, thumbnail_root):
     return import_photo_into_album(conn, image_path, album, thumbnail_root)
 
 
-def import_photo_into_album(conn, image_path, album, thumbnail_root):
+def import_photo_into_album(conn, image_path, album, thumbnail_root, scan_metadata=True):
     image_path = Path(image_path)
-    relative_path = image_path.relative_to(Path(album["path"])).as_posix()
+    album_path = Path(album["path"])
+    try:
+        relative_path = image_path.relative_to(album_path).as_posix()
+    except ValueError:
+        relative_path = image_path.resolve().relative_to(album_path.resolve()).as_posix()
     stat = image_path.stat()
     checksum = checksum_file(image_path)
-    width, height = image_size(image_path)
-    photo_id = upsert_photo(conn, checksum, width, height, stat.st_size)
+    media_type = media_type_for_path(image_path)
+    width, height = media_size(image_path, media_type)
+    photo_id = upsert_photo(conn, checksum, width, height, stat.st_size, media_type)
     conn.execute(
         """
         INSERT INTO album_photos(album_id, photo_id, relative_path, filename, mtime, file_size, is_missing)
@@ -1618,7 +1722,8 @@ def import_photo_into_album(conn, image_path, album, thumbnail_root):
         (album["id"], photo_id, relative_path, image_path.name, stat.st_mtime, stat.st_size),
     )
     ensure_thumbnail(image_path, thumbnail_root, checksum)
-    rescan_metadata(conn, photo_id, image_path)
+    if scan_metadata and media_type == "image":
+        rescan_metadata(conn, photo_id, image_path)
     return photo_id
 
 
@@ -2759,21 +2864,32 @@ def _serialize_face_scan_job(row):
 
 def photo_ids_for_face_scope(conn, scope, photo_ids=None, album_name=None, mode="detect"):
     if scope in {"selection", "photo"}:
-        return list(dict.fromkeys(int(photo_id) for photo_id in (photo_ids or [])))
+        requested = list(dict.fromkeys(int(photo_id) for photo_id in (photo_ids or [])))
+        if not requested:
+            return []
+        placeholders = ",".join("?" for _ in requested)
+        rows = conn.execute(
+            f"SELECT id AS photo_id FROM photos WHERE media_type='image' AND id IN ({placeholders})",
+            tuple(requested),
+        ).fetchall()
+        return [row["photo_id"] for row in rows]
     if scope == "album":
         rows = conn.execute(
             """
             SELECT DISTINCT ap.photo_id FROM album_photos ap
             JOIN albums a ON a.id=ap.album_id
-            WHERE a.name=? AND ap.is_missing=0
+            JOIN photos p ON p.id=ap.photo_id
+            WHERE a.name=? AND ap.is_missing=0 AND p.media_type='image'
             """,
             (album_name,),
         ).fetchall()
     elif mode == "match" or scope == "rematch":
-        rows = conn.execute("SELECT photo_id FROM face_photo_scans ORDER BY photo_id").fetchall()
+        rows = conn.execute(
+            "SELECT fps.photo_id FROM face_photo_scans fps JOIN photos p ON p.id=fps.photo_id WHERE p.media_type='image' ORDER BY fps.photo_id"
+        ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT DISTINCT photo_id FROM album_photos WHERE is_missing=0 ORDER BY photo_id"
+            "SELECT DISTINCT ap.photo_id FROM album_photos ap JOIN photos p ON p.id=ap.photo_id WHERE ap.is_missing=0 AND p.media_type='image' ORDER BY ap.photo_id"
         ).fetchall()
     return [row["photo_id"] for row in rows]
 
@@ -2782,7 +2898,7 @@ def search_photos(conn, query, limit=30):
     like = f"%{query.strip()}%"
     rows = conn.execute(
         """
-        SELECT p.id, p.checksum, ap.filename, ap.relative_path, a.name AS album_name
+        SELECT p.id, p.checksum, p.media_type, ap.filename, ap.relative_path, a.name AS album_name
         FROM photos p
         JOIN album_photos ap ON ap.photo_id=p.id AND ap.is_missing=0
         JOIN albums a ON a.id=ap.album_id
@@ -2797,6 +2913,7 @@ def search_photos(conn, query, limit=30):
         {
             "id": row["id"],
             "checksum": row["checksum"],
+            "media_type": row["media_type"] or "image",
             "filename": row["filename"],
             "album_name": row["album_name"],
             "relative_path": row["relative_path"],

@@ -15,14 +15,18 @@ from PIL import Image, ImageOps
 from werkzeug.utils import secure_filename
 
 from comfy_generation import (
+    CURRENT_WORKFLOW_ID,
     ComfyClient,
     ComfyGenerationCancelled,
     ComfyGenerationError,
     ComfyPromptUnavailable,
     ComfyUnavailable,
     build_edit_options,
+    build_registered_edit_options,
     comfy_node_title,
     extract_history_filenames,
+    get_registered_workflow,
+    list_registered_workflows,
     list_lora_catalog,
     patch_prompt_and_workflow,
 )
@@ -94,6 +98,7 @@ BASE_DIR = Path(__file__).resolve().parent
 IMAGES_ROOT = BASE_DIR / "static" / "images"
 THUMBNAIL_ROOT = BASE_DIR / "static" / "thumbnails"
 PREVIEW_ROOT = BASE_DIR / "static" / "previews"
+COMFY_WORKFLOW_ROOT = BASE_DIR / "comfyui-workflows"
 DB_PATH = BASE_DIR / "instance" / "gallery.sqlite3"
 FACE_REFERENCE_ROOT = BASE_DIR / "instance" / "face_references"
 PER_PAGE = 100
@@ -108,6 +113,7 @@ COMFY_JOB_LOCK = threading.Lock()
 FACE_WORKER_LOCK = threading.Lock()
 FACE_ENGINE_LOCK = threading.Lock()
 COMFY_JOBS = {}
+SCAN_QUEUE = []
 FACE_WORKER_THREAD = None
 FACE_ENGINE_INSTANCE = None
 IMAGE_ANALYSIS_ENGINE_INSTANCE = None
@@ -147,6 +153,7 @@ SCAN_STATUS = {
     "updated_at": None,
     "finished_at": None,
     "summary": None,
+    "origin": "manual",
 }
 
 
@@ -458,6 +465,8 @@ def create_comfy_job(photo_id, payload):
         "progress_max": None,
         "seed": None,
         "output_filenames": [],
+        "workflow_id": str(payload.get("workflow_id") or CURRENT_WORKFLOW_ID),
+        "output_kind": None,
         "photo": None,
         "error": None,
         "cancel_requested": False,
@@ -556,11 +565,23 @@ def run_comfy_job(job_id, photo_id, payload):
         uploaded_images = {}
         patched_payload = deepcopy(payload)
         raise_if_comfy_job_cancelled(job_id)
-        update_comfy_job(job_id, state="preparing", message="Upload des references")
+        update_comfy_job(job_id, state="preparing", message="Preparation du workflow")
         with connect_db(DB_PATH) as conn:
             detail = get_photo_detail(conn, photo_id)
             if not detail:
                 raise ValueError("Photo not found")
+            workflow_id = str(patched_payload.get("workflow_id") or CURRENT_WORKFLOW_ID)
+            registered = get_registered_workflow(workflow_id, COMFY_WORKFLOW_ROOT)
+            source_filename = validated_source_filename(detail, patched_payload.get("source_filename"))
+            source_image_name = None
+            if registered and registered["config"]["mode"] in {"i2i", "i2v"}:
+                if detail.get("media_type") != "image":
+                    raise ValueError("Le workflow selectionne requiert une image source")
+                source_path = find_photo_file(conn, photo_id)
+                if not source_path:
+                    raise ValueError("Image source introuvable")
+                source_image_name = client.upload_image(source_path)
+                raise_if_comfy_job_cancelled(job_id)
             for reference in patched_payload.get("references") or []:
                 raise_if_comfy_job_cancelled(job_id)
                 node_id = str(reference.get("node_id") or "")
@@ -576,17 +597,29 @@ def run_comfy_job(job_id, photo_id, payload):
                     reference["input_name"] = input_name
                 elif node_id:
                     uploaded_images[node_id] = input_name
-            prompt, workflow, patch_info = patch_prompt_and_workflow(detail, patched_payload, uploaded_images=uploaded_images)
+            prompt, workflow, patch_info = patch_prompt_and_workflow(
+                detail,
+                patched_payload,
+                uploaded_images=uploaded_images,
+                source_image_name=source_image_name,
+                source_filename=source_filename,
+                workflow_root=COMFY_WORKFLOW_ROOT,
+            )
 
         raise_if_comfy_job_cancelled(job_id)
         update_comfy_job(job_id, state="queued", message="Envoi a ComfyUI", seed=patch_info.get("seed"))
+        preview_nodes = {str(node_id) for node_id in patch_info.get("preview_nodes") or []}
+        active_node = None
 
         def on_progress(progress):
+            nonlocal active_node
             if comfy_job_cancel_requested(job_id):
                 if "prompt_id" in progress:
                     update_comfy_job(job_id, prompt_id=progress.get("prompt_id"))
                 return
             if progress.get("preview"):
+                if preview_nodes and str(active_node) not in preview_nodes:
+                    return
                 update_comfy_job(job_id, preview=progress["preview"], preview_updated_at=time.time())
                 return
             updates = {}
@@ -596,6 +629,7 @@ def run_comfy_job(job_id, photo_id, payload):
                 updates["prompt_id"] = progress.get("prompt_id")
             if "node" in progress:
                 node_id = progress.get("node")
+                active_node = node_id
                 updates["node"] = node_id
                 updates["node_title"] = comfy_node_title(prompt, workflow, node_id)
             if "value" in progress or "max" in progress:
@@ -615,11 +649,16 @@ def run_comfy_job(job_id, photo_id, payload):
             cancel_callback=lambda: comfy_job_cancel_requested(job_id),
         )
         raise_if_comfy_job_cancelled(job_id)
-        output_filenames = extract_history_filenames(history)
+        output_filenames = extract_history_filenames(
+            history,
+            output_node=patch_info.get("output_node"),
+            output_kind=patch_info.get("output_kind"),
+        )
+        output_label = "video" if patch_info.get("output_kind") == "video" else "image"
         update_comfy_job(
             job_id,
             state="importing",
-            message="Import de l'image generee",
+            message=f"Import de {output_label} generee",
             prompt_id=prompt_id,
             node=None,
             node_title=None,
@@ -629,25 +668,28 @@ def run_comfy_job(job_id, photo_id, payload):
         )
 
         generated_photo = None
+        generated_photos = []
         raise_if_comfy_job_cancelled(job_id)
         with connect_db(DB_PATH) as conn:
             output_paths = output_paths_from_history(conn, output_filenames)
             if not output_paths:
                 raise ComfyGenerationError("Generated output file was not found in the output album")
-            generated_photo_id = None
             for output_path in output_paths:
                 raise_if_comfy_job_cancelled(job_id)
                 generated_photo_id = import_output_photo(conn, output_path, THUMBNAIL_ROOT)
-            raise_if_comfy_job_cancelled(job_id)
-            if generated_photo_id and generated_photo_id != photo_id:
-                create_photo_link(conn, photo_id, generated_photo_id, "variant")
-                generated_photo = get_photo_detail(conn, generated_photo_id)
+                if generated_photo_id and generated_photo_id != photo_id:
+                    create_photo_link(conn, photo_id, generated_photo_id, "variant")
+                    generated_photo = get_photo_detail(conn, generated_photo_id)
+                    generated_photos.append(generated_photo)
             raise_if_comfy_job_cancelled(job_id)
             complete_comfy_job(
                 job_id,
-                message="Image generee",
+                message="Video generee" if patch_info.get("output_kind") == "video" else "Image generee",
                 prompt_id=prompt_id,
                 photo=generated_photo,
+                photos=generated_photos,
+                workflow_id=patch_info.get("workflow_id"),
+                output_kind=patch_info.get("output_kind"),
             )
     except ComfyGenerationCancelled:
         update_comfy_job(
@@ -668,6 +710,19 @@ def run_comfy_job(job_id, photo_id, payload):
             error=str(exc),
             finished_at=time.time(),
         )
+
+
+def validated_source_filename(detail, requested_filename=None):
+    memberships = detail.get("memberships") or []
+    requested_filename = str(requested_filename or "").strip()
+    if requested_filename:
+        for membership in memberships:
+            if membership.get("filename") == requested_filename:
+                return requested_filename
+    for membership in memberships:
+        if membership.get("available") and membership.get("filename"):
+            return membership["filename"]
+    return next((item.get("filename") for item in memberships if item.get("filename")), "image.png")
 
 
 def selected_album_name(albums, requested):
@@ -813,7 +868,119 @@ def gallery_page_url(
 
 def scan_status_snapshot():
     with SCAN_LOCK:
-        return deepcopy(SCAN_STATUS)
+        return _scan_status_snapshot_locked()
+
+
+def _scan_status_snapshot_locked():
+    snapshot = deepcopy(SCAN_STATUS)
+    snapshot["queued_count"] = len(SCAN_QUEUE)
+    return snapshot
+
+
+def scan_start_message(options):
+    if options["scope"] == "selection":
+        return f"Scan de la selection ({len(options['photo_ids'])} images) demarre"
+    if options["scope"] == "current":
+        return f"Scan de l'album {options['album']} demarre"
+    return "Scan de tous les albums demarre"
+
+
+def activate_scan_job_locked(entry):
+    now = time.time()
+    options = entry["options"]
+    SCAN_STATUS.update(
+        {
+            "active": True,
+            "job_id": entry["job_id"],
+            "state": "running",
+            "stage": "scan",
+            "message": scan_start_message(options),
+            "album": options["album"],
+            "file": None,
+            "photos": 0,
+            "album_photos": 0,
+            "processed": 0,
+            "skipped": 0,
+            "errors": [],
+            "options": deepcopy(options),
+            "cancel_requested": False,
+            "face_job_id": None,
+            "face_job": None,
+            "metadata_total": 0,
+            "metadata_processed": 0,
+            "metadata_skipped": 0,
+            "metadata_errors": 0,
+            "analysis_total": 0,
+            "analysis_processed": 0,
+            "analysis_skipped": 0,
+            "analysis_errors": 0,
+            "face_total": 0,
+            "face_skipped": 0,
+            "started_at": now,
+            "updated_at": now,
+            "finished_at": None,
+            "summary": None,
+            "origin": entry.get("origin") or "manual",
+        }
+    )
+
+
+def start_scan_job_thread(entry):
+    thread = threading.Thread(
+        target=run_scan_job,
+        args=(entry["job_id"], entry["options"]),
+        daemon=True,
+        name=f"gallery-scan-{entry['job_id'][:8]}",
+    )
+    thread.start()
+
+
+def enqueue_scan_job(options, origin="manual", queue_if_busy=False):
+    entry = {
+        "job_id": str(uuid4()),
+        "options": deepcopy(options),
+        "origin": origin,
+        "queued_at": time.time(),
+    }
+    start_now = False
+    with SCAN_LOCK:
+        if SCAN_STATUS["active"]:
+            if not queue_if_busy:
+                return None, _scan_status_snapshot_locked()
+            SCAN_QUEUE.append(entry)
+            scheduled = {
+                "active": False,
+                "job_id": entry["job_id"],
+                "state": "queued",
+                "stage": "queued",
+                "message": "Scan automatique en attente",
+                "options": deepcopy(options),
+                "origin": origin,
+                "queue_position": len(SCAN_QUEUE),
+            }
+            return scheduled, _scan_status_snapshot_locked()
+        activate_scan_job_locked(entry)
+        start_now = True
+        scheduled = _scan_status_snapshot_locked()
+    if start_now:
+        start_scan_job_thread(entry)
+    return scheduled, scheduled
+
+
+def finish_scan_job_and_promote(job_id, **updates):
+    next_entry = None
+    with SCAN_LOCK:
+        if SCAN_STATUS.get("job_id") != job_id:
+            return _scan_status_snapshot_locked()
+        SCAN_STATUS.update(active=False, finished_at=time.time(), **updates)
+        SCAN_STATUS["updated_at"] = time.time()
+        if SCAN_QUEUE:
+            next_entry = SCAN_QUEUE.pop(0)
+            activate_scan_job_locked(next_entry)
+        snapshot = _scan_status_snapshot_locked()
+    if next_entry:
+        start_scan_job_thread(next_entry)
+    return snapshot
 
 
 def update_scan_status(**updates):
@@ -935,6 +1102,13 @@ def run_metadata_stage(job_id, options, photo_ids, sync=False):
             raise ScanCancelled("Scan JSON annule")
         try:
             with connect_db(DB_PATH) as conn:
+                photo = conn.execute(
+                    "SELECT media_type FROM photos WHERE id=?",
+                    (photo_id,),
+                ).fetchone()
+                if not photo or photo["media_type"] != "image":
+                    summary["skipped"] += 1
+                    continue
                 cached = conn.execute(
                     "SELECT 1 FROM photo_metadata WHERE photo_id=?",
                     (photo_id,),
@@ -978,7 +1152,10 @@ def run_image_analysis_stage(job_id, options, photo_ids, sync=False):
     pending_photo_ids = []
     with connect_db(DB_PATH) as conn:
         for photo_id in photo_ids:
-            photo = conn.execute("SELECT checksum FROM photos WHERE id=?", (photo_id,)).fetchone()
+            photo = conn.execute("SELECT checksum, media_type FROM photos WHERE id=?", (photo_id,)).fetchone()
+            if not photo or photo["media_type"] != "image":
+                summary["skipped"] += 1
+                continue
             cached = bool(
                 photo
                 and not force
@@ -1075,6 +1252,8 @@ def face_stage_candidates(options, photo_ids):
 
 def enqueue_scan_face_stage(job_id, options, photo_ids, sync=False):
     if not options.get("face_recognition"):
+        if options.get("skip_automatic_face_scan"):
+            return None, None
         return enqueue_automatic_face_scan(params={"parent_scan_job_id": job_id}), None
     pending_photo_ids, skipped = face_stage_candidates(options, photo_ids)
     summary = {
@@ -1179,36 +1358,34 @@ def run_scan_job(job_id, options):
             + summary["image_analysis"]["processed"]
             + summary.get("faces", {}).get("processed", 0)
         )
-        update_scan_status(
-            active=False,
+        finish_scan_job_and_promote(
+            job_id,
             state="done",
             stage="done",
             message=(
                 f"Scan termine: {summary['processed']} image(s) indexee(s), "
                 f"{analysis_processed} analyse(s) executee(s)"
             ),
-            finished_at=time.time(),
             summary=summary,
         )
         print(f"[scan] job {job_id} done: {summary}", flush=True)
     except ScanCancelled:
-        update_scan_status(
-            active=False,
+        finish_scan_job_and_promote(
+            job_id,
             state="cancelled",
             stage="cancelled",
             message="Scan annule",
-            finished_at=time.time(),
+            summary=None,
         )
         print(f"[scan] job {job_id} cancelled", flush=True)
     except Exception as exc:
         print(f"[scan] job {job_id} failed: {exc}", flush=True)
         traceback.print_exc()
-        update_scan_status(
-            active=False,
+        finish_scan_job_and_promote(
+            job_id,
             state="error",
             stage="error",
             message=str(exc),
-            finished_at=time.time(),
             summary=None,
         )
 
@@ -1349,7 +1526,8 @@ def api_album_slideshow_photos(album_id):
             exclude_tags=exclude_tags,
             max_sensitivity=max_sensitivity,
         )
-    return jsonify({"ok": True, "photos": photos, "total": total})
+    photos = [photo for photo in photos if photo.get("media_type") == "image"]
+    return jsonify({"ok": True, "photos": photos, "total": len(photos)})
 
 
 @app.patch("/api/albums/<int:album_id>")
@@ -1387,58 +1565,9 @@ def api_scan():
             return jsonify({"ok": False, "error": str(exc)}), 404
         return jsonify({"ok": True, "summary": summary})
 
-    with SCAN_LOCK:
-        if SCAN_STATUS["active"]:
-            return jsonify({"ok": True, "job": deepcopy(SCAN_STATUS), "already_running": True}), 202
-        job_id = str(uuid4())
-        SCAN_STATUS.update(
-            {
-                "active": True,
-                "job_id": job_id,
-                "state": "running",
-                "stage": "scan",
-                "message": (
-                    f"Scan de la selection ({len(options['photo_ids'])} images) demarre"
-                    if options["scope"] == "selection"
-                    else f"Scan de l'album {options['album']} demarre"
-                    if options["scope"] == "current"
-                    else "Scan de tous les albums demarre"
-                ),
-                "album": options["album"],
-                "file": None,
-                "photos": 0,
-                "album_photos": 0,
-                "processed": 0,
-                "skipped": 0,
-                "errors": [],
-                "options": deepcopy(options),
-                "cancel_requested": False,
-                "face_job_id": None,
-                "face_job": None,
-                "metadata_total": 0,
-                "metadata_processed": 0,
-                "metadata_skipped": 0,
-                "metadata_errors": 0,
-                "analysis_total": 0,
-                "analysis_processed": 0,
-                "analysis_skipped": 0,
-                "analysis_errors": 0,
-                "face_total": 0,
-                "face_skipped": 0,
-                "started_at": time.time(),
-                "updated_at": time.time(),
-                "finished_at": None,
-                "summary": None,
-            }
-        )
-        job = deepcopy(SCAN_STATUS)
-    thread = threading.Thread(
-        target=run_scan_job,
-        args=(job_id, options),
-        daemon=True,
-        name=f"gallery-scan-{job_id[:8]}",
-    )
-    thread.start()
+    scheduled, job = enqueue_scan_job(options)
+    if scheduled is None:
+        return jsonify({"ok": True, "job": job, "already_running": True}), 202
     return jsonify({"ok": True, "job": job}), 202
 
 
@@ -1461,6 +1590,15 @@ def api_comfy_status():
     return jsonify({"ok": True, "available": available})
 
 
+@app.get("/api/comfy/workflows")
+def api_comfy_workflows():
+    try:
+        workflows = list_registered_workflows(COMFY_WORKFLOW_ROOT)
+        return jsonify({"ok": True, "workflows": workflows})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.get("/api/photos/<int:photo_id>")
 def api_photo_detail(photo_id):
     ensure_ready()
@@ -1476,12 +1614,14 @@ def api_photo_preview(photo_id):
     ensure_ready()
     with connect_db(DB_PATH) as conn:
         photo = conn.execute(
-            "SELECT checksum FROM photos WHERE id=?",
+            "SELECT checksum, media_type FROM photos WHERE id=?",
             (photo_id,),
         ).fetchone()
         image_path = find_photo_file(conn, photo_id) if photo else None
     if not photo:
         return jsonify({"ok": False, "error": "Photo not found"}), 404
+    if photo["media_type"] != "image":
+        return jsonify({"ok": False, "error": "Aucun apercu image pour une video"}), 400
     if not image_path:
         return jsonify({"ok": False, "error": "No file found for this photo"}), 404
 
@@ -1511,12 +1651,14 @@ def api_rescan_photo_image_analysis(photo_id):
     ensure_ready()
     with connect_db(DB_PATH) as conn:
         photo = conn.execute(
-            "SELECT id, checksum FROM photos WHERE id=?",
+            "SELECT id, checksum, media_type FROM photos WHERE id=?",
             (photo_id,),
         ).fetchone()
         image_path = find_photo_file(conn, photo_id) if photo else None
     if not photo:
         return jsonify({"ok": False, "error": "Photo not found"}), 404
+    if photo["media_type"] != "image":
+        return jsonify({"ok": False, "error": "L'analyse d'image ne prend pas en charge les videos"}), 400
     if not image_path:
         return jsonify({"ok": False, "error": "No file found for this photo"}), 404
 
@@ -1548,12 +1690,32 @@ def api_rescan_photo_image_analysis(photo_id):
 @app.get("/api/photos/<int:photo_id>/comfy/edit-options")
 def api_comfy_edit_options(photo_id):
     ensure_ready()
+    workflow_id = str(request.args.get("workflow_id") or CURRENT_WORKFLOW_ID)
     try:
         with connect_db(DB_PATH) as conn:
             detail = get_photo_detail(conn, photo_id)
             if not detail:
                 return jsonify({"ok": False, "error": "Photo not found"}), 404
+            if detail.get("media_type") != "image":
+                return jsonify({"ok": False, "error": "La generation ComfyUI requiert une image source"}), 400
             lora_catalog = list_lora_catalog(conn)
+            if workflow_id != CURRENT_WORKFLOW_ID:
+                registered = get_registered_workflow(workflow_id, COMFY_WORKFLOW_ROOT)
+                if registered["config"]["mode"] == "i2v" and not (detail.get("metadata") or {}).get("prompt"):
+                    image_path = find_photo_file(conn, photo_id)
+                    if image_path:
+                        try:
+                            rescan_metadata(conn, photo_id, image_path)
+                            detail = get_photo_detail(conn, photo_id)
+                        except OSError:
+                            pass
+                options = build_registered_edit_options(
+                    detail,
+                    lora_catalog,
+                    workflow_id,
+                    COMFY_WORKFLOW_ROOT,
+                )
+                return jsonify({"ok": True, "options": options})
             try:
                 options = build_edit_options(detail, lora_catalog)
             except ComfyPromptUnavailable:
@@ -1578,14 +1740,24 @@ def api_comfy_generate(photo_id):
     client = get_comfy_client()
     if not client.is_available():
         return jsonify({"ok": False, "error": "ComfyUI is not available"}), 503
+    workflow_id = str(payload.get("workflow_id") or CURRENT_WORKFLOW_ID)
+    try:
+        registered = get_registered_workflow(workflow_id, COMFY_WORKFLOW_ROOT)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     references = payload.get("references") or []
-    if "references" in payload and not any(
+    if workflow_id == CURRENT_WORKFLOW_ID and "references" in payload and not any(
         bool(item.get("enabled", True)) for item in references if isinstance(item, dict)
     ):
         return jsonify({"ok": False, "error": "Au moins une reference active est requise"}), 400
     with connect_db(DB_PATH) as conn:
-        if not get_photo_detail(conn, photo_id):
+        detail = get_photo_detail(conn, photo_id)
+        if not detail:
             return jsonify({"ok": False, "error": "Photo not found"}), 404
+        if detail.get("media_type") != "image":
+            return jsonify({"ok": False, "error": "La generation ComfyUI requiert une image source"}), 400
+        if registered and registered["config"]["mode"] in {"i2i", "i2v"} and not detail.get("original_url"):
+            return jsonify({"ok": False, "error": "Image source indisponible"}), 400
     try:
         job = create_comfy_job(photo_id, payload)
     except ComfyJobAlreadyActive as exc:
@@ -1595,6 +1767,7 @@ def api_comfy_generate(photo_id):
 
 @app.post("/api/comfy/references/upload")
 def api_comfy_reference_upload():
+    ensure_ready()
     uploaded = request.files.get("file")
     if not uploaded or not uploaded.filename:
         return jsonify({"ok": False, "error": "Aucun fichier fourni"}), 400
@@ -1616,15 +1789,66 @@ def api_comfy_reference_upload():
             temp_path = Path(temp_dir) / filename
             temp_path.write_bytes(data)
             input_name = client.upload_image(temp_path)
+        with connect_db(DB_PATH) as conn:
+            input_album, input_path = validated_comfy_input_path(conn, input_name)
+            photo_id = import_photo_into_album(
+                conn,
+                input_path,
+                input_album,
+                THUMBNAIL_ROOT,
+                scan_metadata=False,
+            )
+            photo = get_photo_detail(conn, photo_id)
+        scan_options = normalize_scan_options(
+            {
+                "scope": "selection",
+                "photo_ids": [photo_id],
+                "scan_mode": "missing",
+                "metadata": True,
+                "image_analysis": True,
+                "face_recognition": False,
+            }
+        )
+        scan_options["skip_automatic_face_scan"] = True
+        scan_job, scan_status = enqueue_scan_job(
+            scan_options,
+            origin="comfy_reference",
+            queue_if_busy=True,
+        )
         return jsonify(
             {
                 "ok": True,
                 "input_name": input_name,
                 "thumbnail_url": f"/api/comfy/input-preview?filename={urlencode({'name': input_name})[5:]}",
+                "photo": photo,
+                "scan_job": scan_job,
+                "scan_status": scan_status,
             }
         ), 201
-    except (ComfyUnavailable, ValueError) as exc:
+    except ComfyUnavailable as exc:
         return jsonify({"ok": False, "error": str(exc)}), 503
+    except (OSError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+def validated_comfy_input_path(conn, input_name):
+    normalized = str(input_name or "").replace("\\", "/").strip("/")
+    parts = normalized.split("/") if normalized else []
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Chemin d'image ComfyUI input invalide")
+    album = get_album_by_name(conn, "input")
+    if not album or album["type"] != "input":
+        raise ValueError("La galerie input n'est pas configuree")
+    album_root = Path(album["path"]).resolve()
+    input_path = Path(album["path"]).joinpath(*parts)
+    resolved_input_path = input_path.resolve()
+    try:
+        resolved_input_path.relative_to(album_root)
+    except ValueError as exc:
+        raise ValueError("Chemin d'image ComfyUI input invalide") from exc
+    if not resolved_input_path.is_file():
+        raise ValueError(f"Image ComfyUI input introuvable: {normalized}")
+    return album, input_path
 
 
 @app.get("/api/comfy/input-preview")
@@ -1679,6 +1903,9 @@ def api_comfy_job_preview(job_id):
 def api_rescan_metadata(photo_id):
     ensure_ready()
     with connect_db(DB_PATH) as conn:
+        photo = conn.execute("SELECT media_type FROM photos WHERE id=?", (photo_id,)).fetchone()
+        if photo and photo["media_type"] != "image":
+            return jsonify({"ok": False, "error": "Les videos ne contiennent pas de metadonnees image"}), 400
         image_path = find_photo_file(conn, photo_id)
         if not image_path:
             return jsonify({"ok": False, "error": "No file found for this photo"}), 404
@@ -1724,6 +1951,10 @@ def api_batch_rescan_metadata():
         if missing:
             return jsonify({"ok": False, "error": f"Photos not found: {', '.join(map(str, missing))}"}), 404
         for photo_id in photo_ids:
+            photo = conn.execute("SELECT media_type FROM photos WHERE id=?", (photo_id,)).fetchone()
+            if photo and photo["media_type"] != "image":
+                results.append({"photo_id": photo_id, "status": "skipped", "error": "Media video"})
+                continue
             image_path = find_photo_file(conn, photo_id)
             if not image_path:
                 results.append({"photo_id": photo_id, "status": "failed", "error": "No file found for this photo"})
@@ -1735,11 +1966,15 @@ def api_batch_rescan_metadata():
                 results.append({"photo_id": photo_id, "status": "failed", "error": str(exc)})
 
     scanned = sum(result["status"] == "scanned" for result in results)
-    failed = len(results) - scanned
+    skipped = sum(result["status"] == "skipped" for result in results)
+    failed = len(results) - scanned - skipped
+    summary = {"requested": len(photo_ids), "scanned": scanned, "failed": failed}
+    if skipped:
+        summary["skipped"] = skipped
     return jsonify(
         {
             "ok": True,
-            "summary": {"requested": len(photo_ids), "scanned": scanned, "failed": failed},
+            "summary": summary,
             "results": results,
         }
     )

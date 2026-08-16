@@ -45,6 +45,8 @@ const state = {
     detailsSheetDrag: null,
     detailsSheetSuppressClick: false,
     comfyAvailable: false,
+    comfyWorkflows: [],
+    comfyWorkflowId: "current",
     comfyOptions: null,
     comfyReferences: [],
     comfyReferenceTarget: null,
@@ -112,6 +114,14 @@ const MOBILE_DETAILS_MEDIA = window.matchMedia("(max-width: 760px)");
 const DETAILS_SHEET_STATES = ["hidden", "compact", "expanded"];
 const DETAILS_SHEET_SNAP_DISTANCE = 56;
 const DETAILS_SHEET_SNAP_VELOCITY = 0.45;
+
+function videoBadgeHtml() {
+    return `
+        <span class="video-badge" title="Vidéo" aria-label="Vidéo">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6.5v11l9-5.5-9-5.5Z"></path></svg>
+        </span>
+    `;
+}
 
 function tagsFromInput(value) {
     return value.split(",").map((tag) => tag.trim()).filter(Boolean);
@@ -407,6 +417,7 @@ function viewerPhotoSummary(photoId) {
         id: linkedPhoto.linked_photo_id,
         checksum: linkedPhoto.checksum,
         filename: linkedPhoto.filename,
+        media_type: linkedPhoto.media_type || "image",
         thumbnail_url: linkedPhoto.thumbnail_url,
         preview_url: linkedPhoto.preview_url,
         original_url: linkedPhoto.original_url,
@@ -462,6 +473,16 @@ function clearViewerImageLoads() {
     resetViewerImageElement($("#viewer-thumbnail-image"));
     resetViewerImageElement($("#viewer-preview-image"));
     resetViewerImageElement($("#viewer-image"));
+    const video = $("#viewer-video");
+    if (video) {
+        video.pause();
+        video.removeAttribute("src");
+        video.removeAttribute("poster");
+        video.hidden = true;
+        video.load();
+    }
+    $$(".viewer-image-layer").forEach((image) => { image.hidden = false; });
+    $(".viewer-stage")?.classList.remove("is-video");
     state.viewerPhoto = null;
     state.viewerOriginalPending = false;
     state.viewerOriginalLoaded = false;
@@ -541,6 +562,26 @@ function startProgressiveViewerLoad(photo, loadId) {
     state.viewerPhoto = photo;
     resetViewerZoom();
     const alt = photo.filename || photo.checksum || "";
+
+    if (photo.media_type === "video") {
+        $$(".viewer-image-layer").forEach((image) => { image.hidden = true; });
+        const video = $("#viewer-video");
+        $(".viewer-stage")?.classList.add("is-video");
+        if (!video || !photo.original_url) {
+            setViewerLoadError("La vidéo n’a pas pu être chargée.");
+            return;
+        }
+        video.hidden = false;
+        video.poster = photo.thumbnail_url || "";
+        video.src = photo.original_url;
+        video.setAttribute("aria-label", alt);
+        video.load();
+        video.play().catch(() => {
+            // Les contrôles natifs restent disponibles si l'autoplay est bloqué.
+        });
+        setViewerLoading(null);
+        return;
+    }
 
     const thumbnail = $("#viewer-thumbnail-image");
     thumbnail.alt = alt;
@@ -674,6 +715,11 @@ function closePhotoModal(options = {}) {
 }
 
 function renderPhotoDetail(photo) {
+    const isVideo = photo.media_type === "video";
+    $("#rescan-image-analysis-button").disabled = isVideo;
+    $("#rescan-metadata-button").disabled = isVideo;
+    $("#detail-image-analysis").hidden = isVideo;
+    $("#detail-face-section").hidden = isVideo;
     const viewerAlt = photo.memberships[0]?.filename || photo.checksum;
     $$(".viewer-image-layer").forEach((image) => {
         image.alt = viewerAlt;
@@ -702,8 +748,10 @@ function renderPhotoDetail(photo) {
         .filter((tag) => tag.source === "manual")
         .map((tag) => tag.name)
         .join(", ");
-    renderImageAnalysis(photo);
-    renderPhotoFaces(photo.face_analysis);
+    if (!isVideo) {
+        renderImageAnalysis(photo);
+        renderPhotoFaces(photo.face_analysis);
+    }
     renderLinks(photo.links);
     renderLinkedStrip(photo.links);
     refreshComfyStatus();
@@ -819,6 +867,7 @@ function galleryPhotoFromDetail(photo) {
     return {
         id: photo.id,
         checksum: photo.checksum,
+        media_type: photo.media_type || "image",
         filename: membership.filename,
         relative_path: membership.relative_path,
         album_name: membership.album_name,
@@ -872,6 +921,7 @@ function renderGalleryItem(photo) {
         <li class="gallery-item" data-gallery-photo-id="${photo.id}">
             <button class="thumbnail" type="button" data-photo-id="${photo.id}">
                 <img src="${photo.thumbnail_url}" alt="${escapeHtml(photo.filename)}" loading="lazy">
+                ${photo.media_type === "video" ? videoBadgeHtml() : ""}
                 ${photo.favorite ? `
                     <span class="favorite-badge" title="Present dans output et dans un album user">
                         *${photo.user_album_count > 1 ? `<small>${photo.user_album_count}</small>` : ""}
@@ -1124,6 +1174,7 @@ function renderLinkedStrip(links) {
                 data-open-linked="${link.linked_photo_id}"
                 title="${escapeHtml(link.type)}">
             <img src="${link.thumbnail_url}" alt="${escapeHtml(link.filename)}">
+            ${link.media_type === "video" ? videoBadgeHtml() : ""}
         </button>
         `).join("")}
         <button type="button"
@@ -1290,10 +1341,12 @@ function updateComfyButton() {
         return;
     }
     const jobActive = Boolean(state.comfyJob?.active);
-    button.disabled = !state.comfyAvailable || !state.currentPhoto || jobActive;
+    const validSource = state.currentPhoto?.media_type !== "video";
+    button.disabled = !state.comfyAvailable || !state.currentPhoto || !validSource || jobActive;
     button.title = jobActive
         ? "Une generation est deja en cours"
-        : state.comfyAvailable ? "Regenerer avec ComfyUI" : "ComfyUI indisponible";
+        : !validSource ? "La génération ComfyUI requiert une image"
+            : state.comfyAvailable ? "Regenerer avec ComfyUI" : "ComfyUI indisponible";
 }
 
 async function refreshComfyStatus() {
@@ -1539,22 +1592,71 @@ async function openComfyModalForPhoto(photoId, options = {}) {
     setComfyStatus("Chargement des options...");
     if (options.reset) {
         state.comfyOptions = null;
+        state.comfyWorkflowId = options.workflowId || state.comfyJob?.workflow_id || "current";
         state.comfyReferences = [];
         state.comfyReferenceTarget = null;
         updateComfyFormJobControls(state.comfyJob);
     }
     try {
-        const data = await fetchJson(`/api/photos/${photoId}/comfy/edit-options`);
+        if (!state.comfyWorkflows.length || options.reset) {
+            const workflowData = await fetchJson("/api/comfy/workflows");
+            state.comfyWorkflows = workflowData.workflows || [];
+        }
         state.comfySourcePhotoId = photoId;
-        state.comfyOptions = data.options;
-        renderComfyOptions(data.options);
-        setComfyStatus("");
+        renderComfyWorkflowSelect();
+        await loadComfyWorkflowOptions(photoId, state.comfyWorkflowId);
     } catch (error) {
+        state.comfyOptions = null;
         setComfyStatus(error.message, true);
     }
     updateComfyFormJobControls(state.comfyJob);
     modal.classList.add("open");
     modal.setAttribute("aria-hidden", "false");
+}
+
+function renderComfyWorkflowSelect() {
+    const select = $("#comfy-workflow-select");
+    if (!select) {
+        return;
+    }
+    select.innerHTML = state.comfyWorkflows.map((workflow) => `
+        <option value="${escapeHtml(workflow.id)}">${escapeHtml(workflow.label)}</option>
+    `).join("");
+    if (!state.comfyWorkflows.some((workflow) => workflow.id === state.comfyWorkflowId)) {
+        state.comfyWorkflowId = "current";
+    }
+    select.value = state.comfyWorkflowId;
+}
+
+async function loadComfyWorkflowOptions(photoId, workflowId) {
+    state.comfyWorkflowId = workflowId || "current";
+    state.comfyOptions = null;
+    updateComfyFormJobControls(state.comfyJob);
+    setComfyStatus("Chargement du workflow...");
+    try {
+        const data = await fetchJson(
+            `/api/photos/${photoId}/comfy/edit-options?workflow_id=${encodeURIComponent(state.comfyWorkflowId)}`,
+        );
+        state.comfyOptions = data.options;
+        renderComfyOptions(data.options);
+        setComfyStatus("");
+    } catch (error) {
+        setComfyStatus(error.message, true);
+        throw error;
+    } finally {
+        updateComfyFormJobControls(state.comfyJob);
+    }
+}
+
+async function changeComfyWorkflow(event) {
+    if (!state.comfySourcePhotoId || state.comfyJob?.active) {
+        return;
+    }
+    try {
+        await loadComfyWorkflowOptions(state.comfySourcePhotoId, event.target.value);
+    } catch (_error) {
+        // Le sélecteur reste disponible pour choisir un autre workflow.
+    }
 }
 
 async function reopenComfyJob() {
@@ -1620,6 +1722,10 @@ function updateComfyFormJobControls(job) {
 }
 
 function renderComfyOptions(options) {
+    state.comfyWorkflowId = options.workflow_id || "current";
+    if ($("#comfy-workflow-select")) {
+        $("#comfy-workflow-select").value = state.comfyWorkflowId;
+    }
     $("#comfy-prompt").value = options.prompt || "";
     $("#comfy-seed-mode").value = "keep";
     $("#comfy-steps").value = options.steps || "";
@@ -1640,6 +1746,11 @@ function renderComfyOptions(options) {
     }));
     renderComfyLoras(options.loras || [], state.comfyLoraCatalog);
     renderComfyReferences();
+    const capabilities = options.capabilities || {};
+    $("#comfy-seed-field").hidden = capabilities.seed === false;
+    $("#comfy-steps-field").hidden = capabilities.steps === false;
+    $("#comfy-loras-section").hidden = capabilities.loras === false;
+    $("#comfy-references-section").hidden = capabilities.references === false;
 }
 
 function formatComfyLoraStrength(value) {
@@ -1649,6 +1760,7 @@ function formatComfyLoraStrength(value) {
 
 function renderComfyLoras(loras, catalog) {
     const container = $("#comfy-loras");
+    const allowNew = state.comfyWorkflowId === "current";
     const rows = loras.map((lora) => {
         const names = catalog.map((item) => item.lora_name);
         if (!names.includes(lora.lora_name)) {
@@ -1670,8 +1782,8 @@ function renderComfyLoras(loras, catalog) {
     }).join("");
     container.innerHTML = `
         <div data-comfy-lora-rows>${rows || '<span class="muted">Aucun LoRA dans ce workflow</span>'}</div>
-        <button type="button" data-add-comfy-lora ${catalog.length ? "" : "disabled"}>Ajouter un LoRA</button>
-        ${catalog.length ? "" : '<small class="muted">Aucun LoRA disponible dans l’historique de la galerie.</small>'}
+        ${allowNew ? `<button type="button" data-add-comfy-lora ${catalog.length ? "" : "disabled"}>Ajouter un LoRA</button>` : ""}
+        ${catalog.length || !allowNew ? "" : '<small class="muted">Aucun LoRA disponible dans l’historique de la galerie.</small>'}
     `;
 }
 
@@ -1754,7 +1866,7 @@ async function searchComfyReferences(event) {
     }
     const data = await fetchJson(`/api/photos/search?q=${encodeURIComponent(query)}`);
     results.innerHTML = data.photos
-        .filter((photo) => !state.currentPhoto || photo.id !== state.currentPhoto.id)
+        .filter((photo) => photo.media_type !== "video" && (!state.currentPhoto || photo.id !== state.currentPhoto.id))
         .map((photo) => `
             <button type="button" class="search-result" data-comfy-ref-result="${photo.id}" data-filename="${escapeHtml(photo.filename)}" data-thumbnail-url="${escapeHtml(photo.thumbnail_url)}">
                 <img src="${photo.thumbnail_url}" alt="">
@@ -1823,7 +1935,19 @@ async function uploadComfyReference(input) {
     }
     state.comfyReferenceAddOpen = false;
     state.comfyReferenceTarget = null;
-    setComfyStatus("");
+    if (data.photo) {
+        addPhotoToCurrentGallery(data.photo);
+    }
+    if (data.scan_status) {
+        state.scanStatusClosed = false;
+        renderScanStatus(data.scan_status, { force: true });
+        startScanPolling();
+    }
+    setComfyStatus(
+        data.scan_job?.state === "queued"
+            ? "Référence ajoutée à input. Scan JSON et IA en attente."
+            : "Référence ajoutée à input. Scan JSON et IA lancés.",
+    );
     renderComfyReferences();
 }
 
@@ -1844,7 +1968,12 @@ async function submitComfyGeneration(event) {
         return;
     }
     setComfyStatus("Envoi a ComfyUI...");
+    const selectedMembership = state.currentPhoto?.memberships?.find(
+        (membership) => membership.album_name === state.selectedAlbum?.name,
+    ) || state.currentPhoto?.memberships?.[0];
     const payload = {
+        workflow_id: state.comfyWorkflowId || "current",
+        source_filename: selectedMembership?.filename || null,
         prompt: $("#comfy-prompt").value,
         seed_mode: $("#comfy-seed-mode").value,
         steps: Number($("#comfy-steps").value || state.comfyOptions.steps || 1),
@@ -1861,7 +1990,7 @@ async function submitComfyGeneration(event) {
             ...(reference.photo_id ? { photo_id: reference.photo_id } : { input_name: reference.input_name || reference.image_name }),
         })),
     };
-    if (!payload.references.some((reference) => reference.enabled)) {
+    if (state.comfyOptions.capabilities?.references !== false && !payload.references.some((reference) => reference.enabled)) {
         setComfyStatus("Activez au moins une référence.", true);
         return;
     }
@@ -2391,7 +2520,7 @@ function touchDistance(touches) {
 }
 
 function isInteractiveSwipeTarget(target) {
-    return Boolean(target.closest("button, input, select, textarea, a, [role='button']"));
+    return Boolean(target.closest("button, input, select, textarea, a, video, [role='button']"));
 }
 
 function handleViewerTouchStart(event) {
@@ -3694,6 +3823,25 @@ async function submitScanOptions(event) {
     }
 }
 
+async function refreshAutomaticScanPhotos(job) {
+    const photoIds = [...new Set(job.options?.photo_ids || [])];
+    for (const photoId of photoIds) {
+        try {
+            const data = await fetchJson(`/api/photos/${photoId}`);
+            if (data.photo) {
+                syncPhotoInCurrentGallery(data.photo);
+                if (state.currentPhoto?.id === data.photo.id) {
+                    state.currentPhoto = data.photo;
+                    renderPhotoDetail(data.photo);
+                }
+            }
+        } catch (_error) {
+            // The scan status already reports backend errors; keep the modal usable.
+        }
+    }
+    await refreshTagFacets();
+}
+
 function startScanPolling() {
     window.clearInterval(state.scanPollTimer);
     if (!state.scanBusyDone) {
@@ -3707,7 +3855,9 @@ function startScanPolling() {
                 window.clearInterval(state.scanPollTimer);
                 state.scanBusyDone?.();
                 state.scanBusyDone = null;
-                if (data.job.state === "done") {
+                if (data.job.origin === "comfy_reference") {
+                    await refreshAutomaticScanPhotos(data.job);
+                } else if (data.job.state === "done") {
                     window.location.reload();
                 }
             }
@@ -3795,6 +3945,9 @@ function renderScanStatus(job, options = {}) {
     }
     if (job.errors && job.errors.length) {
         details.push(`erreurs: ${job.errors.length}`);
+    }
+    if (job.queued_count) {
+        details.push(`en attente: ${job.queued_count}`);
     }
     $("#scan-status-detail").textContent = details.join(" | ");
 }
@@ -3937,6 +4090,7 @@ function bindEvents() {
     });
     $("#album-action-form")?.addEventListener("submit", submitAlbumAction);
     $("#comfy-form")?.addEventListener("submit", submitComfyGeneration);
+    $("#comfy-workflow-select")?.addEventListener("change", changeComfyWorkflow);
     $("#comfy-loras")?.addEventListener("focusout", (event) => {
         if (event.target.matches("[data-comfy-lora-strength]")) {
             event.target.value = formatComfyLoraStrength(event.target.value);

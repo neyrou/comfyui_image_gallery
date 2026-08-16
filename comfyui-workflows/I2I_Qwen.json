@@ -1,0 +1,371 @@
+{
+  "1": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "2": {
+    "inputs": {
+      "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "3": {
+    "inputs": {
+      "unet_name": "qwen_image_edit_2511_bf16.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "4": {
+    "inputs": {
+      "lora_name": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors",
+      "strength_model": 1,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "5": {
+    "inputs": {
+      "conditioning": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "ConditioningZeroOut"
+    }
+  },
+  "6": {
+    "inputs": {
+      "custom_output": [
+        "10",
+        2
+      ]
+    },
+    "class_type": "QwenEditOutputExtractor",
+    "_meta": {
+      "title": "Qwen Edit Output Extractor"
+    }
+  },
+  "7": {
+    "inputs": {
+      "images": [
+        "6",
+        3
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "8": {
+    "inputs": {
+      "value": "gender swap, keep same clothes, change face to a sexy girl, beautiful legs, thin body"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "String (Multiline)"
+    }
+  },
+  "9": {
+    "inputs": {
+      "max_size": 2300,
+      "image": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "QwenEditAdaptiveLongestEdge",
+    "_meta": {
+      "title": "Qwen Edit Adaptive Longest Edge"
+    }
+  },
+  "10": {
+    "inputs": {
+      "prompt": [
+        "8",
+        0
+      ],
+      "return_full_refs_cond": true,
+      "instruction": "Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.",
+      "clip": [
+        "2",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ],
+      "configs": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlusCustom_lrzjason",
+    "_meta": {
+      "title": "TextEncodeQwenImageEditPlusCustom lrzjason"
+    }
+  },
+  "11": {
+    "inputs": {
+      "max_size": 1536
+    },
+    "class_type": "QwenEditAdaptiveLongestEdge",
+    "_meta": {
+      "title": "Qwen Edit Adaptive Longest Edge"
+    }
+  },
+  "13": {
+    "inputs": {
+      "image": "photo_20260419-142704.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "16": {
+    "inputs": {
+      "to_ref": true,
+      "ref_main_image": true,
+      "ref_longest_edge": [
+        "9",
+        0
+      ],
+      "ref_crop": "pad",
+      "ref_upscale": "lanczos",
+      "to_vl": true,
+      "vl_resize": true,
+      "vl_target_size": 384,
+      "vl_crop": "center",
+      "vl_upscale": "bicubic",
+      "image": [
+        "13",
+        0
+      ],
+      "mask": [
+        "13",
+        1
+      ]
+    },
+    "class_type": "QwenEditConfigPreparer",
+    "_meta": {
+      "title": "Qwen Edit Config Preparer"
+    }
+  },
+  "17": {
+    "inputs": {
+      "seed": [
+        "44",
+        0
+      ],
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1,
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "10",
+        0
+      ],
+      "negative": [
+        "5",
+        0
+      ],
+      "latent_image": [
+        "10",
+        1
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "18": {
+    "inputs": {
+      "image": [
+        "22",
+        0
+      ],
+      "pad_info": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "CropWithPadInfo",
+    "_meta": {
+      "title": "Crop With Pad Info"
+    }
+  },
+  "20": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "scale_by": [
+        "18",
+        1
+      ],
+      "image": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "ImageScaleBy",
+    "_meta": {
+      "title": "Upscale Image By"
+    }
+  },
+  "21": {
+    "inputs": {
+      "images": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "22": {
+    "inputs": {
+      "samples": [
+        "17",
+        0
+      ],
+      "vae": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "29": {
+    "inputs": {
+      "rgthree_comparer": {
+        "images": [
+          {
+            "name": "A",
+            "selected": true,
+            "url": "/api/view?filename=rgthree.compare._temp_bmbps_00271_.png&type=temp&subfolder=&rand=0.8239879636124255"
+          },
+          {
+            "name": "B",
+            "selected": true,
+            "url": "/api/view?filename=rgthree.compare._temp_bmbps_00272_.png&type=temp&subfolder=&rand=0.8523789283160098"
+          }
+        ]
+      },
+      "image_a": [
+        "47",
+        0
+      ],
+      "image_b": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "Image Comparer (rgthree)",
+    "_meta": {
+      "title": "Image Comparer (rgthree)"
+    }
+  },
+  "42": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "47",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "43": {
+    "inputs": {
+      "images": [
+        "20",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "44": {
+    "inputs": {
+      "seed": 347173521362214
+    },
+    "class_type": "Seed (rgthree)",
+    "_meta": {
+      "title": "Seed (rgthree)"
+    }
+  },
+  "47": {
+    "inputs": {
+      "enabled": false,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "none",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 0.5,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "20",
+        0
+      ],
+      "face_model": [
+        "48",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap"
+    }
+  },
+  "48": {
+    "inputs": {
+      "face_model": "Emma1.safetensors"
+    },
+    "class_type": "ReActorLoadFaceModel",
+    "_meta": {
+      "title": "Load Face Model 🌌 ReActor"
+    }
+  }
+}

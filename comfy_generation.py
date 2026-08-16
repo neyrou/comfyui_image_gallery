@@ -2,6 +2,7 @@ import copy
 import json
 import mimetypes
 import random
+import re
 import time
 import uuid
 from pathlib import Path
@@ -23,6 +24,13 @@ from comfy_graph import (
 
 COMFY_BASE_URL = "http://127.0.0.1:8188"
 MAX_SEED = 1125899906842624
+CURRENT_WORKFLOW_ID = "current"
+WORKFLOW_ROOT = Path(__file__).resolve().parent / "comfyui-workflows"
+I2V_IDLE_PROMPT_SUFFIX = (
+    "subtle idle waiting motion only, minimal movement, no abrupt motion, no energetic movement, "
+    "preserve the original pose, preserve the original framing, preserve visual coherence with the source image"
+)
+REGISTERED_WORKFLOW_MODES = {"t2i", "i2i", "i2v"}
 
 
 class ComfyUnavailable(RuntimeError):
@@ -39,6 +47,112 @@ class ComfyGenerationCancelled(ComfyGenerationError):
 
 class ComfyPromptUnavailable(ValueError):
     pass
+
+
+def load_workflow_registry(workflow_root=WORKFLOW_ROOT):
+    workflow_root = Path(workflow_root).resolve()
+    registry_path = workflow_root / "workflow_registry.json"
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Registre ComfyUI invalide: {exc}") from exc
+
+    workflows = registry.get("workflows") if isinstance(registry, dict) else None
+    if not isinstance(workflows, dict):
+        raise ValueError("Le registre ComfyUI doit contenir un objet workflows")
+
+    validated = {}
+    for registry_id, raw_entry in workflows.items():
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"Workflow invalide: {registry_id}")
+        entry = copy.deepcopy(raw_entry)
+        workflow_id = str(entry.get("id") or registry_id).strip()
+        if workflow_id != str(registry_id) or not re.fullmatch(r"[A-Za-z0-9_.-]+", workflow_id):
+            raise ValueError(f"Identifiant de workflow invalide: {registry_id}")
+        filename = str(entry.get("filename") or "").strip()
+        if not filename or Path(filename).name != filename or Path(filename).suffix.lower() != ".json":
+            raise ValueError(f"Fichier de workflow invalide: {workflow_id}")
+        template_path = (workflow_root / filename).resolve()
+        if template_path.parent != workflow_root:
+            raise ValueError(f"Chemin de workflow non autorise: {workflow_id}")
+        mode = str(entry.get("mode") or "").lower()
+        if mode not in REGISTERED_WORKFLOW_MODES:
+            raise ValueError(f"Mode de workflow invalide: {workflow_id}")
+        try:
+            template = json.loads(template_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Workflow {workflow_id} invalide: {exc}") from exc
+        if not isinstance(template, dict):
+            raise ValueError(f"Le workflow {workflow_id} doit etre un prompt API ComfyUI")
+
+        entry["id"] = workflow_id
+        entry["mode"] = mode
+        entry["output_kind"] = str(entry.get("output_kind") or "image").lower()
+        entry["prompt"] = _validate_registry_node(template, workflow_id, entry.get("prompt"), "prompt")
+        entry["output"] = _validate_registry_node(template, workflow_id, entry.get("output"), "output")
+        if entry["output_kind"] not in {"image", "video"}:
+            raise ValueError(f"Type de sortie invalide: {workflow_id}")
+        if mode in {"i2i", "i2v"}:
+            entry["input_image"] = _validate_registry_node(
+                template, workflow_id, entry.get("input_image"), "input_image"
+            )
+        elif entry.get("input_image") is not None:
+            entry["input_image"] = _validate_registry_node(
+                template, workflow_id, entry.get("input_image"), "input_image"
+            )
+        if entry.get("seed") is not None:
+            entry["seed"] = _validate_registry_node(template, workflow_id, entry.get("seed"), "seed")
+        entry["preview"] = [
+            _validate_registry_node(template, workflow_id, node_id, "preview")
+            for node_id in (entry.get("preview") or [])
+        ]
+        entry["dimension_nodes"] = [
+            _validate_registry_node(template, workflow_id, node_id, "dimension_nodes")
+            for node_id in (entry.get("dimension_nodes") or [])
+        ]
+        validated[workflow_id] = {"config": entry, "template": template}
+    return validated
+
+
+def _validate_registry_node(template, workflow_id, node_id, field):
+    if node_id in (None, ""):
+        raise ValueError(f"Node {field} manquant pour {workflow_id}")
+    node_id = str(node_id)
+    if node_id not in template or not isinstance(template[node_id], dict):
+        raise ValueError(f"Node {field} {node_id} introuvable dans {workflow_id}")
+    return node_id
+
+
+def list_registered_workflows(workflow_root=WORKFLOW_ROOT):
+    items = [
+        {
+            "id": CURRENT_WORKFLOW_ID,
+            "label": "Workflow de l'image actuelle",
+            "mode": "current",
+            "output_kind": "image",
+        }
+    ]
+    for item in load_workflow_registry(workflow_root).values():
+        config = item["config"]
+        items.append(
+            {
+                "id": config["id"],
+                "label": config.get("label") or config["id"],
+                "mode": config["mode"],
+                "output_kind": config["output_kind"],
+            }
+        )
+    return items
+
+
+def get_registered_workflow(workflow_id, workflow_root=WORKFLOW_ROOT):
+    workflow_id = str(workflow_id or CURRENT_WORKFLOW_ID)
+    if workflow_id == CURRENT_WORKFLOW_ID:
+        return None
+    item = load_workflow_registry(workflow_root).get(workflow_id)
+    if not item:
+        raise ValueError(f"Workflow ComfyUI inconnu: {workflow_id}")
+    return copy.deepcopy(item)
 
 
 class ComfyClient:
@@ -353,6 +467,9 @@ def build_edit_options(detail, lora_catalog):
     steps = find_steps(active_nodes)
     references = reference_options(prompt, workflow)
     return {
+        "workflow_id": CURRENT_WORKFLOW_ID,
+        "mode": "current",
+        "output_kind": "image",
         "prompt": find_prompt_text(active_nodes, prompt_node_ids) or metadata.get("prompt") or "",
         "prompt_node_ids": prompt_node_ids,
         "seed": seed,
@@ -361,7 +478,86 @@ def build_edit_options(detail, lora_catalog):
         "references": references,
         "images": image_options(nodes, workflow_nodes, workflow_links, bypassed_ids),
         "lora_catalog": lora_catalog,
+        "capabilities": {
+            "prompt": True,
+            "seed": seed is not None,
+            "steps": steps is not None,
+            "loras": True,
+            "references": True,
+        },
     }
+
+
+def build_registered_edit_options(detail, lora_catalog, workflow_id, workflow_root=WORKFLOW_ROOT):
+    item = get_registered_workflow(workflow_id, workflow_root)
+    config = item["config"]
+    prompt = item["template"]
+    nodes = normalize_prompt_nodes(prompt)
+    prompt_node = nodes[config["prompt"]]
+    template_prompt = _node_text_value(prompt_node) or ""
+    if config["mode"] == "i2v":
+        source_prompt = str((detail.get("metadata") or {}).get("prompt") or "").strip()
+        prompt_text = append_i2v_idle_suffix(source_prompt)
+    else:
+        prompt_text = template_prompt
+    seed = _registered_seed_value(nodes, config)
+    steps = find_steps(nodes)
+    loras = lora_options(nodes, {}, set())
+    return {
+        "workflow_id": config["id"],
+        "mode": config["mode"],
+        "output_kind": config["output_kind"],
+        "prompt": prompt_text,
+        "prompt_node_ids": [config["prompt"]],
+        "seed": None if seed is None else str(seed),
+        "steps": steps,
+        "loras": loras,
+        "references": [],
+        "images": [],
+        "lora_catalog": lora_catalog,
+        "capabilities": {
+            "prompt": True,
+            "seed": seed is not None,
+            "steps": steps is not None,
+            "loras": bool(loras),
+            "references": False,
+        },
+    }
+
+
+def append_i2v_idle_suffix(prompt_text):
+    prompt_text = str(prompt_text or "").strip()
+    if I2V_IDLE_PROMPT_SUFFIX.lower() in prompt_text.lower():
+        return prompt_text
+    return f"{prompt_text}, {I2V_IDLE_PROMPT_SUFFIX}" if prompt_text else I2V_IDLE_PROMPT_SUFFIX
+
+
+def _node_text_value(node):
+    inputs = node.get("inputs") or {}
+    for key in ("text", "prompt", "value"):
+        value = inputs.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _set_node_text(node, value):
+    inputs = node.setdefault("inputs", {})
+    for key in ("text", "prompt", "value"):
+        if key in inputs and not isinstance(inputs.get(key), list):
+            inputs[key] = value
+            return
+    raise ValueError("Le node de prompt mappe ne contient pas de champ texte")
+
+
+def _registered_seed_value(nodes, config):
+    if config.get("seed"):
+        node = nodes.get(config["seed"], {})
+        for key in ("seed", "seed_noise", "noise_seed"):
+            value = (node.get("inputs") or {}).get(key)
+            if not isinstance(value, list) and value is not None:
+                return value
+    return current_seed(nodes)
 
 
 def reference_options(prompt, workflow):
@@ -376,7 +572,27 @@ def patch_prompt(detail, payload, uploaded_images=None, rng=None):
     return patched, info
 
 
-def patch_prompt_and_workflow(detail, payload, uploaded_images=None, rng=None):
+def patch_prompt_and_workflow(
+    detail,
+    payload,
+    uploaded_images=None,
+    rng=None,
+    source_image_name=None,
+    source_filename=None,
+    workflow_root=WORKFLOW_ROOT,
+):
+    workflow_id = str(payload.get("workflow_id") or CURRENT_WORKFLOW_ID)
+    if workflow_id != CURRENT_WORKFLOW_ID:
+        return patch_registered_prompt(
+            detail,
+            payload,
+            workflow_id,
+            source_image_name=source_image_name,
+            source_filename=source_filename,
+            rng=rng,
+            workflow_root=workflow_root,
+        )
+
     metadata = detail.get("metadata") or {}
     prompt = loads_json(metadata.get("raw_prompt_json"))
     workflow = loads_json(metadata.get("raw_workflow_json"))
@@ -460,7 +676,130 @@ def patch_prompt_and_workflow(detail, payload, uploaded_images=None, rng=None):
             raise ValueError("Le workflow visuel ComfyUI est requis pour ajouter un LoRA")
         insert_new_loras(patched, patched_workflow, new_loras)
 
-    return patched, patched_workflow, {"seed": seed}
+    return patched, patched_workflow, {
+        "seed": seed,
+        "workflow_id": CURRENT_WORKFLOW_ID,
+        "mode": "current",
+        "output_kind": None,
+        "output_node": None,
+        "preview_nodes": [],
+    }
+
+
+def patch_registered_prompt(
+    detail,
+    payload,
+    workflow_id,
+    source_image_name=None,
+    source_filename=None,
+    rng=None,
+    workflow_root=WORKFLOW_ROOT,
+):
+    item = get_registered_workflow(workflow_id, workflow_root)
+    config = item["config"]
+    patched = copy.deepcopy(item["template"])
+    nodes = normalize_prompt_nodes(patched)
+
+    prompt_text = str(payload.get("prompt") or "").strip()
+    if config["mode"] == "i2v":
+        prompt_text = append_i2v_idle_suffix(prompt_text)
+    if prompt_text:
+        _set_node_text(nodes[config["prompt"]], prompt_text)
+
+    steps = payload.get("steps")
+    if steps not in (None, ""):
+        apply_steps(nodes, int(steps))
+
+    seed = _registered_seed_value(nodes, config)
+    if payload.get("seed_mode") == "random" or seed is None:
+        seed = (rng or random.SystemRandom()).randint(0, MAX_SEED)
+    if config.get("seed"):
+        seed_node = nodes[config["seed"]]
+        seed_inputs = seed_node.setdefault("inputs", {})
+        seed_key = next(
+            (key for key in ("seed", "seed_noise", "noise_seed") if key in seed_inputs),
+            "seed",
+        )
+        seed_inputs[seed_key] = seed
+        seed_node["is_changed"] = [seed]
+    else:
+        apply_seed(nodes, seed)
+
+    _patch_existing_loras(nodes, payload.get("loras") or [])
+
+    if config["mode"] in {"i2i", "i2v"}:
+        if not source_image_name:
+            raise ValueError("L'image source n'a pas pu etre envoyee a ComfyUI")
+        input_node = nodes[config["input_image"]]
+        input_node.setdefault("inputs", {})["image"] = source_image_name
+
+    if config["mode"] == "i2v":
+        width = detail.get("width")
+        height = detail.get("height")
+        target_width, target_height = i2v_dimensions(width, height, config)
+        for node_id in config.get("dimension_nodes") or []:
+            dimension_inputs = nodes[node_id].setdefault("inputs", {})
+            dimension_inputs["width"] = target_width
+            dimension_inputs["height"] = target_height
+        output_inputs = nodes[config["output"]].setdefault("inputs", {})
+        output_inputs["filename_prefix"] = f"video/{video_output_stem(source_filename)}_i2v"
+
+    return patched, None, {
+        "seed": seed,
+        "workflow_id": config["id"],
+        "mode": config["mode"],
+        "output_kind": config["output_kind"],
+        "output_node": config["output"],
+        "preview_nodes": list(config.get("preview") or []),
+    }
+
+
+def _patch_existing_loras(nodes, requested_loras):
+    for lora in requested_loras:
+        if not isinstance(lora, dict) or lora.get("new") or not lora.get("node_id"):
+            continue
+        node = nodes.get(str(lora.get("node_id")))
+        if not node or node.get("class_type") != "LoraLoaderModelOnly":
+            continue
+        name = str(lora.get("lora_name") or current_lora_name(node) or "").strip()
+        if not name or _is_blacklisted_lora(name):
+            continue
+        strength = float(lora.get("strength_model", current_lora_strength(node) or 1))
+        if not lora.get("enabled", True):
+            strength = 0.0
+        inputs = node.setdefault("inputs", {})
+        inputs["lora_name"] = name
+        inputs["strength_model"] = strength
+
+
+def i2v_dimensions(width, height, config):
+    try:
+        width = int(width)
+        height = int(height)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Dimensions de l'image source indisponibles") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("Dimensions de l'image source invalides")
+    target_min = max(1, int(config.get("target_min_dimension") or 480))
+    multiple = max(1, int(config.get("round_larger_dimension_to") or 16))
+    if width == height:
+        return target_min, target_min
+    scale = target_min / min(width, height)
+    larger = max(width, height) * scale
+    rounding_mode = str(config.get("rounding_mode") or "nearest")
+    if rounding_mode == "up":
+        rounded_larger = int(-(-larger // multiple) * multiple)
+    elif rounding_mode == "down":
+        rounded_larger = max(multiple, int(larger // multiple) * multiple)
+    else:
+        rounded_larger = max(multiple, int(round(larger / multiple)) * multiple)
+    return (rounded_larger, target_min) if width > height else (target_min, rounded_larger)
+
+
+def video_output_stem(filename):
+    stem = Path(str(filename or "image")).stem.strip() or "image"
+    stem = re.sub(r"[^\w.-]+", "_", stem, flags=re.UNICODE).strip("._")
+    return stem or "image"
 
 
 def apply_reference_configuration(prompt, workflow, requested_references):
@@ -1326,10 +1665,17 @@ def has_active_path(start_id, sink_ids, graph):
     return False
 
 
-def extract_history_filenames(history):
+def extract_history_filenames(history, output_node=None, output_kind=None):
     filenames = []
-    for node_output in (history.get("outputs") or {}).values():
-        for key in ("images", "gifs"):
+    outputs = history.get("outputs") or {}
+    if output_node is not None:
+        node_output = outputs.get(str(output_node)) or outputs.get(output_node) or {}
+        node_outputs = [node_output]
+    else:
+        node_outputs = outputs.values()
+    keys = ("videos",) if output_kind == "video" else ("images", "gifs", "videos")
+    for node_output in node_outputs:
+        for key in keys:
             for item in node_output.get(key) or []:
                 filename = item.get("filename")
                 if filename:
