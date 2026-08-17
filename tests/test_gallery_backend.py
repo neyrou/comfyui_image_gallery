@@ -45,6 +45,14 @@ def create_oriented_jpeg(path):
     image.save(path, exif=exif)
 
 
+def create_camera_jpeg(path):
+    image = Image.new("RGB", (40, 20), (20, 40, 60))
+    exif = Image.Exif()
+    exif[271] = "Google"
+    exif[272] = "Pixel 8a"
+    image.save(path, exif=exif)
+
+
 class GalleryBackendTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -106,6 +114,144 @@ class GalleryBackendTests(unittest.TestCase):
                 ).fetchall()
             }
         self.assertEqual(scanned_albums, {"output"})
+
+    def test_input_scan_hides_all_clipspace_files_without_deleting_them(self):
+        input_root = self.images_root / "input"
+        input_root.mkdir()
+        original = input_root / "ordinary.png"
+        hidden = input_root / "clipspace-future-artifact.png"
+        user_clipspace = self.images_root / "Celine" / "clipspace-kept.png"
+        create_png(original)
+        create_png(hidden, color=(30, 50, 70))
+        create_png(user_clipspace, color=(70, 50, 30))
+
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        legacy = input_root / "clipspace-legacy.png"
+        original.rename(legacy)
+        with connect_db(self.db_path) as conn:
+            input_album = get_album_by_name(conn, "input")
+            conn.execute(
+                """
+                UPDATE album_photos
+                SET relative_path=?, filename=?
+                WHERE album_id=? AND relative_path=?
+                """,
+                (legacy.name, legacy.name, input_album["id"], original.name),
+            )
+
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            _, input_photos, input_total = list_gallery_photos(conn, "input")
+            _, user_photos, user_total = list_gallery_photos(conn, "Celine")
+            legacy_row = conn.execute(
+                """
+                SELECT ap.is_missing
+                FROM album_photos ap
+                JOIN albums a ON a.id=ap.album_id
+                WHERE a.name='input' AND ap.relative_path=?
+                """,
+                (legacy.name,),
+            ).fetchone()
+        self.assertEqual(input_photos, [])
+        self.assertEqual(input_total, 0)
+        self.assertEqual(user_total, 1)
+        self.assertEqual(user_photos[0]["filename"], user_clipspace.name)
+        self.assertEqual(legacy_row["is_missing"], 1)
+        self.assertTrue(hidden.is_file())
+        self.assertTrue(legacy.is_file())
+
+    def test_scan_ignores_non_image_file_with_image_extension_without_breaking_album(self):
+        input_root = self.images_root / "input"
+        input_root.mkdir()
+        invalid = input_root / "ChatGPT Image.png"
+        invalid.write_text(
+            '<?xml version="1.0"?><Error><Code>AuthenticationFailed</Code></Error>',
+            encoding="utf-8-sig",
+        )
+
+        summary = scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            album = get_album_by_name(conn, "input")
+            _, photos, total = list_gallery_photos(conn, "input")
+            membership = conn.execute(
+                """
+                SELECT ap.is_missing
+                FROM album_photos ap
+                WHERE ap.album_id=? AND ap.relative_path=?
+                """,
+                (album["id"], invalid.name),
+            ).fetchone()
+        self.assertEqual(summary["errors"], [])
+        self.assertIsNone(album["scan_error"])
+        self.assertEqual(photos, [])
+        self.assertEqual(total, 0)
+        self.assertEqual(membership["is_missing"], 1)
+        self.assertTrue(invalid.is_file())
+
+    def test_metadata_scan_tags_authentic_and_exposes_input_only_badges(self):
+        input_root = self.images_root / "input"
+        input_root.mkdir()
+        authentic_path = input_root / "1000016904.jpg"
+        comfy_path = input_root / "ComfyUI_00001_.png"
+        create_camera_jpeg(authentic_path)
+        prompt = __import__("json").dumps(
+            {"1": {"class_type": "KSampler", "inputs": {}}}
+        )
+        create_png(comfy_path, prompt=prompt)
+
+        scan_albums(
+            self.db_path,
+            self.images_root,
+            self.thumbnails,
+            scan_metadata=True,
+        )
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+
+        with connect_db(self.db_path) as conn:
+            _, photos, total = list_gallery_photos(conn, "input")
+            by_name = {photo["filename"]: photo for photo in photos}
+            authentic_id = by_name[authentic_path.name]["id"]
+            authentic_source = conn.execute(
+                """
+                SELECT pt.source
+                FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                WHERE pt.photo_id=? AND t.name='authentique'
+                """,
+                (authentic_id,),
+            ).fetchone()["source"]
+            detail = get_photo_detail(conn, by_name[comfy_path.name]["id"])
+
+            set_photo_tags(conn, authentic_id, ["authentique"])
+            gallery_db_module.sync_authentic_tag(conn, authentic_id, False)
+            manual_source = conn.execute(
+                """
+                SELECT pt.source
+                FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+                WHERE pt.photo_id=? AND t.name='authentique'
+                """,
+                (authentic_id,),
+            ).fetchone()["source"]
+
+        self.assertEqual(total, 2)
+        self.assertTrue(by_name[authentic_path.name]["is_authentic"])
+        self.assertFalse(by_name[authentic_path.name]["is_comfyui"])
+        self.assertTrue(by_name[comfy_path.name]["is_comfyui"])
+        self.assertFalse(by_name[comfy_path.name]["is_authentic"])
+        self.assertTrue(detail["is_comfyui"])
+        self.assertEqual(authentic_source, "metadata_auto")
+        self.assertEqual(manual_source, "manual")
+
+        client = app_module.app.test_client()
+        input_html = client.get("/?album=input").get_data(as_text=True)
+        output_html = client.get("/?album=output").get_data(as_text=True)
+        self.assertIn('class="provenance-badge authentic-badge"', input_html)
+        self.assertIn('class="provenance-badge comfyui-badge"', input_html)
+        self.assertNotIn('class="provenance-badge authentic-badge"', output_html)
+        self.assertNotIn('class="provenance-badge comfyui-badge"', output_html)
 
     def test_thumbnail_applies_exif_orientation_and_can_be_refreshed(self):
         image_path = self.images_root / "output" / "oriented.jpg"

@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -9,6 +10,10 @@ LORA_BLACKLIST_EXACT = {
     "qwen-image-edit-2511-lightning-4steps-v1.0-fp32.safetensors",
 }
 LORA_BLACKLIST_CONTAINS = ("lightning",)
+AUTHENTIC_FILENAME_PATTERN = re.compile(
+    r"^(?:PXL_|IMG[-_]|DSC[-_]|DSCN|DSCF|MVIMG_|CAM_|CAMERA_|WEBCAM_)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -21,6 +26,8 @@ class ExtractedMetadata:
     loras: list[dict] = field(default_factory=list)
     raw_prompt: dict | list | str | None = None
     raw_workflow: dict | list | str | None = None
+    is_comfyui: bool = False
+    is_authentic: bool = False
 
 
 def extract_from_image(image_path: str | Path) -> ExtractedMetadata:
@@ -28,7 +35,16 @@ def extract_from_image(image_path: str | Path) -> ExtractedMetadata:
     with Image.open(image_path) as image:
         prompt_raw = image.info.get("prompt")
         workflow_raw = image.info.get("workflow")
-    return extract_from_comfy_payloads(prompt_raw, workflow_raw)
+        exif = image.getexif()
+        has_camera_exif = any(
+            str(exif.get(tag_id) or "").strip()
+            for tag_id in (271, 272)  # Make, Model
+        )
+    metadata = extract_from_comfy_payloads(prompt_raw, workflow_raw)
+    metadata.is_authentic = not metadata.is_comfyui and (
+        has_camera_exif or bool(AUTHENTIC_FILENAME_PATTERN.match(image_path.name))
+    )
+    return metadata
 
 
 def extract_from_prompt_json(prompt_json: str | dict, workflow_json: str | dict | None = None) -> ExtractedMetadata:
@@ -52,6 +68,11 @@ def extract_from_comfy_payloads(prompt_payload, workflow_payload=None) -> Extrac
     }
 
     metadata = ExtractedMetadata(raw_prompt=prompt, raw_workflow=workflow)
+    metadata.is_comfyui = bool(prompt_nodes) or bool(
+        workflow_nodes
+        and isinstance(workflow, dict)
+        and isinstance(workflow.get("links"), list)
+    )
     metadata.prompt = _extract_prompt(active_prompt_nodes)
     metadata.unet_name = _extract_unet_name(active_prompt_nodes)
     metadata.seed_noise, metadata.seed = _extract_seed(active_prompt_nodes)

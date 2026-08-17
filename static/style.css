@@ -427,6 +427,49 @@ button:disabled {
     transform: scale(1.04);
 }
 
+.provenance-badges {
+    position: absolute;
+    z-index: 5;
+    top: 8px;
+    left: 8px;
+    display: inline-flex;
+    gap: 6px;
+    pointer-events: none;
+}
+
+.selection-mode .provenance-badges {
+    left: 44px;
+}
+
+.provenance-badge {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border: 2px solid rgba(255, 255, 255, 0.9);
+    border-radius: 50%;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.42);
+}
+
+.authentic-badge {
+    color: white;
+    background: #e97816;
+}
+
+.authentic-badge svg {
+    width: 20px;
+    height: 20px;
+    fill: currentColor;
+}
+
+.comfyui-badge {
+    color: #ffdc2f;
+    background: #1769c2;
+    font-size: 20px;
+    font-weight: 900;
+    line-height: 1;
+}
+
 .video-badge {
     position: absolute;
     z-index: 5;

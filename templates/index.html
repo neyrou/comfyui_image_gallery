@@ -124,6 +124,18 @@
                     <li class="gallery-item" data-gallery-photo-id="{{ photo.id }}">
                         <button class="thumbnail" type="button" data-photo-id="{{ photo.id }}">
                             <img src="{{ photo.thumbnail_url }}" alt="{{ photo.filename }}" loading="lazy">
+                            {% if selected_album.type == 'input' and (photo.is_authentic or photo.is_comfyui) %}
+                                <span class="provenance-badges">
+                                    {% if photo.is_authentic %}
+                                        <span class="provenance-badge authentic-badge" title="Photo authentique" aria-label="Photo authentique">
+                                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4.5 10.3 3h3.4L15 4.5h3A2.5 2.5 0 0 1 20.5 7v10A2.5 2.5 0 0 1 18 19.5H6A2.5 2.5 0 0 1 3.5 17V7A2.5 2.5 0 0 1 6 4.5h3Zm2.1 11.2 5-5-1.4-1.4-3.6 3.6-1.8-1.8-1.4 1.4 3.2 3.2Z"></path></svg>
+                                        </span>
+                                    {% endif %}
+                                    {% if photo.is_comfyui %}
+                                        <span class="provenance-badge comfyui-badge" title="Image générée par ComfyUI" aria-label="Image générée par ComfyUI">C</span>
+                                    {% endif %}
+                                </span>
+                            {% endif %}
                             {% if photo.media_type == 'video' %}
                                 <span class="video-badge" title="Vid&eacute;o" aria-label="Vid&eacute;o">
                                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6.5v11l9-5.5-9-5.5Z"></path></svg>

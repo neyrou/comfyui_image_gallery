@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from face_recognition import FACE_ATTRIBUTES_VERSION
 from metadata_extractor import extract_from_image
@@ -28,6 +28,8 @@ CROSSDRESSING_TAG_NAME = "crossdressing"
 CROSSDRESSING_MACHINE_KEY = "rule:crossdressing"
 LEGACY_CROSSDRESS_TAG_NAME = "crossdress"
 LEGACY_CROSSDRESS_MACHINE_KEY = "rule:crossdress"
+AUTHENTIC_TAG_NAME = "authentique"
+AUTHENTIC_TAG_SOURCE = "metadata_auto"
 FEMININE_TAG_FAMILY_PATTERNS = {
     "breast": re.compile(r"\bbreasts?\b"),
     "cleavage": re.compile(r"\bcleavage\b"),
@@ -151,6 +153,7 @@ def init_db(db_path):
                 seed TEXT,
                 raw_prompt_json TEXT,
                 raw_workflow_json TEXT,
+                is_comfyui INTEGER NOT NULL DEFAULT 0,
                 scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -325,6 +328,12 @@ def init_db(db_path):
             "TEXT NOT NULL DEFAULT 'image' CHECK(media_type IN ('image', 'video'))",
         )
         _ensure_column(conn, "photo_metadata", "unet_name", "TEXT")
+        _ensure_column(
+            conn,
+            "photo_metadata",
+            "is_comfyui",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         _ensure_column(
             conn,
             "face_identities",
@@ -575,7 +584,10 @@ def scan_album(
     try:
         for image_path in _iter_image_files(album_path):
             _raise_if_scan_cancelled(cancel_callback)
+            if album["type"] == "input" and image_path.name.lower().startswith("clipspace-"):
+                continue
             relative_path = None
+            photo_id = None
             try:
                 relative_path = image_path.relative_to(album_path).as_posix()
                 stat = image_path.stat()
@@ -657,6 +669,31 @@ def scan_album(
                         skipped=skipped,
                         message=f"{album['name']}: {count} photos",
                     )
+            except UnidentifiedImageError as exc:
+                if relative_path is not None:
+                    conn.execute(
+                        """
+                        UPDATE album_photos
+                        SET is_missing=1, updated_at=CURRENT_TIMESTAMP
+                        WHERE album_id=? AND relative_path=?
+                        """,
+                        (album["id"], relative_path),
+                    )
+                    seen_keys.difference_update(
+                        [key for key in seen_keys if key[1] == relative_path]
+                    )
+                print(
+                    f"[scan] {album['name']} ignored non-image file {image_path}: {exc}",
+                    flush=True,
+                )
+                _report_scan_progress(
+                    progress_callback,
+                    event="file_ignored",
+                    album=album["name"],
+                    file=str(image_path),
+                    error=str(exc),
+                    album_photos=count,
+                )
             except (OSError, ValueError) as exc:
                 error = str(exc)
                 if relative_path is not None:
@@ -932,8 +969,11 @@ def rescan_metadata(conn, photo_id, image_path):
     conn.execute("DELETE FROM photo_used_images WHERE photo_id=?", (photo_id,))
     conn.execute(
         """
-        INSERT INTO photo_metadata(photo_id, prompt, unet_name, seed_noise, seed, raw_prompt_json, raw_workflow_json, scanned_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO photo_metadata(
+            photo_id, prompt, unet_name, seed_noise, seed,
+            raw_prompt_json, raw_workflow_json, is_comfyui, scanned_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(photo_id) DO UPDATE SET
             prompt=excluded.prompt,
             unet_name=excluded.unet_name,
@@ -941,6 +981,7 @@ def rescan_metadata(conn, photo_id, image_path):
             seed=excluded.seed,
             raw_prompt_json=excluded.raw_prompt_json,
             raw_workflow_json=excluded.raw_workflow_json,
+            is_comfyui=excluded.is_comfyui,
             scanned_at=CURRENT_TIMESTAMP
         """,
         (
@@ -951,6 +992,7 @@ def rescan_metadata(conn, photo_id, image_path):
             _string_or_none(extracted.seed),
             _json_or_none(extracted.raw_prompt),
             _json_or_none(extracted.raw_workflow),
+            int(extracted.is_comfyui),
         ),
     )
     for lora in extracted.loras:
@@ -962,6 +1004,7 @@ def rescan_metadata(conn, photo_id, image_path):
             (photo_id, lora.get("node_id"), lora["lora_name"], lora.get("strength_model")),
         )
     sync_lora_tags(conn, photo_id, extracted.loras)
+    sync_authentic_tag(conn, photo_id, extracted.is_authentic)
     for image_name in extracted.used_images:
         conn.execute(
             "INSERT OR IGNORE INTO photo_used_images(photo_id, image_name) VALUES (?, ?)",
@@ -977,6 +1020,34 @@ def rescan_metadata(conn, photo_id, image_path):
             )
     sync_crossdress_tag(conn, photo_id)
     return extracted
+
+
+def sync_authentic_tag(conn, photo_id, is_authentic):
+    tag = conn.execute(
+        "SELECT id FROM tags WHERE name=?",
+        (AUTHENTIC_TAG_NAME,),
+    ).fetchone()
+    if not is_authentic:
+        if tag:
+            conn.execute(
+                "DELETE FROM photo_tags WHERE photo_id=? AND tag_id=? AND source=?",
+                (photo_id, tag["id"], AUTHENTIC_TAG_SOURCE),
+            )
+        return
+
+    tag = tag or upsert_tag(conn, AUTHENTIC_TAG_NAME)
+    conn.execute(
+        """
+        INSERT INTO photo_tags(photo_id, tag_id, source)
+        VALUES (?, ?, ?)
+        ON CONFLICT(photo_id, tag_id) DO UPDATE SET
+            source=CASE
+                WHEN photo_tags.source=? THEN excluded.source
+                ELSE photo_tags.source
+            END
+        """,
+        (photo_id, tag["id"], AUTHENTIC_TAG_SOURCE, AUTHENTIC_TAG_SOURCE),
+    )
 
 
 def sync_lora_tags(conn, photo_id, loras):
@@ -1233,11 +1304,13 @@ def list_gallery_photos(
                a.name AS album_name,
                fav.has_output, fav.has_user, fav.album_count, fav.user_album_count,
                GROUP_CONCAT(DISTINCT t.name) AS tags,
+               COALESCE(pm.is_comfyui, 0) AS is_comfyui,
                pia.analysis_level,
                ({effective_rank_sql}) AS effective_sensitivity_rank
         FROM album_photos ap
         JOIN photos p ON p.id = ap.photo_id
         JOIN albums a ON a.id = ap.album_id
+        LEFT JOIN photo_metadata pm ON pm.photo_id=p.id
         LEFT JOIN photo_image_analyses pia ON pia.photo_id=p.id
         LEFT JOIN photo_tags pt ON pt.photo_id = p.id
         LEFT JOIN tags t ON t.id = pt.tag_id
@@ -1378,6 +1451,7 @@ def serialize_gallery_photo(row):
     album_name = data["album_name"]
     relative_path = data["relative_path"]
     checksum = data["checksum"]
+    tags = _split_tags(data.get("tags"))
     return {
         "id": data["id"],
         "checksum": checksum,
@@ -1388,7 +1462,9 @@ def serialize_gallery_photo(row):
         "width": data["width"],
         "height": data["height"],
         "mtime": data["mtime"],
-        "tags": _split_tags(data.get("tags")),
+        "tags": tags,
+        "is_authentic": AUTHENTIC_TAG_NAME in tags,
+        "is_comfyui": bool(data.get("is_comfyui")),
         "analysis_level": data.get("analysis_level"),
         "effective_sensitivity": sensitivity_from_rank(data.get("effective_sensitivity_rank")),
         "favorite": bool(data["has_output"] and data["has_user"]),
@@ -1493,6 +1569,8 @@ def get_photo_detail(conn, photo_id):
         "original_url": first_available["original_url"] if first_available else None,
         "memberships": serialized_memberships,
         "tags": [dict(row) for row in tags],
+        "is_authentic": any(row["name"] == AUTHENTIC_TAG_NAME for row in tags),
+        "is_comfyui": bool(metadata["is_comfyui"]) if metadata else False,
         "metadata": dict(metadata) if metadata else None,
         "loras": [dict(row) for row in loras],
         "used_images": [row["image_name"] for row in used_images],

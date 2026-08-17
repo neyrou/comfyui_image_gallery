@@ -123,6 +123,24 @@ function videoBadgeHtml() {
     `;
 }
 
+function provenanceBadgesHtml(photo) {
+    if (state.selectedAlbum?.type !== "input" || (!photo.is_authentic && !photo.is_comfyui)) {
+        return "";
+    }
+    return `
+        <span class="provenance-badges">
+            ${photo.is_authentic ? `
+                <span class="provenance-badge authentic-badge" title="Photo authentique" aria-label="Photo authentique">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4.5 10.3 3h3.4L15 4.5h3A2.5 2.5 0 0 1 20.5 7v10A2.5 2.5 0 0 1 18 19.5H6A2.5 2.5 0 0 1 3.5 17V7A2.5 2.5 0 0 1 6 4.5h3Zm2.1 11.2 5-5-1.4-1.4-3.6 3.6-1.8-1.8-1.4 1.4 3.2 3.2Z"></path></svg>
+                </span>
+            ` : ""}
+            ${photo.is_comfyui ? `
+                <span class="provenance-badge comfyui-badge" title="Image générée par ComfyUI" aria-label="Image générée par ComfyUI">C</span>
+            ` : ""}
+        </span>
+    `;
+}
+
 function tagsFromInput(value) {
     return value.split(",").map((tag) => tag.trim()).filter(Boolean);
 }
@@ -874,6 +892,8 @@ function galleryPhotoFromDetail(photo) {
         width: photo.width,
         height: photo.height,
         tags: photo.tags || [],
+        is_authentic: Boolean(photo.is_authentic),
+        is_comfyui: Boolean(photo.is_comfyui),
         favorite: Boolean(photo.memberships.some((item) => item.type === "output") && photo.memberships.some((item) => item.type === "user")),
         album_count: photo.memberships.length,
         user_album_count: photo.memberships.filter((item) => item.type === "user").length,
@@ -921,6 +941,7 @@ function renderGalleryItem(photo) {
         <li class="gallery-item" data-gallery-photo-id="${photo.id}">
             <button class="thumbnail" type="button" data-photo-id="${photo.id}">
                 <img src="${photo.thumbnail_url}" alt="${escapeHtml(photo.filename)}" loading="lazy">
+                ${provenanceBadgesHtml(photo)}
                 ${photo.media_type === "video" ? videoBadgeHtml() : ""}
                 ${photo.favorite ? `
                     <span class="favorite-badge" title="Present dans output et dans un album user">
@@ -1274,6 +1295,7 @@ async function rescanCurrentMetadata() {
     const done = setBusy($("#rescan-metadata-button"), "Scan...");
     try {
         const data = await fetchJson(`/api/photos/${state.currentPhoto.id}/metadata/rescan`, { method: "POST", body: "{}" });
+        syncPhotoInCurrentGallery(data.photo);
         state.currentPhoto = data.photo;
         renderPhotoDetail(data.photo);
     } catch (error) {

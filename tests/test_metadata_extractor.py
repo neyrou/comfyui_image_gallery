@@ -1,8 +1,11 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from metadata_extractor import extract_from_prompt_json
+from PIL import Image, PngImagePlugin
+
+from metadata_extractor import extract_from_image, extract_from_prompt_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +68,39 @@ class MetadataExtractorTests(unittest.TestCase):
         metadata = extract_from_prompt_json(prompt, workflow)
 
         self.assertEqual([lora["lora_name"] for lora in metadata.loras], ["kept.safetensors"])
+
+    def test_detects_authentic_images_and_gives_comfyui_priority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            camera_path = root / "renamed-photo.jpg"
+            camera_exif = Image.Exif()
+            camera_exif[271] = "Google"
+            camera_exif[272] = "Pixel 8a"
+            Image.new("RGB", (16, 16)).save(camera_path, exif=camera_exif)
+
+            webcam_path = root / "webcam_2026-08-14_17-02-20.png"
+            Image.new("RGB", (16, 16)).save(webcam_path)
+
+            orientation_only_path = root / "renamed-export.jpg"
+            orientation_exif = Image.Exif()
+            orientation_exif[274] = 6
+            Image.new("RGB", (16, 16)).save(orientation_only_path, exif=orientation_exif)
+
+            comfy_path = root / "IMG_1234.png"
+            comfy_info = PngImagePlugin.PngInfo()
+            comfy_info.add_text(
+                "prompt",
+                json.dumps({"1": {"class_type": "KSampler", "inputs": {}}}),
+            )
+            Image.new("RGB", (16, 16)).save(comfy_path, pnginfo=comfy_info)
+
+            self.assertTrue(extract_from_image(camera_path).is_authentic)
+            self.assertTrue(extract_from_image(webcam_path).is_authentic)
+            self.assertFalse(extract_from_image(orientation_only_path).is_authentic)
+            comfy = extract_from_image(comfy_path)
+            self.assertTrue(comfy.is_comfyui)
+            self.assertFalse(comfy.is_authentic)
 
 
 if __name__ == "__main__":
