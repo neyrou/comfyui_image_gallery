@@ -272,6 +272,7 @@
                             <button type="button" data-album-action-open="move">deplacer vers...</button>
                             <button type="button" id="refresh-thumbnail-button">Rafra&icirc;chir la miniature</button>
                             <button type="button" id="comfy-generate-button" disabled>regenerer cette image</button>
+                            <button type="button" id="remove-photo-from-album-button" class="warning-menu-item" disabled>Supprimer de la galerie</button>
                             <button type="button" id="delete-photo-button" class="danger-menu-item">Supprimer</button>
                         </div>
                     </div>
@@ -407,7 +408,10 @@
         <div class="modal-backdrop" data-close-comfy></div>
         <section class="comfy-panel" role="dialog" aria-modal="true" aria-label="Generation ComfyUI">
             <div class="panel-header">
-                <h2>Generation ComfyUI</h2>
+                <div class="comfy-panel-title">
+                    <h2>Generation ComfyUI</h2>
+                    <span class="comfy-queue-count" id="comfy-queue-count">File ComfyUI : 0</span>
+                </div>
                 <button type="button" data-close-comfy>×</button>
             </div>
             <form id="comfy-form">

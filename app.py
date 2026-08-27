@@ -34,6 +34,7 @@ from gallery_db import (
     ALLOWED_ALBUM_TYPES,
     ALLOWED_LINK_TYPES,
     SENSITIVITY_LEVELS,
+    PhotoAlbumRemovalError,
     ScanCancelled,
     TagCategoryLocked,
     connect_db,
@@ -87,6 +88,7 @@ from gallery_db import (
     photo_ids_for_face_scope,
     rematch_photo_faces,
     replace_photo_faces,
+    remove_photo_from_album,
     set_face_setting,
     update_face_identity,
 )
@@ -110,9 +112,11 @@ FACE_ENGINE_FACTORY = InsightFaceEngine
 IMAGE_ANALYSIS_ENGINE_FACTORY = LocalImageAnalysisEngine
 SCAN_LOCK = threading.Lock()
 COMFY_JOB_LOCK = threading.Lock()
+COMFY_SUBMIT_CONDITION = threading.Condition()
 FACE_WORKER_LOCK = threading.Lock()
 FACE_ENGINE_LOCK = threading.Lock()
 COMFY_JOBS = {}
+COMFY_SUBMIT_QUEUE = []
 SCAN_QUEUE = []
 FACE_WORKER_THREAD = None
 FACE_ENGINE_INSTANCE = None
@@ -444,6 +448,27 @@ class ComfyJobAlreadyActive(RuntimeError):
         self.job = job
 
 
+def wait_for_comfy_submit_turn(job_id):
+    with COMFY_SUBMIT_CONDITION:
+        while not COMFY_SUBMIT_QUEUE or COMFY_SUBMIT_QUEUE[0] != job_id:
+            if comfy_job_cancel_requested(job_id):
+                if job_id in COMFY_SUBMIT_QUEUE:
+                    COMFY_SUBMIT_QUEUE.remove(job_id)
+                    COMFY_SUBMIT_CONDITION.notify_all()
+                return False
+            COMFY_SUBMIT_CONDITION.wait(timeout=0.1)
+        return True
+
+
+def release_comfy_submit_turn(job_id):
+    with COMFY_SUBMIT_CONDITION:
+        if COMFY_SUBMIT_QUEUE and COMFY_SUBMIT_QUEUE[0] == job_id:
+            COMFY_SUBMIT_QUEUE.pop(0)
+        elif job_id in COMFY_SUBMIT_QUEUE:
+            COMFY_SUBMIT_QUEUE.remove(job_id)
+        COMFY_SUBMIT_CONDITION.notify_all()
+
+
 def _comfy_job_snapshot(job):
     snapshot = {key: value for key, value in job.items() if key != "preview"}
     snapshot["preview_available"] = bool(job.get("preview"))
@@ -457,7 +482,7 @@ def create_comfy_job(photo_id, payload):
         "photo_id": photo_id,
         "active": True,
         "state": "preparing",
-        "message": "Preparation",
+        "message": "En attente de soumission",
         "prompt_id": None,
         "node": None,
         "node_title": None,
@@ -477,11 +502,16 @@ def create_comfy_job(photo_id, payload):
         "finished_at": None,
     }
     with COMFY_JOB_LOCK:
-        active_job = next((item for item in COMFY_JOBS.values() if item.get("active")), None)
-        if active_job:
-            raise ComfyJobAlreadyActive(_comfy_job_snapshot(active_job))
         COMFY_JOBS[job_id] = job
-    thread = threading.Thread(target=run_comfy_job, args=(job_id, photo_id, payload), daemon=True)
+    with COMFY_SUBMIT_CONDITION:
+        COMFY_SUBMIT_QUEUE.append(job_id)
+        COMFY_SUBMIT_CONDITION.notify_all()
+    thread = threading.Thread(
+        target=run_comfy_job,
+        args=(job_id, photo_id, payload),
+        daemon=True,
+        name=f"comfy-{job_id[:8]}",
+    )
     thread.start()
     return comfy_job_snapshot(job_id)
 
@@ -508,8 +538,21 @@ def current_comfy_job_snapshot():
         active_jobs = [job for job in COMFY_JOBS.values() if job.get("active")]
         if not active_jobs:
             return None
-        job = max(active_jobs, key=lambda item: item.get("started_at") or 0)
+        priorities = {"running": 0, "importing": 1, "queued": 2, "cancel_requested": 3, "preparing": 4}
+        job = min(
+            active_jobs,
+            key=lambda item: (priorities.get(item.get("state"), 5), item.get("started_at") or 0),
+        )
         return _comfy_job_snapshot(job)
+
+
+def active_comfy_job_snapshots():
+    with COMFY_JOB_LOCK:
+        jobs = sorted(
+            (job for job in COMFY_JOBS.values() if job.get("active")),
+            key=lambda item: item.get("started_at") or 0,
+        )
+        return [_comfy_job_snapshot(job) for job in jobs]
 
 
 def comfy_job_cancel_requested(job_id):
@@ -561,7 +604,11 @@ def comfy_job_preview(job_id):
 
 def run_comfy_job(job_id, photo_id, payload):
     client = get_comfy_client()
+    owns_submit_turn = False
     try:
+        if not wait_for_comfy_submit_turn(job_id):
+            raise ComfyGenerationCancelled("Generation annulee")
+        owns_submit_turn = True
         uploaded_images = {}
         patched_payload = deepcopy(payload)
         raise_if_comfy_job_cancelled(job_id)
@@ -641,12 +688,19 @@ def run_comfy_job(job_id, photo_id, payload):
                     updates["message"] = message
                 update_comfy_job(job_id, **updates)
 
+        def on_queued(prompt_id):
+            nonlocal owns_submit_turn
+            update_comfy_job(job_id, prompt_id=prompt_id, state="queued", message="En attente dans ComfyUI")
+            release_comfy_submit_turn(job_id)
+            owns_submit_turn = False
+
         prompt_id, history = client.run_prompt(
             prompt,
             workflow,
             job_id,
             progress_callback=on_progress,
             cancel_callback=lambda: comfy_job_cancel_requested(job_id),
+            queued_callback=on_queued,
         )
         raise_if_comfy_job_cancelled(job_id)
         output_filenames = extract_history_filenames(
@@ -710,6 +764,9 @@ def run_comfy_job(job_id, photo_id, payload):
             error=str(exc),
             finished_at=time.time(),
         )
+    finally:
+        if owns_submit_turn:
+            release_comfy_submit_turn(job_id)
 
 
 def validated_source_filename(detail, requested_filename=None):
@@ -1586,8 +1643,15 @@ def api_cancel_scan_job(job_id):
 
 @app.get("/api/comfy/status")
 def api_comfy_status():
-    available = get_comfy_client().is_available()
-    return jsonify({"ok": True, "available": available})
+    client = get_comfy_client()
+    available = client.is_available()
+    queue = None
+    if available:
+        try:
+            queue = client.queue_status()
+        except (AttributeError, ComfyUnavailable):
+            queue = None
+    return jsonify({"ok": True, "available": available, "queue": queue})
 
 
 @app.get("/api/comfy/workflows")
@@ -1758,10 +1822,7 @@ def api_comfy_generate(photo_id):
             return jsonify({"ok": False, "error": "La generation ComfyUI requiert une image source"}), 400
         if registered and registered["config"]["mode"] in {"i2i", "i2v"} and not detail.get("original_url"):
             return jsonify({"ok": False, "error": "Image source indisponible"}), 400
-    try:
-        job = create_comfy_job(photo_id, payload)
-    except ComfyJobAlreadyActive as exc:
-        return jsonify({"ok": False, "error": str(exc), "job": exc.job}), 409
+    job = create_comfy_job(photo_id, payload)
     return jsonify({"ok": True, "job": job}), 202
 
 
@@ -1867,7 +1928,13 @@ def api_comfy_input_preview():
 
 @app.get("/api/comfy/jobs/current")
 def api_current_comfy_job():
-    return jsonify({"ok": True, "job": current_comfy_job_snapshot()})
+    return jsonify(
+        {
+            "ok": True,
+            "job": current_comfy_job_snapshot(),
+            "jobs": active_comfy_job_snapshots(),
+        }
+    )
 
 
 @app.get("/api/comfy/jobs/<job_id>")
@@ -2114,6 +2181,26 @@ def api_delete_photo(photo_id):
             return jsonify({"ok": False, "error": "Photo not found"}), 404
         albums = list_albums(conn)
     return jsonify({"ok": True, "deleted": result, "albums": albums})
+
+
+@app.delete("/api/photos/<int:photo_id>/album-membership")
+def api_remove_photo_album_membership(photo_id):
+    ensure_ready()
+    payload = request.get_json(silent=True) or {}
+    album_name = payload.get("album_name")
+    if not isinstance(album_name, str) or not album_name.strip():
+        return jsonify({"ok": False, "error": "Album name is required"}), 400
+
+    try:
+        with connect_db(DB_PATH) as conn:
+            removed = remove_photo_from_album(conn, photo_id, album_name)
+            detail = get_photo_detail(conn, photo_id)
+            albums = list_albums(conn)
+    except PhotoAlbumRemovalError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), exc.status_code
+    except OSError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "removed": removed, "photo": detail, "albums": albums})
 
 
 @app.delete("/api/photos/batch")

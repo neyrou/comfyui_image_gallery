@@ -54,7 +54,13 @@ const state = {
     comfyReferenceDragIndex: null,
     comfyReferencePointerId: null,
     comfyLoraCatalog: [],
-    comfyJob: null,
+    comfyJobs: new Map(),
+    comfyDisplayedJob: null,
+    comfyQueue: null,
+    comfyHandledJobIds: new Set(),
+    comfyModalSessionJobIds: new Set(),
+    comfyModalSessionFailed: false,
+    comfyLastGeneratedPhoto: null,
     comfySourcePhotoId: null,
     comfyJobPollTimer: null,
     comfyPreviewVersion: null,
@@ -651,6 +657,7 @@ async function openPhoto(photoId, options = {}) {
     const loadId = ++state.viewerLoadId;
     const summary = options.photo || viewerPhotoSummary(photoId);
     state.currentPhoto = null;
+    updateRemoveFromAlbumButton(null);
     state.currentIndex = state.photos.findIndex((photo) => photo.id === photoId);
     setDetailsLoading(true);
     setViewerLoadError();
@@ -772,7 +779,28 @@ function renderPhotoDetail(photo) {
     }
     renderLinks(photo.links);
     renderLinkedStrip(photo.links);
+    updateRemoveFromAlbumButton(photo);
     refreshComfyStatus();
+}
+
+function updateRemoveFromAlbumButton(photo) {
+    const button = $("#remove-photo-from-album-button");
+    if (!button) {
+        return;
+    }
+    const albumName = state.selectedAlbum?.display_name || state.selectedAlbum?.name || "la galerie";
+    const uniqueAlbumCount = new Set((photo?.memberships || []).map((membership) => membership.album_id)).size;
+    const hasCurrentMembership = Boolean(
+        state.selectedAlbum?.name
+        && (photo?.memberships || []).some((membership) => membership.album_name === state.selectedAlbum.name),
+    );
+    button.textContent = `Supprimer de '${albumName}'`;
+    button.disabled = !hasCurrentMembership || uniqueAlbumCount <= 1;
+    button.title = !hasCurrentMembership
+        ? "La photo n'est pas presente dans cette galerie"
+        : button.disabled
+            ? "La photo doit rester presente dans au moins une galerie"
+            : `Supprimer uniquement de '${albumName}'`;
 }
 
 function renderImageAnalysis(photo) {
@@ -903,7 +931,11 @@ function galleryPhotoFromDetail(photo) {
     };
 }
 
-function addPhotoToCurrentGallery(photo) {
+function refreshCurrentPhotoIndex() {
+    state.currentIndex = state.photos.findIndex((item) => state.currentPhoto && item.id === state.currentPhoto.id);
+}
+
+function upsertPhotoInCurrentGallery(photo) {
     const gallery = $("#gallery-list");
     if (!gallery || !state.selectedAlbum || !photo.memberships.some((item) => item.album_name === state.selectedAlbum.name)) {
         return;
@@ -912,16 +944,30 @@ function addPhotoToCurrentGallery(photo) {
     if (!galleryPhoto) {
         return;
     }
-    state.photos = [galleryPhoto, ...state.photos.filter((item) => item.id !== photo.id)];
-    gallery.querySelector(`[data-photo-id="${photo.id}"]`)?.closest("li")?.remove();
+
+    const existingIndex = state.photos.findIndex((item) => item.id === photo.id);
+    if (existingIndex >= 0) {
+        state.photos.splice(existingIndex, 1, galleryPhoto);
+        const existingItem = gallery.querySelector(`[data-gallery-photo-id="${photo.id}"]`);
+        if (existingItem) {
+            existingItem.outerHTML = renderGalleryItem(galleryPhoto);
+        }
+        refreshCurrentPhotoIndex();
+        renderSelectionState();
+        return;
+    }
+
+    state.photos.unshift(galleryPhoto);
     gallery.insertAdjacentHTML("afterbegin", renderGalleryItem(galleryPhoto));
+    refreshCurrentPhotoIndex();
+    renderSelectionState();
 }
 
 function removePhotoFromCurrentGallery(photoId) {
     const gallery = $("#gallery-list");
     state.photos = state.photos.filter((item) => item.id !== photoId);
     gallery?.querySelector(`[data-photo-id="${photoId}"]`)?.closest("li")?.remove();
-    state.currentIndex = state.photos.findIndex((item) => state.currentPhoto && item.id === state.currentPhoto.id);
+    refreshCurrentPhotoIndex();
 }
 
 function syncPhotoInCurrentGallery(photo) {
@@ -929,8 +975,7 @@ function syncPhotoInCurrentGallery(photo) {
         return;
     }
     if (photo.memberships.some((item) => item.album_name === state.selectedAlbum.name)) {
-        addPhotoToCurrentGallery(photo);
-        state.currentIndex = state.photos.findIndex((item) => item.id === photo.id);
+        upsertPhotoInCurrentGallery(photo);
         return;
     }
     removePhotoFromCurrentGallery(photo.id);
@@ -1362,23 +1407,24 @@ function updateComfyButton() {
     if (!button) {
         return;
     }
-    const jobActive = Boolean(state.comfyJob?.active);
     const validSource = state.currentPhoto?.media_type !== "video";
-    button.disabled = !state.comfyAvailable || !state.currentPhoto || !validSource || jobActive;
-    button.title = jobActive
-        ? "Une generation est deja en cours"
-        : !validSource ? "La génération ComfyUI requiert une image"
-            : state.comfyAvailable ? "Regenerer avec ComfyUI" : "ComfyUI indisponible";
+    button.disabled = !state.comfyAvailable || !state.currentPhoto || !validSource;
+    button.title = !validSource
+        ? "La génération ComfyUI requiert une image"
+        : state.comfyAvailable ? "Regenerer avec ComfyUI" : "ComfyUI indisponible";
 }
 
 async function refreshComfyStatus() {
     try {
         const data = await fetchJson("/api/comfy/status");
         state.comfyAvailable = Boolean(data.available);
+        state.comfyQueue = data.queue || null;
     } catch (_error) {
         state.comfyAvailable = false;
+        state.comfyQueue = null;
     }
     updateComfyButton();
+    renderComfyQueue();
 }
 
 function togglePhotoActionsMenu() {
@@ -1591,10 +1637,6 @@ async function deleteCurrentPhoto() {
 }
 
 async function openComfyModal() {
-    if (state.comfyJob?.active) {
-        await reopenComfyJob();
-        return;
-    }
     if (!state.currentPhoto) {
         return;
     }
@@ -1614,10 +1656,10 @@ async function openComfyModalForPhoto(photoId, options = {}) {
     setComfyStatus("Chargement des options...");
     if (options.reset) {
         state.comfyOptions = null;
-        state.comfyWorkflowId = options.workflowId || state.comfyJob?.workflow_id || "current";
+        state.comfyWorkflowId = options.workflowId || "current";
         state.comfyReferences = [];
         state.comfyReferenceTarget = null;
-        updateComfyFormJobControls(state.comfyJob);
+        updateComfyFormJobControls(state.comfyDisplayedJob);
     }
     try {
         if (!state.comfyWorkflows.length || options.reset) {
@@ -1631,7 +1673,7 @@ async function openComfyModalForPhoto(photoId, options = {}) {
         state.comfyOptions = null;
         setComfyStatus(error.message, true);
     }
-    updateComfyFormJobControls(state.comfyJob);
+    updateComfyFormJobControls(state.comfyDisplayedJob);
     modal.classList.add("open");
     modal.setAttribute("aria-hidden", "false");
 }
@@ -1653,7 +1695,7 @@ function renderComfyWorkflowSelect() {
 async function loadComfyWorkflowOptions(photoId, workflowId) {
     state.comfyWorkflowId = workflowId || "current";
     state.comfyOptions = null;
-    updateComfyFormJobControls(state.comfyJob);
+    updateComfyFormJobControls(state.comfyDisplayedJob);
     setComfyStatus("Chargement du workflow...");
     try {
         const data = await fetchJson(
@@ -1666,12 +1708,12 @@ async function loadComfyWorkflowOptions(photoId, workflowId) {
         setComfyStatus(error.message, true);
         throw error;
     } finally {
-        updateComfyFormJobControls(state.comfyJob);
+        updateComfyFormJobControls(state.comfyDisplayedJob);
     }
 }
 
 async function changeComfyWorkflow(event) {
-    if (!state.comfySourcePhotoId || state.comfyJob?.active) {
+    if (!state.comfySourcePhotoId) {
         return;
     }
     try {
@@ -1682,7 +1724,7 @@ async function changeComfyWorkflow(event) {
 }
 
 async function reopenComfyJob() {
-    const job = state.comfyJob;
+    const job = state.comfyDisplayedJob;
     if (!job?.active) {
         return;
     }
@@ -1697,7 +1739,7 @@ async function reopenComfyJob() {
     }
     renderComfyJob(job);
     if (!state.comfyJobPollTimer) {
-        startComfyJobPolling(job.id);
+        startComfyJobPolling();
     }
 }
 
@@ -1717,8 +1759,16 @@ function setComfyStatus(message, isError = false) {
     status.classList.toggle("error", Boolean(isError));
 }
 
+function activeComfyJobs() {
+    return [...state.comfyJobs.values()]
+        .filter((job) => job?.active)
+        .sort((left, right) => (left.started_at || 0) - (right.started_at || 0));
+}
+
 function updateComfyFormJobControls(job) {
-    const active = Boolean(job?.active);
+    const active = activeComfyJobs().length > 0;
+    const closeOnFinish = $("#comfy-close-on-finish")?.checked !== false;
+    const locked = active && closeOnFinish;
     const cancelRequested = job?.state === "cancel_requested";
     $$("#comfy-form input, #comfy-form textarea, #comfy-form select, #comfy-form button").forEach((control) => {
         if (
@@ -1726,19 +1776,19 @@ function updateComfyFormJobControls(job) {
             && control.id !== "comfy-cancel-button"
             && control.id !== "comfy-close-on-finish"
         ) {
-            control.disabled = active;
+            control.disabled = locked;
         }
     });
     const submit = $("#comfy-submit-button");
     if (submit) {
-        submit.disabled = active || !state.comfyOptions;
-        submit.textContent = active ? "Generation..." : "Lancer";
-        submit.toggleAttribute("aria-busy", active);
+        submit.disabled = locked || !state.comfyOptions;
+        submit.textContent = active && !locked ? "Ajouter à la file" : locked ? "Génération..." : "Lancer";
+        submit.toggleAttribute("aria-busy", locked);
     }
     const cancel = $("#comfy-cancel-button");
     if (cancel) {
-        cancel.hidden = !active;
-        cancel.disabled = !active || cancelRequested;
+        cancel.hidden = !job?.active;
+        cancel.disabled = !job?.active || cancelRequested;
         cancel.textContent = cancelRequested ? "Annulation..." : "Annuler la generation";
     }
 }
@@ -1958,7 +2008,7 @@ async function uploadComfyReference(input) {
     state.comfyReferenceAddOpen = false;
     state.comfyReferenceTarget = null;
     if (data.photo) {
-        addPhotoToCurrentGallery(data.photo);
+        upsertPhotoInCurrentGallery(data.photo);
     }
     if (data.scan_status) {
         state.scanStatusClosed = false;
@@ -1971,6 +2021,45 @@ async function uploadComfyReference(input) {
             : "Référence ajoutée à input. Scan JSON et IA lancés.",
     );
     renderComfyReferences();
+}
+
+async function removeCurrentPhotoFromAlbum() {
+    if (!state.currentPhoto || !state.selectedAlbum) {
+        return;
+    }
+    closePhotoActionsMenu();
+    const photo = state.currentPhoto;
+    const albumName = state.selectedAlbum.display_name || state.selectedAlbum.name;
+    const filename = currentSourceMembership()?.filename || photo.checksum.slice(0, 12);
+    if (!window.confirm(
+        `Supprimer "${filename}" de la galerie "${albumName}" ? Le fichier de cette galerie sera supprime, mais les copies presentes dans les autres galeries seront conservees.`,
+    )) {
+        return;
+    }
+
+    const removedPhotoId = photo.id;
+    const currentIndex = state.photos.findIndex((item) => item.id === removedPhotoId);
+    const remainingPhotos = state.photos.filter((item) => item.id !== removedPhotoId);
+    const nextPhoto = remainingPhotos.length && currentIndex >= 0
+        ? remainingPhotos[Math.min(currentIndex, remainingPhotos.length - 1)]
+        : null;
+    try {
+        const data = await fetchJson(`/api/photos/${removedPhotoId}/album-membership`, {
+            method: "DELETE",
+            body: JSON.stringify({ album_name: state.selectedAlbum.name }),
+        });
+        state.albums = data.albums || state.albums;
+        removePhotoFromCurrentGallery(removedPhotoId);
+        if (nextPhoto) {
+            await openPhoto(nextPhoto.id);
+        } else {
+            closePhotoModal();
+            state.currentPhoto = null;
+            state.currentIndex = -1;
+        }
+    } catch (error) {
+        alert(error.message);
+    }
 }
 
 function moveComfyReference(from, to) {
@@ -1986,13 +2075,15 @@ function moveComfyReference(from, to) {
 
 async function submitComfyGeneration(event) {
     event.preventDefault();
-    if (!state.comfySourcePhotoId || !state.comfyOptions || state.comfyJob?.active) {
+    const formLocked = activeComfyJobs().length > 0 && $("#comfy-close-on-finish")?.checked !== false;
+    if (!state.comfySourcePhotoId || !state.comfyOptions || formLocked) {
         return;
     }
     setComfyStatus("Envoi a ComfyUI...");
-    const selectedMembership = state.currentPhoto?.memberships?.find(
+    const sourcePhoto = state.currentPhoto?.id === state.comfySourcePhotoId ? state.currentPhoto : null;
+    const selectedMembership = sourcePhoto?.memberships?.find(
         (membership) => membership.album_name === state.selectedAlbum?.name,
-    ) || state.currentPhoto?.memberships?.[0];
+    ) || sourcePhoto?.memberships?.[0];
     const payload = {
         workflow_id: state.comfyWorkflowId || "current",
         source_filename: selectedMembership?.filename || null,
@@ -2022,26 +2113,24 @@ async function submitComfyGeneration(event) {
             method: "POST",
             body: JSON.stringify(payload),
         });
-        state.comfyJob = data.job;
+        state.comfyJobs.set(data.job.id, data.job);
+        state.comfyModalSessionJobIds.add(data.job.id);
         renderComfyJob(data.job);
-        startComfyJobPolling(data.job.id);
+        setComfyStatus("Génération ajoutée à la file ComfyUI.");
+        startComfyJobPolling();
     } catch (error) {
-        if (error.status === 409 && error.data?.job) {
-            state.comfyJob = error.data.job;
-            renderComfyJob(error.data.job);
-            startComfyJobPolling(error.data.job.id);
-            return;
-        }
         setComfyStatus(error.message, true);
-        updateComfyFormJobControls(null);
+        updateComfyFormJobControls(state.comfyDisplayedJob);
         refreshComfyStatus();
     }
 }
 
-function startComfyJobPolling(jobId) {
-    stopComfyJobPolling();
+function startComfyJobPolling() {
+    if (state.comfyJobPollTimer) {
+        return;
+    }
     state.comfyPollFailures = 0;
-    pollComfyJob(jobId, 1000);
+    pollComfyJobs(0);
 }
 
 function stopComfyJobPolling() {
@@ -2049,43 +2138,107 @@ function stopComfyJobPolling() {
     state.comfyJobPollTimer = null;
 }
 
-function pollComfyJob(jobId, delay) {
+function pollComfyJobs(delay) {
     state.comfyJobPollTimer = window.setTimeout(async () => {
         try {
-            const data = await fetchJson(`/api/comfy/jobs/${jobId}`);
+            await Promise.all([refreshComfyStatus(), refreshComfyJobs()]);
             state.comfyPollFailures = 0;
-            state.comfyJob = data.job;
-            renderComfyJob(data.job);
-            if (!data.job.active) {
-                stopComfyJobPolling();
-                refreshComfyStatus();
-                if (data.job.state === "done" && data.job.photo) {
-                    addPhotoToCurrentGallery(data.job.photo);
-                    if ($("#comfy-close-on-finish")?.checked !== false) {
-                        closeComfyModal();
-                        await openPhoto(data.job.photo.id);
-                    }
-                }
-                return;
-            }
-            pollComfyJob(jobId, 1000);
+            pollComfyJobs(1000);
         } catch (error) {
             state.comfyPollFailures += 1;
             if (state.comfyPollFailures >= 8) {
                 stopComfyJobPolling();
                 setComfyStatus(`Suivi interrompu: ${error.message}`, true);
-                refreshComfyStatus();
                 return;
             }
             const retryDelay = Math.min(1000 * Math.pow(1.7, state.comfyPollFailures), 10000);
             setComfyStatus(`Connexion temporairement perdue, nouvelle tentative ${state.comfyPollFailures}/8...`);
-            pollComfyJob(jobId, retryDelay);
+            pollComfyJobs(retryDelay);
         }
     }, delay);
 }
 
+async function refreshComfyJobs() {
+    const data = await fetchJson("/api/comfy/jobs/current");
+    const activeIds = new Set();
+    (data.jobs || []).forEach((job) => {
+        activeIds.add(job.id);
+        state.comfyJobs.set(job.id, job);
+    });
+    const finishedJobs = await Promise.all(
+        [...state.comfyJobs.values()]
+            .filter((job) => job?.active && !activeIds.has(job.id))
+            .map(async (job) => (await fetchJson(`/api/comfy/jobs/${job.id}`)).job),
+    );
+    finishedJobs.forEach((job) => state.comfyJobs.set(job.id, job));
+    const preferred = data.job ? state.comfyJobs.get(data.job.id) || data.job : null;
+    const nextDisplayedJob = preferred?.active ? preferred : activeComfyJobs()[0] || null;
+    if (nextDisplayedJob) {
+        renderComfyJob(nextDisplayedJob);
+    } else {
+        state.comfyDisplayedJob = null;
+        state.comfyPreviewVersion = null;
+        $("#comfy-preview").hidden = true;
+        $("#comfy-preview-image").removeAttribute("src");
+        renderComfyJobBanner(null);
+        updateComfyFormJobControls(null);
+    }
+    for (const job of state.comfyJobs.values()) {
+        if (!job.active) {
+            await handleFinishedComfyJob(job);
+        }
+    }
+    await finishComfyModalSessionIfReady();
+}
+
+async function handleFinishedComfyJob(job) {
+    if (state.comfyHandledJobIds.has(job.id)) {
+        return;
+    }
+    state.comfyHandledJobIds.add(job.id);
+    if (job.state === "done") {
+        const photos = job.photos?.length ? job.photos : job.photo ? [job.photo] : [];
+        photos.forEach((photo) => upsertPhotoInCurrentGallery(photo));
+        if (photos.length) {
+            state.comfyLastGeneratedPhoto = photos[photos.length - 1];
+        }
+    } else if (state.comfyModalSessionJobIds.has(job.id)) {
+        state.comfyModalSessionFailed = true;
+    }
+}
+
+async function finishComfyModalSessionIfReady() {
+    const sessionJobs = [...state.comfyModalSessionJobIds]
+        .map((jobId) => state.comfyJobs.get(jobId))
+        .filter(Boolean);
+    if (!sessionJobs.length || sessionJobs.some((job) => job.active)) {
+        return;
+    }
+    const shouldClose = $("#comfy-close-on-finish")?.checked !== false;
+    const generatedPhoto = state.comfyLastGeneratedPhoto;
+    if (shouldClose && !state.comfyModalSessionFailed && generatedPhoto && $("#comfy-modal").classList.contains("open")) {
+        state.comfyModalSessionJobIds.clear();
+        state.comfyModalSessionFailed = false;
+        state.comfyLastGeneratedPhoto = null;
+        closeComfyModal();
+        await openPhoto(generatedPhoto.id);
+        return;
+    }
+    const failed = state.comfyModalSessionFailed;
+    state.comfyModalSessionJobIds.clear();
+    state.comfyModalSessionFailed = false;
+    state.comfyLastGeneratedPhoto = null;
+    setComfyStatus(failed ? "File terminée avec une erreur ou une annulation." : "Toutes les générations sont terminées.", failed);
+}
+
 function renderComfyJob(job) {
-    state.comfyJob = job;
+    const previousJobId = state.comfyDisplayedJob?.id;
+    state.comfyDisplayedJob = job;
+    if (previousJobId !== job.id) {
+        state.comfyPreviewVersion = null;
+        $("#comfy-preview").hidden = true;
+        $("#comfy-preview-image").removeAttribute("src");
+    }
     const pieces = [job.message || job.state || "Generation"];
     if (job.node_title || job.node) {
         pieces.push(job.node_title || `node ${job.node}`);
@@ -2116,40 +2269,57 @@ function renderComfyJob(job) {
     }
 }
 
+function renderComfyQueue() {
+    const total = state.comfyQueue?.total_count;
+    const badge = $("#comfy-queue-count");
+    if (badge) {
+        badge.textContent = Number.isFinite(total) ? `File ComfyUI : ${total}` : "File ComfyUI indisponible";
+    }
+    renderComfyJobBanner(state.comfyDisplayedJob);
+}
+
 function renderComfyJobBanner(job) {
     const box = $("#comfy-job-status");
     if (!box) {
         return;
     }
-    if (!job?.active) {
+    const total = state.comfyQueue?.total_count;
+    if (!job?.active && !(Number.isFinite(total) && total > 0)) {
         box.hidden = true;
         return;
     }
     box.hidden = false;
-    box.dataset.state = job.state || "running";
-    $("#comfy-job-status-title").textContent = job.state === "cancel_requested"
-        ? "Annulation en cours"
-        : "Generation en cours";
-    $("#comfy-job-status-message").textContent = job.message || job.state || "Generation...";
+    box.dataset.state = job?.state || "queued";
+    $("#comfy-job-status-title").textContent = Number.isFinite(total) && total > 0
+        ? `${total} génération${total === 1 ? "" : "s"} en cours ou en attente`
+        : job?.state === "cancel_requested"
+            ? "Annulation en cours"
+            : job?.active ? "Génération en préparation" : "Génération ComfyUI";
+    $("#comfy-job-status-message").textContent = job?.message || "Tâche lancée hors de la galerie";
     const details = [];
-    if (job.node_title || job.node) {
+    if (state.comfyQueue) {
+        details.push(`${state.comfyQueue.running_count} en cours, ${state.comfyQueue.pending_count} en attente`);
+    }
+    if (job?.node_title || job?.node) {
         details.push(job.node_title || `node ${job.node}`);
     }
-    if (job.progress !== null && job.progress_max !== null) {
+    if (job?.progress !== null && job?.progress !== undefined && job?.progress_max !== null && job?.progress_max !== undefined) {
         details.push(`${job.progress}/${job.progress_max}`);
     }
     $("#comfy-job-status-detail").textContent = details.join(" | ");
+    $("#comfy-job-reopen-button").hidden = !job?.active;
 }
 
 async function cancelComfyGeneration() {
-    const job = state.comfyJob;
+    const job = state.comfyDisplayedJob;
     if (!job?.active || job.state === "cancel_requested") {
         return;
     }
     try {
         const data = await fetchJson(`/api/comfy/jobs/${job.id}/cancel`, { method: "POST", body: "{}" });
+        state.comfyJobs.set(data.job.id, data.job);
         renderComfyJob(data.job);
-        startComfyJobPolling(data.job.id);
+        startComfyJobPolling();
     } catch (error) {
         setComfyStatus(error.message, true);
     }
@@ -2158,12 +2328,12 @@ async function cancelComfyGeneration() {
 async function resumeComfyGenerationState() {
     try {
         const data = await fetchJson("/api/comfy/jobs/current");
+        (data.jobs || []).forEach((job) => state.comfyJobs.set(job.id, job));
         if (data.job?.active) {
-            state.comfyJob = data.job;
-            state.comfySourcePhotoId = data.job.photo_id;
+            state.comfyDisplayedJob = data.job;
             renderComfyJob(data.job);
-            startComfyJobPolling(data.job.id);
         }
+        startComfyJobPolling();
     } catch (_error) {
         // ComfyUI generation tracking is non-critical during initial page load.
     }
@@ -4105,6 +4275,11 @@ function bindEvents() {
         reopenComfyJob().catch((error) => setComfyStatus(error.message, true));
     });
     $("#comfy-cancel-button")?.addEventListener("click", cancelComfyGeneration);
+    $("#comfy-close-on-finish")?.addEventListener("change", () => {
+        updateComfyFormJobControls(state.comfyDisplayedJob);
+        finishComfyModalSessionIfReady().catch((error) => setComfyStatus(error.message, true));
+    });
+    $("#remove-photo-from-album-button")?.addEventListener("click", removeCurrentPhotoFromAlbum);
     $("#delete-photo-button")?.addEventListener("click", deleteCurrentPhoto);
     $("#photo-actions-button")?.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -4455,10 +4630,12 @@ function bindEvents() {
             closeComfyModal();
             closeTagFilter();
         }
-        if ($("#photo-modal").classList.contains("open") && event.key === "ArrowRight") {
+        const photoModalOpen = $("#photo-modal").classList.contains("open");
+        const comfyModalOpen = $("#comfy-modal")?.classList.contains("open");
+        if (photoModalOpen && !comfyModalOpen && event.key === "ArrowRight") {
             navigate(1);
         }
-        if ($("#photo-modal").classList.contains("open") && event.key === "ArrowLeft") {
+        if (photoModalOpen && !comfyModalOpen && event.key === "ArrowLeft") {
             navigate(-1);
         }
     });

@@ -54,6 +54,12 @@ class TagCategoryLocked(ValueError):
     pass
 
 
+class PhotoAlbumRemovalError(ValueError):
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class GalleryConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
         try:
@@ -1722,6 +1728,74 @@ def delete_photo(conn, photo_id, thumbnail_root, preview_root=None):
             deleted_files.append(str(preview_path))
     conn.execute("DELETE FROM photos WHERE id=?", (photo_id,))
     return {"photo_id": photo_id, "checksum": photo["checksum"], "deleted_files": deleted_files}
+
+
+def remove_photo_from_album(conn, photo_id, album_name):
+    photo = conn.execute("SELECT id FROM photos WHERE id=?", (photo_id,)).fetchone()
+    if not photo:
+        raise PhotoAlbumRemovalError("Photo not found", 404)
+    album = get_album_by_name(conn, album_name)
+    if not album:
+        raise PhotoAlbumRemovalError("Album not found", 404)
+
+    memberships = conn.execute(
+        """
+        SELECT relative_path
+        FROM album_photos
+        WHERE album_id=? AND photo_id=? AND is_missing=0
+        ORDER BY relative_path
+        """,
+        (album["id"], photo_id),
+    ).fetchall()
+    if not memberships:
+        raise PhotoAlbumRemovalError("Photo is not present in this album", 404)
+
+    album_count = conn.execute(
+        """
+        SELECT COUNT(DISTINCT album_id) AS total
+        FROM album_photos
+        WHERE photo_id=? AND is_missing=0
+        """,
+        (photo_id,),
+    ).fetchone()["total"]
+    if album_count <= 1:
+        raise PhotoAlbumRemovalError("Photo belongs to only one album", 409)
+
+    album_root = Path(album["path"]).resolve()
+    membership_paths = []
+    seen_paths = set()
+    for membership in memberships:
+        image_path = (album_root / membership["relative_path"]).resolve()
+        try:
+            image_path.relative_to(album_root)
+        except ValueError as exc:
+            raise PhotoAlbumRemovalError("Photo path is outside the album") from exc
+        if image_path in seen_paths:
+            continue
+        seen_paths.add(image_path)
+        if not image_path.exists() or not image_path.is_file():
+            raise PhotoAlbumRemovalError(f"Photo file not found: {image_path}", 404)
+        membership_paths.append(image_path)
+
+    deleted_files = []
+    for image_path in membership_paths:
+        image_path.unlink()
+        deleted_files.append(str(image_path))
+
+    conn.execute(
+        """
+        UPDATE album_photos
+        SET is_missing=1, updated_at=CURRENT_TIMESTAMP
+        WHERE album_id=? AND photo_id=? AND is_missing=0
+        """,
+        (album["id"], photo_id),
+    )
+    return {
+        "photo_id": photo_id,
+        "album_id": album["id"],
+        "album_name": album["name"],
+        "deleted_files": deleted_files,
+    }
 
 
 def find_output_photo_by_name(conn, names):

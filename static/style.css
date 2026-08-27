@@ -780,6 +780,16 @@ button:disabled {
     color: var(--danger);
 }
 
+.viewer-menu-dropdown .warning-menu-item {
+    color: #f0aa64;
+}
+
+.viewer-menu-dropdown .warning-menu-item:disabled {
+    color: var(--muted);
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
 .linked-strip {
     position: absolute;
     z-index: 4;
@@ -1006,6 +1016,23 @@ button:disabled {
     font-size: 14px;
     color: var(--muted);
     text-transform: uppercase;
+}
+
+.comfy-panel-title {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.comfy-queue-count {
+    padding: 3px 8px;
+    border: 1px solid #4d82a8;
+    border-radius: 999px;
+    color: #a9d7f5;
+    background: #24313a;
+    font-size: 12px;
+    white-space: nowrap;
 }
 
 .form-field {

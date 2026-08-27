@@ -167,6 +167,18 @@ class ComfyClient:
         except ComfyUnavailable:
             return False
 
+    def queue_status(self):
+        queue = self.get_json("/queue", timeout=max(self.timeout, 10))
+        running = queue.get("queue_running", queue.get("Running", [])) if isinstance(queue, dict) else []
+        pending = queue.get("queue_pending", queue.get("Pending", [])) if isinstance(queue, dict) else []
+        running_count = len(running) if isinstance(running, list) else 0
+        pending_count = len(pending) if isinstance(pending, list) else 0
+        return {
+            "running_count": running_count,
+            "pending_count": pending_count,
+            "total_count": running_count + pending_count,
+        }
+
     def get_json(self, path, timeout=None):
         try:
             with request.urlopen(self.base_url + path, timeout=timeout or self.timeout) as response:
@@ -294,7 +306,15 @@ class ComfyClient:
             }
         return self.post_json("/prompt", payload, timeout=max(self.timeout, 10))
 
-    def run_prompt(self, prompt, workflow, client_id, progress_callback=None, cancel_callback=None):
+    def run_prompt(
+        self,
+        prompt,
+        workflow,
+        client_id,
+        progress_callback=None,
+        cancel_callback=None,
+        queued_callback=None,
+    ):
         self._raise_if_cancelled(cancel_callback)
         ws = None
         try:
@@ -309,6 +329,8 @@ class ComfyClient:
         if not prompt_id:
             raise ComfyGenerationError("ComfyUI did not return a prompt_id")
         self._progress(progress_callback, state="queued", prompt_id=prompt_id)
+        if queued_callback:
+            queued_callback(prompt_id)
         self._raise_if_cancelled(cancel_callback, prompt_id)
 
         if ws is None:

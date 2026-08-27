@@ -776,6 +776,124 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertEqual(response.get_json()["summary"]["copied"], 1)
         self.assertTrue((self.images_root / "Celine" / "source.png").is_file())
 
+    def test_remove_photo_from_album_deletes_all_album_files_and_preserves_photo(self):
+        output_image = self.images_root / "output" / "shared.png"
+        celine_image = self.images_root / "Celine" / "shared.png"
+        celine_duplicate = self.images_root / "Celine" / "shared-copy.png"
+        create_png(output_image)
+        shutil.copyfile(output_image, celine_image)
+        shutil.copyfile(output_image, celine_duplicate)
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+            set_photo_tags(conn, photo_id, ["keep-me"])
+            thumbnail_path = self.thumbnails / f"{get_photo_detail(conn, photo_id)['checksum']}.jpg"
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        response = app_module.app.test_client().delete(
+            f"/api/photos/{photo_id}/album-membership",
+            json={"album_name": "Celine"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["removed"]["album_name"], "Celine")
+        self.assertEqual(len(data["removed"]["deleted_files"]), 2)
+        self.assertTrue(output_image.is_file())
+        self.assertFalse(celine_image.exists())
+        self.assertFalse(celine_duplicate.exists())
+        self.assertTrue(thumbnail_path.is_file())
+        self.assertEqual([item["album_name"] for item in data["photo"]["memberships"]], ["output"])
+        self.assertEqual([tag["name"] for tag in data["photo"]["tags"]], ["keep-me"])
+        with connect_db(self.db_path) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0], 1)
+            missing_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM album_photos ap JOIN albums a ON a.id=ap.album_id
+                WHERE ap.photo_id=? AND a.name='Celine' AND ap.is_missing=1
+                """,
+                (photo_id,),
+            ).fetchone()[0]
+        self.assertEqual(missing_count, 2)
+
+    def test_remove_photo_from_album_validates_membership_and_last_album(self):
+        only_image = self.images_root / "output" / "only.png"
+        create_png(only_image)
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        client = app_module.app.test_client()
+
+        missing_name = client.delete(
+            f"/api/photos/{photo_id}/album-membership",
+            json={},
+        )
+        missing_photo = client.delete(
+            "/api/photos/999999/album-membership",
+            json={"album_name": "output"},
+        )
+        missing_album = client.delete(
+            f"/api/photos/{photo_id}/album-membership",
+            json={"album_name": "unknown"},
+        )
+        missing_membership = client.delete(
+            f"/api/photos/{photo_id}/album-membership",
+            json={"album_name": "Celine"},
+        )
+        last_album = client.delete(
+            f"/api/photos/{photo_id}/album-membership",
+            json={"album_name": "output"},
+        )
+
+        self.assertEqual(missing_name.status_code, 400)
+        self.assertEqual(missing_photo.status_code, 404)
+        self.assertEqual(missing_album.status_code, 404)
+        self.assertEqual(missing_membership.status_code, 404)
+        self.assertEqual(last_album.status_code, 409)
+        self.assertTrue(only_image.is_file())
+        with connect_db(self.db_path) as conn:
+            membership = conn.execute(
+                "SELECT is_missing FROM album_photos WHERE photo_id=?",
+                (photo_id,),
+            ).fetchone()
+        self.assertEqual(membership["is_missing"], 0)
+
+    def test_remove_photo_from_album_keeps_state_when_file_deletion_fails(self):
+        output_image = self.images_root / "output" / "shared.png"
+        celine_image = self.images_root / "Celine" / "shared.png"
+        create_png(output_image)
+        shutil.copyfile(output_image, celine_image)
+        scan_albums(self.db_path, self.images_root, self.thumbnails)
+        with connect_db(self.db_path) as conn:
+            photo_id = conn.execute("SELECT id FROM photos").fetchone()["id"]
+
+        app_module.DB_PATH = self.db_path
+        app_module.IMAGES_ROOT = self.images_root
+        app_module.THUMBNAIL_ROOT = self.thumbnails
+        with patch("gallery_db.Path.unlink", side_effect=OSError("permission denied")):
+            response = app_module.app.test_client().delete(
+                f"/api/photos/{photo_id}/album-membership",
+                json={"album_name": "Celine"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(output_image.is_file())
+        self.assertTrue(celine_image.is_file())
+        with connect_db(self.db_path) as conn:
+            active_count = conn.execute(
+                "SELECT COUNT(*) FROM album_photos WHERE photo_id=? AND is_missing=0",
+                (photo_id,),
+            ).fetchone()[0]
+        self.assertEqual(active_count, 2)
+
     def test_available_album_hides_stale_path_unavailable_error(self):
         stale_error = f"Album path is unavailable: {self.images_root / 'Celine'}"
         with connect_db(self.db_path) as conn:
@@ -902,6 +1020,11 @@ class GalleryBackendTests(unittest.TestCase):
         self.assertIn('data-batch-action="image-analysis"', html)
         self.assertIn('data-batch-action="faces"', html)
         self.assertIn('class="danger-menu-item" data-batch-action="delete"', html)
+        self.assertIn('id="remove-photo-from-album-button" class="warning-menu-item" disabled', html)
+        self.assertLess(
+            html.index('id="remove-photo-from-album-button"'),
+            html.index('id="delete-photo-button"'),
+        )
         self.assertNotIn('id="face-admin-modal"', html)
         self.assertIn('id="admin-modal"', html)
         self.assertIn('id="detail-faces"', html)

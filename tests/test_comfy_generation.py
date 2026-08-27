@@ -213,11 +213,22 @@ class FakeComfyClient:
         Image.new("RGB", (4, 4), (1, 2, 3)).save(buffer, format="PNG")
         return buffer.getvalue(), "image/png"
 
-    def run_prompt(self, prompt, workflow, client_id, progress_callback=None, cancel_callback=None):
+    def run_prompt(
+        self,
+        prompt,
+        workflow,
+        client_id,
+        progress_callback=None,
+        cancel_callback=None,
+        queued_callback=None,
+    ):
         type(self).queued_prompt = prompt
         type(self).queued_workflow = workflow
         if progress_callback:
             progress_callback({"state": "queued", "prompt_id": "prompt-1"})
+        if queued_callback:
+            queued_callback("prompt-1")
+        if progress_callback:
             progress_callback({"state": "running", "node": "4", "value": 1, "max": 6})
         generated_path = self.output_root / "generated.png"
         create_png(generated_path, color=(80, 90, 100))
@@ -229,9 +240,21 @@ class FakeComfyClient:
 class CancellableFakeComfyClient(FakeComfyClient):
     started = threading.Event()
 
-    def run_prompt(self, prompt, workflow, client_id, progress_callback=None, cancel_callback=None):
+    def run_prompt(
+        self,
+        prompt,
+        workflow,
+        client_id,
+        progress_callback=None,
+        cancel_callback=None,
+        queued_callback=None,
+    ):
+        prompt_id = f"prompt-{client_id}"
         if progress_callback:
-            progress_callback({"state": "queued", "prompt_id": "prompt-cancel"})
+            progress_callback({"state": "queued", "prompt_id": prompt_id})
+        if queued_callback:
+            queued_callback(prompt_id)
+        if progress_callback:
             progress_callback({"state": "running", "node": "4", "value": 1, "max": 6})
         type(self).started.set()
         deadline = time.time() + 3
@@ -290,6 +313,9 @@ class ComfyGenerationTests(unittest.TestCase):
     def setUp(self):
         with app_module.COMFY_JOB_LOCK:
             app_module.COMFY_JOBS.clear()
+        with app_module.COMFY_SUBMIT_CONDITION:
+            app_module.COMFY_SUBMIT_QUEUE.clear()
+            app_module.COMFY_SUBMIT_CONDITION.notify_all()
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.images_root = self.root / "static" / "images"
@@ -447,6 +473,23 @@ class ComfyGenerationTests(unittest.TestCase):
         self.assertEqual(client.payload["client_id"], "job-1")
         self.assertEqual(client.payload["extra_data"]["workflow"], workflow)
         self.assertEqual(client.payload["extra_data"]["extra_pnginfo"]["workflow"], workflow)
+
+    def test_queue_status_counts_running_and_pending_prompts(self):
+        client = LegacyCancelClient(
+            {
+                "queue_running": [[0, "running-1"], [1, "running-2"]],
+                "queue_pending": [[2, "pending-1"]],
+            }
+        )
+
+        self.assertEqual(
+            client.queue_status(),
+            {"running_count": 2, "pending_count": 1, "total_count": 3},
+        )
+        with patch("app.get_comfy_client", return_value=client):
+            response = app_module.app.test_client().get("/api/comfy/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["queue"]["total_count"], 3)
 
     def test_comfy_node_title_prefers_custom_workflow_title_and_falls_back_to_prompt_metadata(self):
         prompt = sample_prompt()
@@ -982,7 +1025,7 @@ class ComfyGenerationTests(unittest.TestCase):
             app_module.COMFY_CLIENT_FACTORY = previous_factory
             app_module.scan_albums = previous_scan_albums
 
-    def test_current_conflict_and_cancel_running_comfy_job(self):
+    def test_multiple_active_jobs_are_queued_and_cancelled_individually(self):
         source_prompt = json.dumps(sample_prompt())
         source_workflow = json.dumps(sample_workflow())
         create_png(self.images_root / "output" / "source.png", prompt=source_prompt, workflow=source_workflow)
@@ -1013,12 +1056,18 @@ class ComfyGenerationTests(unittest.TestCase):
             self.assertEqual(current.get_json()["job"]["id"], job_id)
             self.assertEqual(current.get_json()["job"]["node"], "4")
             self.assertEqual(current.get_json()["job"]["node_title"], "Main sampler")
-            conflict = client.post(
+            second = client.post(
                 f"/api/photos/{source_id}/comfy/generate",
                 json={"prompt": "second"},
             )
-            self.assertEqual(conflict.status_code, 409)
-            self.assertEqual(conflict.get_json()["job"]["id"], job_id)
+            self.assertEqual(second.status_code, 202)
+            second_job_id = second.get_json()["job"]["id"]
+            for _ in range(100):
+                active_jobs = client.get("/api/comfy/jobs/current").get_json()["jobs"]
+                if len(active_jobs) == 2 and all(job.get("prompt_id") for job in active_jobs):
+                    break
+                time.sleep(0.02)
+            self.assertEqual([job["id"] for job in active_jobs], [job_id, second_job_id])
 
             cancelled = client.post(f"/api/comfy/jobs/{job_id}/cancel", json={})
             self.assertEqual(cancelled.status_code, 202)
@@ -1033,6 +1082,14 @@ class ComfyGenerationTests(unittest.TestCase):
             self.assertIsNone(final_job["photo"])
             self.assertEqual(client.post(f"/api/comfy/jobs/{job_id}/cancel", json={}).status_code, 200)
             self.assertEqual(client.post("/api/comfy/jobs/missing/cancel", json={}).status_code, 404)
+            remaining = client.get("/api/comfy/jobs/current").get_json()
+            self.assertEqual(remaining["job"]["id"], second_job_id)
+            self.assertEqual([job["id"] for job in remaining["jobs"]], [second_job_id])
+            self.assertEqual(client.post(f"/api/comfy/jobs/{second_job_id}/cancel", json={}).status_code, 202)
+            for _ in range(100):
+                if client.get(f"/api/comfy/jobs/{second_job_id}").get_json()["job"]["active"] is False:
+                    break
+                time.sleep(0.02)
             self.assertIsNone(client.get("/api/comfy/jobs/current").get_json()["job"])
         finally:
             app_module.COMFY_CLIENT_FACTORY = previous_factory
