@@ -721,13 +721,90 @@ button:disabled {
     white-space: nowrap;
 }
 
+.viewer-side-navigation {
+    position: absolute;
+    z-index: 4;
+    inset: 0;
+    pointer-events: none;
+}
+
+.viewer-side-button {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    display: grid;
+    width: clamp(72px, 9vw, 132px);
+    height: 100%;
+    min-height: 0;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: #fff;
+    opacity: 0;
+    pointer-events: auto;
+    transition: opacity 150ms ease, background 150ms ease;
+}
+
+.viewer-side-button-previous {
+    left: 0;
+}
+
+.viewer-side-button-next {
+    right: 0;
+}
+
+.viewer-side-button span {
+    display: grid;
+    width: 48px;
+    height: 68px;
+    place-items: center;
+    border: 1px solid rgba(255, 255, 255, 0.32);
+    border-radius: 8px;
+    background: rgba(16, 16, 16, 0.62);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.36);
+    font-size: 56px;
+    line-height: 1;
+    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.8);
+}
+
+.viewer-side-button-previous:hover,
+.viewer-side-button-previous:focus-visible {
+    background: linear-gradient(90deg, rgba(0, 0, 0, 0.58), rgba(0, 0, 0, 0));
+    opacity: 1;
+}
+
+.viewer-side-button-next:hover,
+.viewer-side-button-next:focus-visible {
+    background: linear-gradient(270deg, rgba(0, 0, 0, 0.58), rgba(0, 0, 0, 0));
+    opacity: 1;
+}
+
+.viewer-side-button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+.viewer-toolbar-navigation {
+    display: none;
+}
+
+.viewer-stage.is-video .viewer-side-navigation {
+    display: none;
+}
+
+.viewer-stage.is-video .viewer-toolbar-navigation {
+    display: block;
+}
+
 @keyframes viewer-spin {
     to { transform: rotate(360deg); }
 }
 
 .viewer-actions {
     position: absolute;
-    z-index: 3;
+    z-index: 5;
     top: 12px;
     right: 12px;
     display: flex;
@@ -2668,6 +2745,12 @@ pre {
         min-height: 38px;
         padding: 3px;
         font-size: 11px;
+    }
+}
+
+@media (hover: none), (pointer: coarse) {
+    .viewer-side-navigation {
+        display: none;
     }
 }
 

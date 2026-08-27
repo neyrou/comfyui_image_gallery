@@ -4343,8 +4343,9 @@ function bindEvents() {
     $("#save-photo-tags-button")?.addEventListener("click", savePhotoTags);
     $("#batch-tag-form")?.addEventListener("submit", submitBatchTags);
     $("#link-search-input")?.addEventListener("input", debounce(searchLinkTargets, 250));
-    $("#prev-button")?.addEventListener("click", () => navigate(-1));
-    $("#next-button")?.addEventListener("click", () => navigate(1));
+    $$('[data-viewer-navigate]').forEach((button) => {
+        button.addEventListener("click", () => navigate(Number(button.dataset.viewerNavigate)));
+    });
     $("#play-button")?.addEventListener("click", () => {
         toggleSlideshow().catch((error) => {
             stopSlideshow();

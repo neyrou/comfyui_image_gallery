@@ -252,6 +252,16 @@
                 <img id="viewer-preview-image" class="viewer-image-layer" alt="">
                 <img id="viewer-image" class="viewer-image-layer" alt="">
                 <video id="viewer-video" class="viewer-video" controls autoplay muted loop playsinline preload="metadata" hidden></video>
+                <nav class="viewer-side-navigation" aria-label="Navigation entre les photos">
+                    <button type="button" class="viewer-side-button viewer-side-button-previous"
+                            data-viewer-navigate="-1" aria-label="Photo précédente" title="Photo précédente">
+                        <span aria-hidden="true">‹</span>
+                    </button>
+                    <button type="button" class="viewer-side-button viewer-side-button-next"
+                            data-viewer-navigate="1" aria-label="Photo suivante" title="Photo suivante">
+                        <span aria-hidden="true">›</span>
+                    </button>
+                </nav>
                 <div class="viewer-loading" id="viewer-loading" role="status" aria-label="Chargement de l'image" hidden>
                     <span class="viewer-spinner" aria-hidden="true"></span>
                     <span id="viewer-loading-label">Chargement de l'aper&ccedil;u&hellip;</span>
@@ -261,9 +271,11 @@
                     <button type="button" id="viewer-retry-button">R&eacute;essayer la HD</button>
                 </div>
                 <div class="viewer-actions">
-                    <button type="button" id="prev-button" title="Précédente">‹</button>
+                    <button type="button" id="prev-button" class="viewer-toolbar-navigation"
+                            data-viewer-navigate="-1" title="Précédente" aria-label="Photo précédente">‹</button>
                     <button type="button" id="play-button" title="Diaporama">▶</button>
-                    <button type="button" id="next-button" title="Suivante">›</button>
+                    <button type="button" id="next-button" class="viewer-toolbar-navigation"
+                            data-viewer-navigate="1" title="Suivante" aria-label="Photo suivante">›</button>
                     <button type="button" id="details-toggle-button" title="Détails">...</button>
                     <div class="viewer-menu">
                         <button type="button" id="photo-actions-button" title="Actions" aria-haspopup="true" aria-expanded="false">&#9776;</button>
